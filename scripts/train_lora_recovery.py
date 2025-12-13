@@ -1,49 +1,45 @@
 """
 Stage B: LoRA recovery adapters for a QAT model.
 
-This script:
-- loads the base HF model
-- replaces nn.Linear with QATLinear (same as Stage A)
-- loads the learned QAT state dict (weights + f)
-- freezes base weights, enables LoRA on QATLinear layers
-- trains only LoRA parameters
-- saves:
-    - lora_only_state_dict.pt (recommended)
-    - full_state_dict.pt      (QAT+LoRA together)
+Flow:
+1) Load base model
+2) Replace Linear -> QATLinear (same as Stage A)
+3) Load QAT state dict (weights + learned f)
+4) Freeze base weights
+5) Enable LoRA on QATLinear layers (train only LoRA A/B)
+6) Run SFT loop (same dataset formatting)
+7) Save:
+   - lora_only_state_dict.pt
+   - full_state_dict.pt
+
+Mixed precision behavior is identical to Stage A.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import torch
 from datasets import load_dataset
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments,
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.utils import __version__ as transformers_version
 
 # Ensure local package imports work without installation.
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from qat_lora.quantizer import QATQuantConfig
-from qat_lora.model_utils import (
-    replace_linear_with_qat,
-    freeze_base_enable_lora,
-    extract_lora_state_dict,
-)
+from qat_lora.model_utils import replace_linear_with_qat, freeze_base_enable_lora, extract_lora_state_dict
 from qat_lora.data import build_alpaca_messages, tokenize_chat_sft, DataCollatorForSFT
+from qat_lora.mixed_precision import pick_device, resolve_amp_dtype, resolve_param_dtype
+from qat_lora.train_loop import LoopConfig, train_sft_single_device
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--model_name_or_path", type=str, required=True)
+    p.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen3-0.6B")
     p.add_argument("--qat_checkpoint", type=str, required=True)
     p.add_argument("--dataset_name", type=str, default="tatsu-lab/alpaca")
     p.add_argument("--dataset_split", type=str, default="train")
@@ -60,12 +56,14 @@ def parse_args():
     p.add_argument("--warmup_steps", type=int, default=50)
     p.add_argument("--logging_steps", type=int, default=10)
     p.add_argument("--save_steps", type=int, default=500)
+    p.add_argument("--max_grad_norm", type=float, default=1.0)
 
-    p.add_argument("--bf16", action="store_true")
-    p.add_argument("--fp16", action="store_true")
+    # Device & mixed precision
+    p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "mps", "cpu"])
+    p.add_argument("--amp_dtype", type=str, default="auto", choices=["auto", "no", "bf16", "fp16"])
+    p.add_argument("--param_dtype", type=str, default="auto", choices=["auto", "fp32", "bf16", "fp16"])
 
     p.add_argument("--skip_lm_head", action="store_true")
-
     p.add_argument("--enable_thinking", action="store_true")
 
     # LoRA config
@@ -84,35 +82,36 @@ def main():
     if tuple(map(int, transformers_version.split(".")[:2])) < (4, 51):
         raise RuntimeError(
             f"Transformers {transformers_version} is too old for Qwen3. "
-            "Please pip install -U 'transformers>=4.51.0'."
+            "Please upgrade: pip install -U 'transformers>=4.51.0'."
         )
+
+    device = pick_device(args.device)
+    amp_dtype = resolve_amp_dtype(args.amp_dtype, device)
+    param_dtype = resolve_param_dtype(args.param_dtype, device)
+    print(f"[device] {device} | amp_dtype={amp_dtype} | param_dtype={param_dtype}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        torch_dtype=torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None),
-    )
-
+    model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype=torch.float32)
     model.config.use_cache = False
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
 
     qc = QATQuantConfig()
-    exclude = None
-    if args.skip_lm_head:
-        exclude = r"(^lm_head$)"
+    exclude = r"(^lm_head$)" if args.skip_lm_head else None
 
-    # Rebuild the exact QATLinear structure and then load the QAT checkpoint.
     replace_linear_with_qat(model, qc=qc, exclude_regex=exclude, verbose=False)
 
     sd = torch.load(args.qat_checkpoint, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=False)
     print(f"Loaded QAT checkpoint. missing={len(missing)} unexpected={len(unexpected)}")
     if unexpected:
-        print("Unexpected keys (showing first 20):", unexpected[:20])
+        print("Unexpected keys (first 20):", unexpected[:20])
+
+    # Cast base params to desired dtype BEFORE enabling LoRA
+    model = model.to(dtype=param_dtype)
 
     # Freeze base + enable LoRA
     lora_layers, trainable = freeze_base_enable_lora(
@@ -139,7 +138,16 @@ def main():
     ds = ds.map(map_fn, remove_columns=ds.column_names)
     collator = DataCollatorForSFT(tokenizer)
 
-    training_args = TrainingArguments(
+    from torch.utils.data import DataLoader
+    dl = DataLoader(
+        ds,
+        batch_size=args.per_device_train_batch_size,
+        shuffle=True,
+        collate_fn=collator,
+        drop_last=True,
+    )
+
+    loop_cfg = LoopConfig(
         output_dir=str(out),
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -149,23 +157,15 @@ def main():
         warmup_steps=args.warmup_steps,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
-        bf16=args.bf16,
-        fp16=args.fp16,
-        report_to=[],
-        remove_unused_columns=False,
-        save_total_limit=2,
+        max_grad_norm=args.max_grad_norm,
+        amp_dtype=amp_dtype,
+        ema_decay=0.0,
     )
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=ds,
-        data_collator=collator,
-    )
+    extra_state = {"stage": "lora_recovery", "args": vars(args)}
+    train_sft_single_device(model, dl, device, loop_cfg, tokenizer=tokenizer, extra_state=extra_state)
 
-    trainer.train()
-
-    # Save LoRA only
+    # Save LoRA only (recommended)
     lora_sd = extract_lora_state_dict(model)
     torch.save(lora_sd, out / "lora_only_state_dict.pt")
 
@@ -174,8 +174,6 @@ def main():
 
     with open(out / "training_args.json", "w") as f:
         json.dump(vars(args), f, indent=2)
-
-    tokenizer.save_pretrained(out)
 
     print(f"Done. Saved LoRA adapter to: {out/'lora_only_state_dict.pt'}")
 

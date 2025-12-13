@@ -1,5 +1,5 @@
 """
-Apple-style (paper-aligned) fake quantizer for 2-bit QAT.
+Apple-style fake quantizer for 2-bit QAT.
 
 Apple's tech report (2025) describes simulating quantization in the forward pass:
 
@@ -21,9 +21,8 @@ We implement a Newton-like *MSE-minimizing clipping scalar* routine as a reasona
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
-import math
 import torch
 
 

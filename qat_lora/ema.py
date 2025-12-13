@@ -2,12 +2,12 @@
 Exponential Moving Average (EMA) helper.
 
 Apple reports maintaining an EMA of weights during 2-bit QAT improved stability and metrics.
-We implement a lightweight EMA tracker compatible with HF Trainer.
+We implement a lightweight EMA tracker for our custom training loop.
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Dict, Iterator
+from typing import Dict, Callable, Optional
 import torch
 
 
@@ -19,10 +19,13 @@ class EMA:
         self.shadow: Dict[str, torch.Tensor] = {}
 
     @torch.no_grad()
-    def init(self, model: torch.nn.Module, include: callable | None = None):
+    def init(self, model: torch.nn.Module, include: Optional[Callable[[str, torch.nn.Parameter], bool]] = None):
         """
         Initialize shadow weights from model parameters.
-        include: optional predicate(name, param)->bool to filter which params are tracked
+
+        include:
+          Optional predicate(name, param)->bool to filter which params are tracked.
+          Default tracks all trainable params.
         """
         self.shadow = {}
         for name, p in model.named_parameters():
@@ -33,7 +36,7 @@ class EMA:
             self.shadow[name] = p.detach().clone()
 
     @torch.no_grad()
-    def update(self, model: torch.nn.Module, include: callable | None = None):
+    def update(self, model: torch.nn.Module, include: Optional[Callable[[str, torch.nn.Parameter], bool]] = None):
         """
         Update shadow weights:
             shadow = decay * shadow + (1-decay) * param
@@ -63,9 +66,7 @@ class EMA:
 
     @torch.no_grad()
     def restore(self, model: torch.nn.Module, backup: Dict[str, torch.Tensor]):
-        """
-        Restore params from a backup returned by apply_to.
-        """
+        """Restore params from a backup returned by apply_to()."""
         for name, p in model.named_parameters():
             if name in backup:
                 p.data.copy_(backup[name])

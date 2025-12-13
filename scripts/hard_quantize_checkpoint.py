@@ -35,7 +35,7 @@ from qat_lora.qat_linear import QATLinear
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--model_name_or_path", type=str, required=True)
+    p.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen3-0.6B")
     p.add_argument("--qat_checkpoint", type=str, required=True)
     p.add_argument("--output_path", type=str, required=True)
     p.add_argument("--skip_lm_head", action="store_true")
@@ -47,7 +47,7 @@ def main():
     args = parse_args()
     qc = QATQuantConfig()
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype="auto")
+    model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype=torch.float32)
     exclude = r"(^lm_head$)" if args.skip_lm_head else None
     replace_linear_with_qat(model, qc=qc, exclude_regex=exclude, verbose=False)
 
@@ -55,7 +55,7 @@ def main():
     model.load_state_dict(sd, strict=False)
 
     # Snap weights
-    for name, m in model.named_modules():
+    for _, m in model.named_modules():
         if isinstance(m, QATLinear):
             w_q = fake_quant_weight_2bit(m.weight, m.f(), qc)
             m.weight.data.copy_(w_q)  # overwrite

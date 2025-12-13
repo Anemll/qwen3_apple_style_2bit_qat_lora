@@ -16,9 +16,6 @@ This matches Apple's high-level recipe:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
-
 import math
 import torch
 import torch.nn as nn
@@ -33,7 +30,7 @@ class QATLinear(nn.Module):
         in_features: int,
         out_features: int,
         bias: bool = True,
-        qc: Optional[QATQuantConfig] = None,
+        qc: QATQuantConfig | None = None,
         # LoRA params (disabled by default)
         lora_r: int = 0,
         lora_alpha: float = 1.0,
@@ -95,8 +92,6 @@ class QATLinear(nn.Module):
 
         We store f via inverse-softplus so that softplus(_f_param) ~= f_init
         """
-        # Inverse softplus approximation:
-        # For y>0, x = log(exp(y) - 1)
         y = torch.tensor(float(f_init)).clamp(min=1e-8)
         self._f_param.data = torch.log(torch.exp(y) - 1.0)
 
@@ -126,7 +121,6 @@ class QATLinear(nn.Module):
 
         # Optional LoRA residual (kept in FP)
         if self.lora_r > 0:
-            # (batch, seq, in) -> (batch, seq, r) -> (batch, seq, out)
             x_d = self.lora_drop(x) if self.lora_drop is not None else x
             y = y + (x_d @ self.lora_A.t() @ self.lora_B.t()) * self.scaling
 

@@ -14,7 +14,7 @@ This is a standard supervised fine-tuning (SFT) pattern.
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Any
 
 import torch
 from transformers import PreTrainedTokenizerBase
@@ -55,7 +55,6 @@ def tokenize_chat_sft(
     Then:
       labels = full_ids; labels[:prompt_len] = -100
     """
-    # Split user and assistant
     user_msg = [messages[0]]
     full_msgs = messages
 
@@ -88,16 +87,11 @@ def tokenize_chat_sft(
     input_ids = full["input_ids"]
     attention_mask = full["attention_mask"]
 
-    # Mask prompt tokens
     labels = input_ids.copy()
     prompt_len = min(len(prompt_ids), len(labels))
     labels[:prompt_len] = [-100] * prompt_len
 
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "labels": labels,
-    }
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
 @dataclass
@@ -109,7 +103,6 @@ class DataCollatorForSFT:
     tokenizer: PreTrainedTokenizerBase
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        # Find max length in batch
         max_len = max(len(f["input_ids"]) for f in features)
 
         input_ids, attention_mask, labels = [], [], []

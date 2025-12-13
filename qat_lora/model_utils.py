@@ -10,20 +10,13 @@ from __future__ import annotations
 
 import re
 import math
-from typing import Dict, Iterable, Optional, Tuple, List
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 from .qat_linear import QATLinear
 from .quantizer import QATQuantConfig, init_f_from_weight
-
-
-def _iter_named_modules(model: nn.Module):
-    """Yield (module_name, module, parent_module, attribute_name)."""
-    for name, module in model.named_modules():
-        # named_modules yields root too; parent resolution is non-trivial.
-        pass
 
 
 def replace_linear_with_qat(
