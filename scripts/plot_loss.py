@@ -35,6 +35,25 @@ def _require_matplotlib():
     return plt
 
 
+def _configure_y_grid(ax, step: float):
+    from matplotlib.ticker import MultipleLocator  # type: ignore
+
+    ax.yaxis.set_minor_locator(MultipleLocator(step))
+    ax.grid(which="minor", axis="y", linestyle=":", linewidth=0.8, alpha=0.25)
+    ax.grid(which="major", axis="y", linestyle="--", linewidth=1.0, alpha=0.25)
+
+
+def _configure_y_grid_major_minor(ax, *, major_step: float, minor_step: float):
+    from matplotlib.ticker import MultipleLocator  # type: ignore
+
+    ax.yaxis.set_major_locator(MultipleLocator(major_step))
+    ax.yaxis.set_minor_locator(MultipleLocator(minor_step))
+    # Major lines: every 1.0 (solid)
+    ax.grid(which="major", axis="y", linestyle="-", linewidth=1.0, alpha=0.25)
+    # Minor lines: every 0.5 (more visible dotted)
+    ax.grid(which="minor", axis="y", linestyle=":", linewidth=1.1, alpha=0.35)
+
+
 def _parse_trainer_state(run_dir: Path) -> Tuple[List[float], List[float], str]:
     paths = sorted(glob.glob(str(run_dir / "checkpoint-*" / "trainer_state.json")))
     if not paths:
@@ -116,6 +135,24 @@ def parse_args():
     )
     p.add_argument("--save", type=str, default=None, help="Optional path to save a PNG.")
     p.add_argument("--no_show", action="store_true", help="Do not open a GUI window.")
+    p.add_argument(
+        "--ygrid_step",
+        type=float,
+        default=0.1,
+        help="Horizontal grid spacing on the loss axis (minor grid, dotted).",
+    )
+    p.add_argument(
+        "--y_major_step",
+        type=float,
+        default=1.0,
+        help="Major y-grid/tick spacing (solid).",
+    )
+    p.add_argument(
+        "--y_minor_step",
+        type=float,
+        default=0.5,
+        help="Minor y-grid spacing (dotted).",
+    )
     return p.parse_args()
 
 
@@ -143,15 +180,23 @@ def main():
         raise SystemExit(f"Could not find any loss source under {run_dir}. Last error: {last_err}")
 
     plt = _require_matplotlib()
-    plt.plot(xs, ys)
-    plt.xlabel("step")
-    plt.ylabel("loss")
-    plt.title(title)
+    fig, ax = plt.subplots()
+    ax.plot(xs, ys)
+    ax.set_xlabel("step")
+    ax.set_ylabel("loss")
+    ax.set_title(title)
+
+    # Y-grid: major every 1.0 (solid), minor every 0.5 (dotted).
+    if args.y_major_step and args.y_major_step > 0 and args.y_minor_step and args.y_minor_step > 0:
+        _configure_y_grid_major_minor(ax, major_step=args.y_major_step, minor_step=args.y_minor_step)
+    elif args.ygrid_step and args.ygrid_step > 0:
+        # Backwards-compatible single-step minor grid.
+        _configure_y_grid(ax, args.ygrid_step)
 
     if args.save:
         out = Path(args.save)
         out.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(out, dpi=150, bbox_inches="tight")
+        fig.savefig(out, dpi=150, bbox_inches="tight")
         print(f"Saved plot to: {out}")
 
     if not args.no_show:
