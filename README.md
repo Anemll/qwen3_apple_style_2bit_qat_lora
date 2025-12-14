@@ -69,6 +69,9 @@ Notes:
 - Use `--save_steps` to control checkpoint frequency and `--resume_from_checkpoint auto` to resume from the latest.
  - KD-QAT (`--teacher_model_name_or_path ...`) is supported for `dataset_format=text` (general text) and `dataset_format=alpaca` (chat SFT style).
 
+Quantization details:
+- Weight codebook is the **balanced 2-bit set** `{ -1.5, -0.5, 0.5, 1.5 }` (no zero level), multiplied by a learned scale `s`.
+
 Resume example:
 
 ```bash
@@ -88,6 +91,19 @@ you can run **knowledge-distillation QAT (KD-QAT)**:
 - Student: your quantized QAT model
 - Teacher: a frozen full-precision model (often the same base model)
 - Loss: KL(teacher || student) over next-token distributions (optionally mixed with CE via `--distill_weight`)
+
+### How distillation transfers “knowledge” into 2-bit QAT
+
+At a high level:
+- The **student** runs with Apple-style int2 fake-quant weights (4 balanced levels) in the forward pass (STE in backward),
+  so the model learns under the same quantization noise it will face at deployment.
+- The **teacher** is a frozen full-precision model that produces the target next-token probability distribution.
+- KD-QAT minimizes KL divergence between teacher and student next-token distributions (with temperature `T`):
+  this “soft target” contains more information than just the single correct token (“dark knowledge”).
+- Optionally, if `--distill_weight < 1.0`, the loss mixes in standard LM cross-entropy on labels:
+  `loss = w * KL + (1-w) * CE`.
+
+This is a good fit when the goal is **preserve behavior/knowledge under 2-bit compression** (rather than teach new skills).
 
 ### Streaming (low disk, needs network)
 
