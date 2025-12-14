@@ -61,6 +61,23 @@ At a high level:
 
 This is a good fit when the goal is **preserve behavior/knowledge under 2-bit compression** (rather than teach new skills).
 
+Concretely, KD-QAT here is **quantization-aware distillation**:
+
+- Student forward uses `QATLinear` (fake-quant weights in forward, STE in backward).
+- Teacher forward runs under `torch.no_grad()` and is never updated.
+- Distillation loss is KL on next-token distributions with temperature `T` (scaled by `T^2`):
+
+```text
+student_logits = student(input_ids).logits      # fake-quant weights
+with torch.no_grad():
+  teacher_logits = teacher(input_ids).logits    # frozen teacher
+
+loss = KL(softmax(teacher_logits/T) || softmax(student_logits/T)) * T^2
+```
+
+So the **teacher probabilities guide the gradient**, and because the student forward includes fake-quantized weights,
+the student learns to match the teacher **under 2-bit weight quantization**.
+
 ### Streaming (recommended default)
 
 ```bash
