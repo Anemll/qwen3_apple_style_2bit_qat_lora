@@ -56,15 +56,26 @@ python scripts/train_qat.py \
   --gradient_accumulation_steps 32 \
   --learning_rate 1e-5 \
   --max_steps 2000 \
+  --save_steps 200 \
   --skip_lm_head \
   --ema_decay 0.999
 ```
 
 Notes:
-- `--amp_dtype bf16` attempts MPS bf16 autocast. If your build can't allocate bf16 tensors on MPS,
-  it will fall back to fp16 automatically.
+- `--amp_dtype bf16` uses MPS bf16 autocast (requires bf16-capable MPS build). If you want automatic fallback,
+  use `--amp_dtype auto`.
 - `--param_dtype bf16` stores parameters in bf16 (saves memory). If you'd like maximum numerical stability,
   use `--param_dtype fp32` but expect higher memory.
+- Use `--save_steps` to control checkpoint frequency and `--resume_from_checkpoint auto` to resume from the latest.
+
+Resume example:
+
+```bash
+python scripts/train_qat.py \
+  --output_dir runs/qwen3_0p6b_qat2b \
+  --resume_from_checkpoint auto \
+  --max_steps 4000
+```
 
 ### CUDA (bf16)
 
@@ -81,6 +92,7 @@ python scripts/train_qat.py \
   --gradient_accumulation_steps 16 \
   --learning_rate 1e-5 \
   --max_steps 2000 \
+  --save_steps 200 \
   --skip_lm_head \
   --ema_decay 0.999
 ```
@@ -105,6 +117,7 @@ python scripts/train_lora_recovery.py \
   --gradient_accumulation_steps 32 \
   --learning_rate 2e-4 \
   --max_steps 1000 \
+  --save_steps 200 \
   --lora_r 32 \
   --lora_alpha 32 \
   --lora_dropout 0.05
@@ -118,7 +131,8 @@ Stage A output directory contains:
 - `qat_state_dict.pt` (convenience)
 - `final_state_dict.pt` (from the loop)
 - optional `final_state_dict_ema.pt` (if EMA enabled)
-- intermediate checkpoints every `--save_steps`
+- checkpoints: `checkpoint_step{N}.pt` and `checkpoint_last.pt` (full training state, used for resume)
+  - older `checkpoint_step*.pt` may be model-only; resume still works but optimizer/scheduler will reinitialize
 
 Stage B output directory contains:
 - `lora_only_state_dict.pt` (recommended)

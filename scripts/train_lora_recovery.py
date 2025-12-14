@@ -37,6 +37,13 @@ from qat_lora.mixed_precision import pick_device, resolve_amp_dtype, resolve_par
 from qat_lora.train_loop import LoopConfig, train_sft_single_device
 
 
+def _from_pretrained_fp32(model_name_or_path: str):
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_name_or_path, dtype=torch.float32)
+    except TypeError:
+        return AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float32)
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen3-0.6B")
@@ -71,6 +78,13 @@ def parse_args():
     p.add_argument("--lora_alpha", type=float, default=32.0)
     p.add_argument("--lora_dropout", type=float, default=0.05)
 
+    p.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to a training checkpoint .pt file. Use auto/latest/last to pick from output_dir.",
+    )
+
     return p.parse_args()
 
 
@@ -94,7 +108,7 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype=torch.float32)
+    model = _from_pretrained_fp32(args.model_name_or_path)
     model.config.use_cache = False
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
@@ -104,7 +118,14 @@ def main():
 
     replace_linear_with_qat(model, qc=qc, exclude_regex=exclude, verbose=False)
 
-    sd = torch.load(args.qat_checkpoint, map_location="cpu")
+    sd_obj = torch.load(args.qat_checkpoint, map_location="cpu")
+    # Allow passing either a plain state_dict, or a full training checkpoint produced by the custom loop.
+    if isinstance(sd_obj, dict) and "model" in sd_obj and "optimizer" in sd_obj and "opt_step" in sd_obj:
+        print(f"[qat_checkpoint] Detected full training checkpoint. Using sd_obj['model'] at opt_step={sd_obj.get('opt_step')}.")
+        sd = sd_obj["model"]
+    else:
+        sd = sd_obj
+
     missing, unexpected = model.load_state_dict(sd, strict=False)
     print(f"Loaded QAT checkpoint. missing={len(missing)} unexpected={len(unexpected)}")
     if unexpected:
@@ -122,6 +143,12 @@ def main():
         verbose=False,
     )
     print(f"Enabled LoRA on {lora_layers} layers. Trainable params: {trainable:,}")
+
+    # When training only adapters with gradient checkpointing enabled, we must ensure that
+    # checkpointed blocks receive inputs that require grads; otherwise, the checkpoint wrapper
+    # will drop the graph and backward() will error.
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
 
     # Dataset
     ds = load_dataset(args.dataset_name, split=args.dataset_split)
@@ -163,7 +190,15 @@ def main():
     )
 
     extra_state = {"stage": "lora_recovery", "args": vars(args)}
-    train_sft_single_device(model, dl, device, loop_cfg, tokenizer=tokenizer, extra_state=extra_state)
+    train_sft_single_device(
+        model,
+        dl,
+        device,
+        loop_cfg,
+        tokenizer=tokenizer,
+        extra_state=extra_state,
+        resume_from_checkpoint=args.resume_from_checkpoint,
+    )
 
     # Save LoRA only (recommended)
     lora_sd = extract_lora_state_dict(model)

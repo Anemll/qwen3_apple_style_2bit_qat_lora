@@ -1,32 +1,25 @@
 """
 Stage A: Apple-style 2-bit QAT on Qwen/Qwen3-0.6B (or any HF causal LM).
 
-Key differences vs a "vanilla" Transformers Trainer script:
-- We do NOT rely on HF Trainer AMP on MPS (which can be flaky depending on versions).
-- Instead we run a small manual loop with torch.amp.autocast.
+This script:
+- loads a HF causal LM
+- replaces nn.Linear with QATLinear (Apple-style fake-quant weights)
+- initializes per-layer learnable scale factor f (Newton-like clip estimator)
+- optionally applies layerwise grad scaling 1/sqrt(out_features)
+- trains with a custom single-device loop (MPS-friendly mixed precision)
+- optionally maintains EMA of weights during training
 
-On CUDA:
-- --amp_dtype fp16 => autocast fp16 + GradScaler
-- --amp_dtype bf16 => autocast bf16 (no scaler)
-
-On MPS:
-- autocast works (fp16 is widely supported; bf16 support depends on your build)
-- GradScaler is currently unreliable on MPS, so we do NOT use it.
-
-We also implement Apple-specific QAT details:
-- Replace nn.Linear with QATLinear (fake int2 weights with balanced levels)
-- Initialize per-layer f using Newton-like clip estimator
-- Optional layerwise grad scaling 1/sqrt(out_features)
-- Optional EMA of weights
-
-Apple also recommends weight_decay=0 for 2-bit QAT; this is the default here.
+Outputs in --output_dir:
+- qat_state_dict.pt (plain model state_dict, convenience)
+- final_state_dict.pt / final_state_dict_ema.pt (from the training loop)
+- checkpoint_step{N}.pt and checkpoint_last.pt (full training state, if --save_steps < max_steps)
+- loss.csv (logged loss points for plotting)
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -38,11 +31,22 @@ from transformers.utils import __version__ as transformers_version
 # Ensure local package imports work without installation.
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
+from qat_lora.data import DataCollatorForSFT, build_alpaca_messages, tokenize_chat_sft
+from qat_lora.model_utils import apply_layerwise_grad_scaling, init_all_f, replace_linear_with_qat
+from qat_lora.mixed_precision import pick_device, resolve_amp_dtype, resolve_param_dtype
 from qat_lora.quantizer import QATQuantConfig
-from qat_lora.model_utils import replace_linear_with_qat, init_all_f, apply_layerwise_grad_scaling
-from qat_lora.data import build_alpaca_messages, tokenize_chat_sft, DataCollatorForSFT
-from qat_lora.mixed_precision import pick_device, MPConfig, resolve_amp_dtype, resolve_param_dtype
 from qat_lora.train_loop import LoopConfig, train_sft_single_device
+
+
+def _from_pretrained_fp32(model_name_or_path: str):
+    """
+    Transformers is deprecating torch_dtype= in favor of dtype= in some versions.
+    Support both to avoid warnings/breakage across installs.
+    """
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_name_or_path, dtype=torch.float32)
+    except TypeError:
+        return AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float32)
 
 
 def parse_args():
@@ -59,7 +63,7 @@ def parse_args():
     p.add_argument("--gradient_accumulation_steps", type=int, default=16)
     p.add_argument("--learning_rate", type=float, default=1e-5)
     p.add_argument("--weight_decay", type=float, default=0.0)  # Apple recommends 0 for 2-bit QAT
-    p.add_argument("--max_steps", type=int, default=2000)       # optimizer steps
+    p.add_argument("--max_steps", type=int, default=2000)  # optimizer steps
     p.add_argument("--warmup_steps", type=int, default=100)
     p.add_argument("--logging_steps", type=int, default=10)
     p.add_argument("--save_steps", type=int, default=500)
@@ -77,10 +81,16 @@ def parse_args():
     p.add_argument("--init_newton_samples", type=int, default=65536)
     p.add_argument("--init_percentile", type=float, default=99.5)
 
-    p.add_argument("--enable_thinking", action="store_true", help="Qwen3 thinking mode in chat template. Default False.")
+    p.add_argument("--enable_thinking", action="store_true", help="Qwen3 thinking mode in chat template.")
     p.add_argument("--grad_scale", action="store_true", help="Apply layerwise grad scaling 1/sqrt(out_features).")
-
     p.add_argument("--ema_decay", type=float, default=0.0, help="If >0, maintain EMA with this decay (e.g., 0.999).")
+
+    p.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to a training checkpoint .pt file. Use auto/latest/last to pick from output_dir.",
+    )
 
     return p.parse_args()
 
@@ -100,31 +110,22 @@ def main():
     device = pick_device(args.device)
     amp_dtype = resolve_amp_dtype(args.amp_dtype, device)
     param_dtype = resolve_param_dtype(args.param_dtype, device)
-
     print(f"[device] {device} | amp_dtype={amp_dtype} | param_dtype={param_dtype}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load on CPU first (more predictable), then .to(device)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        torch_dtype=torch.float32,  # load in fp32, then cast below for stability control
-    )
+    # Load on CPU first (more predictable), then cast and train on device.
+    model = _from_pretrained_fp32(args.model_name_or_path)
     model.config.use_cache = False
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
 
-    # Replace Linear -> QATLinear (on CPU)
     qc = QATQuantConfig()
     exclude = r"(^lm_head$)" if args.skip_lm_head else None
 
-    print("Replacing Linear layers with QATLinear...")
-    n_rep = replace_linear_with_qat(model, qc=qc, exclude_regex=exclude, verbose=False)
-    print(f"Replaced {n_rep} Linear layers.")
-
-    print("Initializing f parameters...")
+    replace_linear_with_qat(model, qc=qc, exclude_regex=exclude, verbose=False)
     init_all_f(
         model,
         qc=qc,
@@ -134,13 +135,10 @@ def main():
         percentile=args.init_percentile,
         verbose=False,
     )
-
     if args.grad_scale:
-        print("Registering layerwise grad scaling hooks...")
         apply_layerwise_grad_scaling(model, verbose=False)
 
     # Cast parameters (after QATLinear creation) to desired dtype.
-    # NOTE: this affects memory and numerical stability.
     model = model.to(dtype=param_dtype)
 
     # Dataset
@@ -159,6 +157,7 @@ def main():
     collator = DataCollatorForSFT(tokenizer)
 
     from torch.utils.data import DataLoader
+
     dl = DataLoader(
         ds,
         batch_size=args.per_device_train_batch_size,
@@ -183,11 +182,18 @@ def main():
     )
 
     extra_state = {"stage": "qat", "args": vars(args)}
-    train_sft_single_device(model, dl, device, loop_cfg, tokenizer=tokenizer, extra_state=extra_state)
+    train_sft_single_device(
+        model,
+        dl,
+        device,
+        loop_cfg,
+        tokenizer=tokenizer,
+        extra_state=extra_state,
+        resume_from_checkpoint=args.resume_from_checkpoint,
+    )
 
-    # Save a convenient "qat_state_dict.pt" name (as in the earlier version of this repo)
+    # Convenience name used by the rest of the repo.
     torch.save(model.state_dict(), out / "qat_state_dict.pt")
-
     with open(out / "training_args.json", "w") as f:
         json.dump(vars(args), f, indent=2)
 
@@ -196,3 +202,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

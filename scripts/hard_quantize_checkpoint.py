@@ -47,7 +47,10 @@ def main():
     args = parse_args()
     qc = QATQuantConfig()
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype=torch.float32)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, dtype=torch.float32)
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype=torch.float32)
     exclude = r"(^lm_head$)" if args.skip_lm_head else None
     replace_linear_with_qat(model, qc=qc, exclude_regex=exclude, verbose=False)
 

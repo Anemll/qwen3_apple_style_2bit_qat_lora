@@ -57,8 +57,13 @@ class QATLinear(nn.Module):
         if self.lora_r > 0:
             # LoRA uses:  W + (alpha/r) * (B @ A)
             # Implemented as: x @ A^T @ B^T
-            self.lora_A = nn.Parameter(torch.zeros(self.lora_r, in_features))
-            self.lora_B = nn.Parameter(torch.zeros(out_features, self.lora_r))
+            # Keep adapter params on the same device/dtype as base weights to avoid dtype mismatches.
+            self.lora_A = nn.Parameter(
+                torch.zeros(self.lora_r, in_features, device=self.weight.device, dtype=self.weight.dtype)
+            )
+            self.lora_B = nn.Parameter(
+                torch.zeros(out_features, self.lora_r, device=self.weight.device, dtype=self.weight.dtype)
+            )
             self.scaling = self.lora_alpha / self.lora_r
             self.lora_drop = nn.Dropout(p=self.lora_dropout)
         else:
@@ -106,8 +111,13 @@ class QATLinear(nn.Module):
         self.lora_alpha = float(alpha)
         self.lora_dropout = float(dropout)
 
-        self.lora_A = nn.Parameter(torch.zeros(self.lora_r, self.in_features))
-        self.lora_B = nn.Parameter(torch.zeros(self.out_features, self.lora_r))
+        # Create on the same device/dtype as base weights to avoid dtype mismatches.
+        self.lora_A = nn.Parameter(
+            torch.zeros(self.lora_r, self.in_features, device=self.weight.device, dtype=self.weight.dtype)
+        )
+        self.lora_B = nn.Parameter(
+            torch.zeros(self.out_features, self.lora_r, device=self.weight.device, dtype=self.weight.dtype)
+        )
         self.scaling = self.lora_alpha / self.lora_r
         self.lora_drop = nn.Dropout(p=self.lora_dropout)
 
