@@ -1,0 +1,20 @@
+# Training outputs and checkpoints
+runs/
+*.pt
+
+# Environments
+.venv/
+.env
+
+# OS junk
+.DS_Store
+
+# Python cache/bytecode
+__pycache__/
+*.py[cod]
+
+# Build artifacts
+qat_lora.egg-info/
+__pycache__
+qat_lora/__pycache__/*
+*.pyc

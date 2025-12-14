@@ -67,6 +67,7 @@ Notes:
 - `--param_dtype bf16` stores parameters in bf16 (saves memory). If you'd like maximum numerical stability,
   use `--param_dtype fp32` but expect higher memory.
 - Use `--save_steps` to control checkpoint frequency and `--resume_from_checkpoint auto` to resume from the latest.
+ - KD-QAT (`--teacher_model_name_or_path ...`) is supported for `dataset_format=text` (general text) and `dataset_format=alpaca` (chat SFT style).
 
 Resume example:
 
@@ -76,6 +77,58 @@ python scripts/train_qat.py \
   --resume_from_checkpoint auto \
   --max_steps 4000
 ```
+
+---
+
+## Optional Stage A.2 — KD-QAT on Plain Text (C4 / general text)
+
+If your goal is **preserving the base model's behavior** under 2-bit weights (rather than learning new instruction-following behavior),
+you can run **knowledge-distillation QAT (KD-QAT)**:
+
+- Student: your quantized QAT model
+- Teacher: a frozen full-precision model (often the same base model)
+- Loss: KL(teacher || student) over next-token distributions (optionally mixed with CE via `--distill_weight`)
+
+### Streaming (low disk, needs network)
+
+```bash
+python scripts/train_qat.py \
+  --model_name_or_path Qwen/Qwen3-0.6B \
+  --teacher_model_name_or_path Qwen/Qwen3-0.6B \
+  --distill_weight 1.0 \
+  --distill_temperature 2.0 \
+  --dataset_name allenai/c4 \
+  --dataset_config_name en \
+  --dataset_split train \
+  --dataset_format text \
+  --dataset_text_field text \
+  --streaming \
+  --output_dir runs/qwen3_kdqat2b_c4_stream \
+  --device mps \
+  --amp_dtype bf16 \
+  --param_dtype bf16 \
+  --max_length 128 \
+  --per_device_train_batch_size 1 \
+  --gradient_accumulation_steps 16 \
+  --learning_rate 5e-6 \
+  --warmup_steps 0 \
+  --max_steps 1280 \
+  --skip_lm_head \
+  --ema_decay 0.999 \
+  --logging_steps 10 \
+  --save_steps 200
+```
+
+### Non-streaming (full download/cached, uses a lot of disk)
+
+Remove `--streaming` to download and build an on-disk dataset cache (Arrow).
+For `allenai/c4` `en` `train`, Hugging Face reports **1024 shards**; at ~300MB/shard compressed, the raw downloads alone are on the order of **hundreds of GB**.
+The built dataset cache can add additional disk usage.
+
+This is recommended if you want:
+- offline repeatability (no network required after caching)
+- faster/less jittery data loading
+- more stable resuming/restarts
 
 ### CUDA (bf16)
 
