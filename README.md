@@ -39,51 +39,7 @@ uv pip install -e .
 
 ---
 
-## Stage A — 2-bit QAT
-
-### MPS (recommended default)
-
-```bash
-python scripts/train_qat.py \
-  --model_name_or_path Qwen/Qwen3-0.6B \
-  --dataset_name tatsu-lab/alpaca \
-  --output_dir runs/qwen3_0p6b_qat2b \
-  --device mps \
-  --amp_dtype bf16 \
-  --param_dtype bf16 \
-  --max_length 512 \
-  --per_device_train_batch_size 1 \
-  --gradient_accumulation_steps 32 \
-  --learning_rate 1e-5 \
-  --max_steps 2000 \
-  --save_steps 200 \
-  --skip_lm_head \
-  --ema_decay 0.999
-```
-
-Notes:
-- `--amp_dtype bf16` uses MPS bf16 autocast (requires bf16-capable MPS build). If you want automatic fallback,
-  use `--amp_dtype auto`.
-- `--param_dtype bf16` stores parameters in bf16 (saves memory). If you'd like maximum numerical stability,
-  use `--param_dtype fp32` but expect higher memory.
-- Use `--save_steps` to control checkpoint frequency and `--resume_from_checkpoint auto` to resume from the latest.
- - KD-QAT (`--teacher_model_name_or_path ...`) is supported for `dataset_format=text` (general text) and `dataset_format=alpaca` (chat SFT style).
-
-Quantization details:
-- Weight codebook is the **balanced 2-bit set** `{ -1.5, -0.5, 0.5, 1.5 }` (no zero level), multiplied by a learned scale `s`.
-
-Resume example:
-
-```bash
-python scripts/train_qat.py \
-  --output_dir runs/qwen3_0p6b_qat2b \
-  --resume_from_checkpoint auto \
-  --max_steps 4000
-```
-
----
-
-## Optional Stage A.2 — KD-QAT on Plain Text (C4 / general text)
+## Stage A.2 — KD-QAT on Plain Text (recommended default for “preserve knowledge”)
 
 If your goal is **preserving the base model's behavior** under 2-bit weights (rather than learning new instruction-following behavior),
 you can run **knowledge-distillation QAT (KD-QAT)**:
@@ -105,7 +61,7 @@ At a high level:
 
 This is a good fit when the goal is **preserve behavior/knowledge under 2-bit compression** (rather than teach new skills).
 
-### Streaming (low disk, needs network)
+### Streaming (recommended default)
 
 ```bash
 python scripts/train_qat.py \
@@ -135,6 +91,10 @@ python scripts/train_qat.py \
   --save_steps 200
 ```
 
+Why streaming is the default here:
+- C4 `en` `train` is extremely large (1024 shards; hundreds of GB if fully downloaded).
+- Streaming lets you train on “infinite” text with low disk usage, at the cost of requiring network access.
+
 ### Non-streaming (full download/cached, uses a lot of disk)
 
 Remove `--streaming` to download and build an on-disk dataset cache (Arrow).
@@ -145,6 +105,32 @@ This is recommended if you want:
 - offline repeatability (no network required after caching)
 - faster/less jittery data loading
 - more stable resuming/restarts
+
+---
+
+## Stage A — 2-bit QAT (Alpaca / instruction SFT)
+
+### MPS (recommended default for instruction tuning / Alpaca-style SFT)
+
+```bash
+python scripts/train_qat.py \
+  --model_name_or_path Qwen/Qwen3-0.6B \
+  --dataset_name tatsu-lab/alpaca \
+  --output_dir runs/qwen3_0p6b_qat2b \
+  --device mps \
+  --amp_dtype bf16 \
+  --param_dtype bf16 \
+  --max_length 512 \
+  --per_device_train_batch_size 1 \
+  --gradient_accumulation_steps 32 \
+  --learning_rate 1e-5 \
+  --max_steps 2000 \
+  --save_steps 200 \
+  --skip_lm_head \
+  --ema_decay 0.999
+```
+
+---
 
 ### CUDA (bf16)
 
@@ -164,6 +150,24 @@ python scripts/train_qat.py \
   --save_steps 200 \
   --skip_lm_head \
   --ema_decay 0.999
+```
+
+Notes:
+- `--amp_dtype bf16` uses bf16 autocast. If you want automatic fallback, use `--amp_dtype auto`.
+- `--param_dtype bf16` stores parameters in bf16 (saves memory). If you'd like maximum numerical stability,
+  use `--param_dtype fp32` but expect higher memory.
+- Use `--save_steps` to control checkpoint frequency and `--resume_from_checkpoint auto` to resume from the latest.
+
+Quantization details:
+- Weight codebook is the **balanced 2-bit set** `{ -1.5, -0.5, 0.5, 1.5 }` (no zero level), multiplied by a learned scale `s`.
+
+Resume example:
+
+```bash
+python scripts/train_qat.py \
+  --output_dir runs/qwen3_0p6b_qat2b \
+  --resume_from_checkpoint auto \
+  --max_steps 4000
 ```
 
 ---
