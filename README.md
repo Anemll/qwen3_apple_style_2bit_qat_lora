@@ -193,6 +193,52 @@ Stage B output directory contains:
 
 ---
 
+## Plotting loss curves
+
+The custom training loop writes `loss.csv` in each run directory (columns: `step,loss,lr`).
+Plot it with:
+
+```bash
+python scripts/plot_loss.py --run_dir runs/qwen3_0p6b_qat2b
+python scripts/plot_loss.py --run_dir runs/qwen3_0p6b_qat2b_lora
+```
+
+If the curve is too noisy, increase `--logging_steps` (e.g. `10`) so each point is an average over more optimizer steps.
+
+---
+
+## Inference sanity checks (QAT-only vs QAT+LoRA)
+
+Use `scripts/run_inference.py` to compare generation with and without the LoRA adapter.
+
+### QAT-only
+
+```bash
+python scripts/run_inference.py \
+  --model_name_or_path Qwen/Qwen3-0.6B \
+  --qat_checkpoint runs/qwen3_0p6b_qat2b/final_state_dict_ema.pt \
+  --device mps \
+  --dtype bf16 \
+  --skip_lm_head \
+  --prompt "Explain QAT and why LoRA recovery helps."
+```
+
+### QAT + LoRA recovery
+
+```bash
+python scripts/run_inference.py \
+  --model_name_or_path Qwen/Qwen3-0.6B \
+  --qat_checkpoint runs/qwen3_0p6b_qat2b/final_state_dict_ema.pt \
+  --lora_checkpoint runs/qwen3_0p6b_qat2b_lora/lora_only_state_dict.pt \
+  --device mps \
+  --dtype bf16 \
+  --skip_lm_head \
+  --lora_r 32 --lora_alpha 32 --lora_dropout 0.0 \
+  --prompt "Explain QAT and why LoRA recovery helps."
+```
+
+---
+
 ## Optional: snap weights to the exact 2-bit grid
 
 ```bash
