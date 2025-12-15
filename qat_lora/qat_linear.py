@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .quantizer import QATQuantConfig, fake_quant_weight_2bit
+from .quantizer import QATQuantConfig, fake_quant_weight_nbit
 
 
 class QATLinear(nn.Module):
@@ -39,7 +39,11 @@ class QATLinear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.qc = qc or QATQuantConfig()
+        qc = qc or QATQuantConfig(n_bits=2)
+
+        # Persist bitwidth in state_dict so checkpoints cannot silently change bitwidth at inference time.
+        self.register_buffer("_qat_nbits", torch.tensor(int(qc.n_bits), dtype=torch.int16), persistent=True)
+        # z is a constant in this repo (0.5), but keep the config for scale/init routines outside this module.
 
         # Base (full-precision) weights
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
@@ -73,6 +77,10 @@ class QATLinear(nn.Module):
             self.lora_drop = None
 
         self.reset_parameters()
+
+    @property
+    def n_bits(self) -> int:
+        return int(self._qat_nbits.item())
 
     def reset_parameters(self):
         # Match nn.Linear default init approximately
@@ -125,8 +133,9 @@ class QATLinear(nn.Module):
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Apple-style fake-quantized weight in forward
-        w_q = fake_quant_weight_2bit(self.weight, self.f(), self.qc)
+        # Apple-style fake-quantized weight in forward (2/4-bit), with STE.
+        qc = QATQuantConfig(n_bits=self.n_bits)
+        w_q = fake_quant_weight_nbit(self.weight, self.f(), qc)
         y = F.linear(x, w_q, self.bias)
 
         # Optional LoRA residual (kept in FP)

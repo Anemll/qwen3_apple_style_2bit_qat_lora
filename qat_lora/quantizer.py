@@ -1,5 +1,5 @@
 """
-Apple-style fake quantizer for 2-bit QAT.
+Apple-style fake quantizer for low-bit (2/4-bit) QAT.
 
 Apple's tech report (2025) describes simulating quantization in the forward pass:
 
@@ -11,6 +11,11 @@ Apple also:
 - uses a learnable scaling factor f per tensor (not derived purely from W)
 - emphasizes careful initialization of f in the 2-bit regime via a Newton-inspired clip estimator
 - finds a "balanced" 2-bit set {-1.5, -0.5, 0.5, 1.5} is smoother than {-2, -1, 0, 1}
+
+This repo generalizes the same *balanced* (no-zero) construction to 4-bit by using
+half-integer codebooks:
+  - 2-bit: {-1.5, -0.5, 0.5, 1.5}
+  - 4-bit: {-7.5, -6.5, ..., 6.5, 7.5}  (16 levels)
 
 This module implements those pieces.
 
@@ -29,21 +34,37 @@ import torch
 @dataclass
 class QATQuantConfig:
     """
-    Quantization config for Apple-style 2-bit.
+    Quantization config for Apple-style low-bit weight QAT.
 
-    We want the *dequantized* codebook to be:
-        {-1.5, -0.5, 0.5, 1.5}
+    We want the *dequantized* codebook to be "balanced" (no zero level) using
+    half-integer centers.
 
-    One way to realize that with Apple's (qmin,qmax,z) formulation is:
-        qmin = -1, qmax = 2, z = 0.5
-    because:
-        (q - z) for q in {-1,0,1,2} is {-1.5,-0.5,0.5,1.5}
+    One way to realize that with Apple's (qmin,qmax,z) formulation is to use:
+      z = 0.5 and choose an integer range [qmin, qmax] of size 2^b such that
+      (q - z) produces half-integers.
 
-    This exactly matches the "balanced 2-bit set" Apple calls out.
+    For b=2:
+      qmin=-1, qmax=2 -> (q - 0.5) gives {-1.5, -0.5, 0.5, 1.5}
+
+    For b=4:
+      qmin=-7, qmax=8 -> (q - 0.5) gives {-7.5, -6.5, ..., 6.5, 7.5}
     """
-    qmin: int = -1
-    qmax: int = 2
+    n_bits: int = 2
     z: float = 0.5
+
+    def __post_init__(self):
+        if self.n_bits not in (2, 4):
+            raise ValueError(f"Only 2 or 4 bits supported (got {self.n_bits})")
+
+    @property
+    def qmin(self) -> int:
+        # 2-bit: -1, 4-bit: -7
+        return -((1 << (self.n_bits - 1)) - 1)
+
+    @property
+    def qmax(self) -> int:
+        # 2-bit: 2, 4-bit: 8
+        return 1 << (self.n_bits - 1)
 
     # Scale formula described by Apple:
     #   s = f * max(|W|) / qmax
@@ -65,7 +86,7 @@ def _round_ste(x: torch.Tensor) -> torch.Tensor:
     return x + (torch.round(x) - x).detach()
 
 
-def fake_quant_weight_2bit(
+def fake_quant_weight_nbit(
     weight: torch.Tensor,
     f: torch.Tensor,
     qc: QATQuantConfig,
@@ -78,7 +99,7 @@ def fake_quant_weight_2bit(
     qc: quant config (qmin,qmax,z)
 
     Returns:
-        dequantized tensor (same dtype as weight), but constrained to 4 levels per scale.
+        dequantized tensor (same dtype as weight), but constrained to 2^b levels per scale.
     """
     s = qc.compute_scale(weight, f)
 
@@ -96,6 +117,15 @@ def fake_quant_weight_2bit(
     w_deq = (w_q - qc.z) * s
     return w_deq
 
+
+def fake_quant_weight_2bit(weight: torch.Tensor, f: torch.Tensor, qc: Optional[QATQuantConfig] = None) -> torch.Tensor:
+    """
+    Back-compat wrapper. Prefer fake_quant_weight_nbit(..., QATQuantConfig(n_bits=...)).
+    """
+    qc2 = qc if qc is not None else QATQuantConfig(n_bits=2)
+    # If caller passed a config with n_bits != 2, honor the wrapper name and force 2-bit.
+    qc2 = QATQuantConfig(n_bits=2, z=float(getattr(qc2, "z", 0.5)))
+    return fake_quant_weight_nbit(weight, f, qc2)
 
 @torch.no_grad()
 def _mse(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:

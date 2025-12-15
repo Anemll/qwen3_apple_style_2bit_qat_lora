@@ -326,6 +326,15 @@ def parse_args():
     p.add_argument("--amp_dtype", type=str, default="auto", choices=["auto", "no", "bf16", "fp16"])
     p.add_argument("--param_dtype", type=str, default="auto", choices=["auto", "fp32", "bf16", "fp16"])
 
+    p.add_argument(
+        "-q",
+        "--quant_bits",
+        type=int,
+        default=2,
+        choices=[2, 4],
+        help="Weight quantization bits for QATLinear (2=default, 4=less aggressive).",
+    )
+
     p.add_argument("--skip_lm_head", action="store_true")
     p.add_argument("--enable_thinking", action="store_true")
 
@@ -389,7 +398,8 @@ def main():
     model = _from_pretrained_fp32(args.model_name_or_path)
     model.config.use_cache = False
 
-    qc = QATQuantConfig()
+    qc = QATQuantConfig(n_bits=int(args.quant_bits))
+    print(f"[qat] weight_bits={qc.n_bits}")
     exclude = r"(^lm_head$)" if args.skip_lm_head else None
     replace_linear_with_qat(model, qc=qc, exclude_regex=exclude, verbose=False)
 

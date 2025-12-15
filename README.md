@@ -185,6 +185,7 @@ Notes:
 
 Quantization details:
 - Weight codebook is the **balanced 2-bit set** `{ -1.5, -0.5, 0.5, 1.5 }` (no zero level), multiplied by a learned scale `s`.
+- You can switch to 4-bit with `-q 4` / `--quant_bits 4` (less aggressive). The balanced 4-bit codebook becomes `{ -7.5, -6.5, ..., 6.5, 7.5 }`.
 
 Resume example:
 

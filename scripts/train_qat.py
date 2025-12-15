@@ -517,6 +517,14 @@ def parse_args():
     p.add_argument("--param_dtype", type=str, default="auto", choices=["auto", "fp32", "bf16", "fp16"])
 
     # QAT config
+    p.add_argument(
+        "-q",
+        "--quant_bits",
+        type=int,
+        default=2,
+        choices=[2, 4],
+        help="Weight quantization bits for QATLinear (2=default, 4=less aggressive).",
+    )
     p.add_argument("--skip_lm_head", action="store_true", help="Do not quantize lm_head (recommended).")
     p.add_argument("--enable_thinking", action="store_true", help="Qwen3 thinking mode in chat template.")
     p.add_argument("--grad_scale", action="store_true", help="Apply layerwise grad scaling 1/sqrt(out_features).")
@@ -606,7 +614,8 @@ def main():
         model.gradient_checkpointing_enable()
 
     # Replace linear layers with QATLinear
-    qc = QATQuantConfig()
+    qc = QATQuantConfig(n_bits=int(args.quant_bits))
+    print(f"[qat] weight_bits={qc.n_bits}")
     exclude = r"(^lm_head$)" if args.skip_lm_head else None
     replace_linear_with_qat(model, qc=qc, exclude_regex=exclude, verbose=False)
 

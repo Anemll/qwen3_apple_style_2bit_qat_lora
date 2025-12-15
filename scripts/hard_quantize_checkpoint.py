@@ -33,7 +33,7 @@ from transformers import AutoModelForCausalLM
 # Ensure local package imports work without installation.
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from qat_lora.quantizer import QATQuantConfig, fake_quant_weight_2bit
+from qat_lora.quantizer import QATQuantConfig, fake_quant_weight_nbit
 from qat_lora.model_utils import replace_linear_with_qat
 from qat_lora.qat_linear import QATLinear
 
@@ -44,6 +44,15 @@ def parse_args():
     p.add_argument("--qat_checkpoint", type=str, required=True, help="Model-only or full training checkpoint .pt")
     p.add_argument("--output_path", type=str, required=True)
     p.add_argument("--skip_lm_head", action="store_true")
+    p.add_argument(
+        "-q",
+        "--quant_bits",
+        type=int,
+        default=2,
+        choices=[2, 4],
+        help="Bitwidth used when constructing QATLinear modules before loading a checkpoint. "
+        "If the checkpoint contains per-layer _qat_nbits buffers, those will override this.",
+    )
     return p.parse_args()
 
 
@@ -59,7 +68,7 @@ def _load_model_state_dict(path: str) -> Dict[str, torch.Tensor]:
 @torch.no_grad()
 def main():
     args = parse_args()
-    qc = QATQuantConfig()
+    qc = QATQuantConfig(n_bits=int(args.quant_bits))
 
     try:
         model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, dtype=torch.float32)
@@ -77,7 +86,8 @@ def main():
     # Snap weights
     for _, m in model.named_modules():
         if isinstance(m, QATLinear):
-            w_q = fake_quant_weight_2bit(m.weight, m.f(), qc)
+            qc_m = QATQuantConfig(n_bits=int(getattr(m, "n_bits", qc.n_bits)))
+            w_q = fake_quant_weight_nbit(m.weight, m.f(), qc_m)
             m.weight.data.copy_(w_q)  # overwrite
 
     torch.save(model.state_dict(), args.output_path)

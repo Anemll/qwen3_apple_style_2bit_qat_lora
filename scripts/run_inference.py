@@ -40,6 +40,15 @@ def parse_args():
     p.add_argument("--qat_checkpoint", type=str, required=True, help="Model-only state_dict (.pt).")
     p.add_argument("--lora_checkpoint", type=str, default=None, help="LoRA-only state_dict (.pt).")
     p.add_argument("--skip_lm_head", action="store_true")
+    p.add_argument(
+        "-q",
+        "--quant_bits",
+        type=int,
+        default=2,
+        choices=[2, 4],
+        help="Bitwidth used when constructing QATLinear modules before loading a checkpoint. "
+        "If the checkpoint contains per-layer _qat_nbits buffers, those will override this.",
+    )
     p.add_argument("--lora_r", type=int, default=32, help="LoRA rank (needed to set scaling).")
     p.add_argument("--lora_alpha", type=float, default=32.0, help="LoRA alpha (needed to set scaling).")
     p.add_argument("--lora_dropout", type=float, default=0.0)
@@ -139,7 +148,7 @@ def main():
     model.eval()
 
     # Rebuild QATLinear structure and load QAT weights
-    qc = QATQuantConfig()
+    qc = QATQuantConfig(n_bits=int(args.quant_bits))
     exclude = r"(^lm_head$)" if args.skip_lm_head else None
     replace_linear_with_qat(model, qc=qc, exclude_regex=exclude, verbose=False)
 
