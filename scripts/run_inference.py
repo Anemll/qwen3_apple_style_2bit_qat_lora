@@ -48,8 +48,16 @@ def parse_args():
     p.add_argument("--dtype", type=str, default="auto", choices=["auto", "fp32", "bf16", "fp16"])
 
     p.add_argument("--prompt", type=str, required=True)
+    p.add_argument("--plain_text", action="store_true", help="Do not apply the chat template; treat prompt as raw text.")
     p.add_argument("--enable_thinking", action="store_true")
     p.add_argument("--max_new_tokens", type=int, default=128)
+    p.add_argument(
+        "--do_sample",
+        type=str,
+        default="true",
+        choices=["true", "false"],
+        help="Whether to sample (true) or use greedy decoding (false).",
+    )
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top_p", type=float, default=0.9)
     return p.parse_args()
@@ -158,24 +166,34 @@ def main():
         print(f"[lora] loaded adapters for {enabled} layers from {args.lora_checkpoint}")
 
     # Build chat prompt
-    messages = [{"role": "user", "content": args.prompt}]
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=args.enable_thinking,
-    )
-    inputs = tokenizer(text, return_tensors="pt", add_special_tokens=False).to(device)
+    if args.plain_text:
+        inputs = tokenizer(args.prompt, return_tensors="pt").to(device)
+    else:
+        messages = [{"role": "user", "content": args.prompt}]
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=args.enable_thinking,
+        )
+        inputs = tokenizer(text, return_tensors="pt", add_special_tokens=False).to(device)
 
-    out = model.generate(
+    do_sample = args.do_sample.lower() == "true"
+    gen_kwargs = dict(
         **inputs,
         max_new_tokens=args.max_new_tokens,
-        do_sample=(args.temperature > 0),
-        temperature=args.temperature,
-        top_p=args.top_p,
+        do_sample=do_sample,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
+    if do_sample:
+        gen_kwargs["temperature"] = args.temperature
+        gen_kwargs["top_p"] = args.top_p
+    else:
+        gen_kwargs["temperature"] = 1.0
+        gen_kwargs["top_p"] = 1.0
+
+    out = model.generate(**gen_kwargs)
     decoded = tokenizer.decode(out[0], skip_special_tokens=False)
     print(decoded)
 

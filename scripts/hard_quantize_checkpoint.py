@@ -9,6 +9,10 @@ Important:
 - This does NOT pack weights into 2-bit storage.
 - True 2-bit inference needs custom packing + kernels.
 
+This script now accepts either:
+- a MODEL-ONLY checkpoint (state_dict), OR
+- a FULL training checkpoint (dict containing a "model" key)
+
 Usage:
   python scripts/hard_quantize_checkpoint.py \
     --model_name_or_path Qwen/Qwen3-0.6B \
@@ -21,6 +25,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Dict
 
 import torch
 from transformers import AutoModelForCausalLM
@@ -36,10 +41,19 @@ from qat_lora.qat_linear import QATLinear
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen3-0.6B")
-    p.add_argument("--qat_checkpoint", type=str, required=True)
+    p.add_argument("--qat_checkpoint", type=str, required=True, help="Model-only or full training checkpoint .pt")
     p.add_argument("--output_path", type=str, required=True)
     p.add_argument("--skip_lm_head", action="store_true")
     return p.parse_args()
+
+
+def _load_model_state_dict(path: str) -> Dict[str, torch.Tensor]:
+    obj = torch.load(path, map_location="cpu")
+    if isinstance(obj, dict) and "model" in obj and isinstance(obj["model"], dict):
+        return obj["model"]
+    if isinstance(obj, dict) and all(isinstance(k, str) for k in obj.keys()):
+        return obj
+    raise RuntimeError(f"Unrecognized checkpoint format: {path}")
 
 
 @torch.no_grad()
@@ -51,17 +65,21 @@ def main():
         model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, dtype=torch.float32)
     except TypeError:
         model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype=torch.float32)
+
     exclude = r"(^lm_head$)" if args.skip_lm_head else None
     replace_linear_with_qat(model, qc=qc, exclude_regex=exclude, verbose=False)
 
-    sd = torch.load(args.qat_checkpoint, map_location="cpu")
-    model.load_state_dict(sd, strict=False)
+    sd = _load_model_state_dict(args.qat_checkpoint)
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if missing or unexpected:
+        print(f"[load] missing={len(missing)} unexpected={len(unexpected)}")
 
     # Snap weights
     for _, m in model.named_modules():
         if isinstance(m, QATLinear):
             w_q = fake_quant_weight_2bit(m.weight, m.f(), qc)
             m.weight.data.copy_(w_q)  # overwrite
+
     torch.save(model.state_dict(), args.output_path)
     print(f"Saved snapped checkpoint to: {args.output_path}")
 

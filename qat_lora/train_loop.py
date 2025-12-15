@@ -425,6 +425,19 @@ def train_sft_single_device(
                 out = model(**batch)
                 loss = out.loss / micro_per_opt
 
+            # Fail fast on NaNs/Infs (common symptom of unstable low-precision runs).
+            if not torch.isfinite(loss).all():
+                # Best-effort save a model-only snapshot for debugging/repro.
+                try:
+                    _atomic_save(model.state_dict(), out_dir / f"nan_state_dict_step{opt_step}.pt")
+                except Exception as e:  # pragma: no cover
+                    print(f"[nan] WARNING: failed to save nan_state_dict_step{opt_step}.pt: {e}")
+                raise RuntimeError(
+                    f"Non-finite loss detected at opt_step={opt_step}. "
+                    "Try lowering learning_rate, increasing warmup_steps, using --amp_dtype no, "
+                    "and/or setting --param_dtype fp32."
+                )
+
             if scaler is not None:
                 scaler.scale(loss).backward()
             else:

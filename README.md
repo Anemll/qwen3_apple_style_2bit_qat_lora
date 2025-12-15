@@ -103,10 +103,18 @@ python scripts/train_qat.py \
   --warmup_steps 0 \
   --max_steps 1280 \
   --skip_lm_head \
-  --ema_decay 0.999 \
+  --ema_decay 0 \
   --logging_steps 10 \
   --save_steps 200
 ```
+
+Notes:
+- On macOS/MPS, `--ema_decay > 0` keeps an extra copy of model weights and can trigger OOM; use `--ema_decay 0` for KD-QAT unless you have headroom.
+- If you see degenerate generation (repetition / “word salad”) under KD-QAT, try:
+  - `--ov-freeze` (freeze all attention `v_proj/o_proj` weights), and optionally
+  - `--freeze-last-mlp --freeze-last-mlp-layers 1` (freeze the last layer’s MLP projections).
+- The `--ov-freeze` idea follows recent work on stabilizing low-bit training by freezing the attention `O/V` projections: https://arxiv.org/html/2403.18159v2
+- If you resume from a full training checkpoint while using these freezing options (or `--train_f_only`), the script will automatically resume **model-only** (reinit optimizer/scheduler, but keep step via filename).
 
 Why streaming is the default here:
 - C4 `en` `train` is extremely large (1024 shards; hundreds of GB if fully downloaded).
@@ -215,6 +223,63 @@ python scripts/train_lora_recovery.py \
 
 ---
 
+### Optional: KD-LoRA using a teacher top-k cache (MPS-friendly)
+
+If you want LoRA to **preserve teacher behavior** (rather than learn new skills), you can train LoRA with a cached distillation loss:
+
+1) Build a teacher cache (one-time):
+
+```bash
+python scripts/precompute_teacher_topk.py \
+  --teacher_model_name_or_path Qwen/Qwen3-0.6B \
+  --dataset_name allenai/c4 \
+  --dataset_config_name en \
+  --dataset_split train \
+  --dataset_text_field text \
+  --streaming \
+  --shuffle_buffer 10000 \
+  --max_length 64 \
+  --topk 32 \
+  --rand_neg 256 \
+  --num_sequences 20000 \
+  --batch_size 1 \
+  --shard_size 512 \
+  --device mps \
+  --dtype bf16 \
+  --output_dir caches/c4_qwen3_L64_K32_R256
+```
+
+2) Train LoRA with the cache (no teacher model loaded during training):
+
+```bash
+python scripts/train_lora_recovery.py \
+  --model_name_or_path Qwen/Qwen3-0.6B \
+  --qat_checkpoint runs/qwen3_kdqat2b_c4_stream/final_state_dict.pt \
+  --output_dir runs/qwen3_kd_lora_cached \
+  --device mps \
+  --amp_dtype bf16 \
+  --param_dtype bf16 \
+  --per_device_train_batch_size 1 \
+  --gradient_accumulation_steps 8 \
+  --learning_rate 5e-5 \
+  --max_steps 2000 \
+  --save_steps 50 \
+  --logging_steps 10 \
+  --skip_lm_head \
+  --lora_r 16 --lora_alpha 16 --lora_dropout 0.0 \
+  --kd_cache_dir caches/c4_qwen3_L64_K32_R256 \
+  --distill_temperature 2.0 \
+  --distill_weight 1.0
+```
+
+Notes:
+- Cache mode requires `--skip_lm_head` and currently uses pure KD (`--distill_weight 1.0`).
+- `--dataset_name` is ignored in cache mode (training reads cached sequences).
+- If KD loss looks good but inference degenerates (repetition / “word salad”), increase negative coverage (`--rand_neg 256` or higher) so “runaway” tokens are more likely to be penalized even if they’re not in teacher top-k.
+- If greedy decoding is still unstable, add one of these cache-mode stabilizers:
+  - `--hard-top1-weight 0.05` (aka `--hard_top1_weight`): adds an extra NLL term on the teacher top-1 token **within the cached candidate softmax** (top-k + random negatives). Cheap and usually helps.
+  - `--hard-full-top1-weight 0.02`–`0.05` (aka `--hard_full_top1_weight`): adds a **full-vocab** cross-entropy term on the teacher top-1 token (computed at the last non-pad prediction position only). More expensive, but directly targets “greedy argmax collapse”.
+
 ## What the scripts produce
 
 Stage A output directory contains:
@@ -303,4 +368,4 @@ python scripts/hard_quantize_checkpoint.py \
 
 ## License
 
-Apache-2.0
+MIT

@@ -1,13 +1,22 @@
 """
-Teacher top-k cache loader used for KD-LoRA without running the teacher at training time.
+Utilities for reading teacher top-k distillation caches produced by
+`scripts/precompute_teacher_topk.py`.
 
-Cache is produced by `scripts/precompute_teacher_topk.py` and contains:
+Each cache directory contains:
   - meta.json
-  - shard_*.pt files with tensors:
-      input_ids:      int32 [N, L]
-      attention_mask: int32 [N, L]
-      topk_idx:       int32 [N, L-1, K]
-      topk_logits:    float16 [N, L-1, K]   (raw teacher logits)
+  - shard_00000.pt, shard_00001.pt, ...
+
+Each shard is a torch.save()'d dict with:
+  - input_ids:     int32/long   [N, L]
+  - attention_mask: uint8/bool  [N, L]  (optional; if missing, assumed all-ones)
+  - topk_idx:      int32/long   [N, L-1, K]
+  - topk_logits:   float16      [N, L-1, K]   (raw teacher logits, not divided by T)
+  - rand_idx (optional):    int32/long [N, L-1, R]   (random negative token ids)
+  - rand_logits (optional): float16    [N, L-1, R]   (teacher logits for rand_idx)
+
+This module provides:
+  - TopKCacheDataset: iterable dataset streaming examples from shards
+  - topk_cache_collate: simple collator that stacks tensors into a batch
 """
 
 from __future__ import annotations
@@ -26,82 +35,122 @@ from torch.utils.data import IterableDataset
 class CacheMeta:
     max_length: Optional[int] = None
     topk: Optional[int] = None
+    rand_neg: Optional[int] = None
+    teacher_model: Optional[str] = None
+    tokenizer: Optional[str] = None
+    vocab_size: Optional[int] = None
     format: Optional[str] = None
 
 
 def load_cache_meta(cache_dir: str | Path) -> CacheMeta:
-    cache_dir = Path(cache_dir)
-    meta_path = cache_dir / "meta.json"
-    if not meta_path.exists():
-        raise FileNotFoundError(f"Missing meta.json in cache dir: {cache_dir}")
-    meta = json.loads(meta_path.read_text())
+    p = Path(cache_dir) / "meta.json"
+    if not p.exists():
+        return CacheMeta()
+    with open(p, "r") as f:
+        obj = json.load(f)
     return CacheMeta(
-        max_length=int(meta["max_length"]) if "max_length" in meta else None,
-        topk=int(meta["topk"]) if "topk" in meta else None,
-        format=meta.get("format"),
+        max_length=obj.get("max_length"),
+        topk=obj.get("topk"),
+        rand_neg=obj.get("rand_neg"),
+        teacher_model=obj.get("teacher_model"),
+        tokenizer=obj.get("tokenizer"),
+        vocab_size=obj.get("vocab_size"),
+        format=obj.get("format"),
     )
 
 
 class TopKCacheDataset(IterableDataset):
     """
-    Iterable dataset over cached shard_*.pt files.
+    Streams cached distillation examples from shard_*.pt files.
 
-    - Intended for num_workers=0.
-    - Each __iter__ reshuffles shard order if shuffle_files=True.
+    Each yielded item is a dict of CPU tensors:
+      - input_ids: [L] long
+      - attention_mask: [L] long
+      - topk_idx: [L-1, K] long
+      - topk_logits: [L-1, K] float16
     """
 
-    def __init__(self, cache_dir: str | Path, *, shuffle_files: bool = False, seed: int = 0):
+    def __init__(self, cache_dir: str | Path, shuffle_files: bool = False, seed: int = 0):
         super().__init__()
         self.cache_dir = Path(cache_dir)
-        self.shuffle_files = bool(shuffle_files)
-        self.seed = int(seed)
-        self._iter_calls = 0
+        self.shuffle_files = shuffle_files
+        self.seed = seed
 
         if not self.cache_dir.exists():
-            raise FileNotFoundError(f"Cache dir not found: {self.cache_dir}")
+            raise FileNotFoundError(f"Cache dir does not exist: {self.cache_dir}")
 
-        # Quick validation
-        _ = load_cache_meta(self.cache_dir)
+        self.files = sorted(self.cache_dir.glob("shard_*.pt"))
+        if not self.files:
+            raise FileNotFoundError(f"No shard_*.pt files found in cache dir: {self.cache_dir}")
 
-    def _list_shards(self) -> List[Path]:
-        shards = sorted(self.cache_dir.glob("shard_*.pt"))
-        if not shards:
-            raise FileNotFoundError(f"No shard_*.pt files found in {self.cache_dir}")
-        return shards
+        self.meta = load_cache_meta(self.cache_dir)
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        shards = self._list_shards()
-
+        files = list(self.files)
         if self.shuffle_files:
-            rng = random.Random(self.seed + self._iter_calls)
-            rng.shuffle(shards)
-        self._iter_calls += 1
+            rng = random.Random(self.seed)
+            rng.shuffle(files)
 
-        for shard_path in shards:
-            obj = torch.load(shard_path, map_location="cpu")
-            input_ids = obj["input_ids"]          # [N, L] int32
-            attention_mask = obj["attention_mask"]  # [N, L] int32
-            topk_idx = obj["topk_idx"]            # [N, L-1, K] int32
-            topk_logits = obj["topk_logits"]      # [N, L-1, K] float16
+        for f in files:
+            shard = torch.load(f, map_location="cpu")
+            input_ids = shard["input_ids"]
+            topk_idx = shard["topk_idx"]
+            topk_logits = shard["topk_logits"]
+            rand_idx = shard.get("rand_idx", None)
+            rand_logits = shard.get("rand_logits", None)
+
+            # attention_mask may be missing for older caches; default to all ones.
+            attn = shard.get("attention_mask", None)
+            if attn is None:
+                attn = torch.ones_like(input_ids, dtype=torch.long)
+
+            # Ensure common dtypes
+            if input_ids.dtype != torch.long:
+                input_ids = input_ids.long()
+            if attn.dtype != torch.long:
+                attn = attn.long()
+            if topk_idx.dtype != torch.long:
+                topk_idx = topk_idx.long()
+            if topk_logits.dtype != torch.float16 and topk_logits.dtype != torch.bfloat16:
+                # Store logits compactly; float16 is typical.
+                topk_logits = topk_logits.to(torch.float16)
 
             n = input_ids.shape[0]
             for i in range(n):
-                yield {
-                    "input_ids": input_ids[i].to(torch.long),
-                    "attention_mask": attention_mask[i].to(torch.long),
-                    "topk_idx": topk_idx[i].to(torch.int32),
-                    "topk_logits": topk_logits[i].to(torch.float16),
+                ex = {
+                    "input_ids": input_ids[i],
+                    "attention_mask": attn[i],
+                    "topk_idx": topk_idx[i],
+                    "topk_logits": topk_logits[i],
                 }
+                if rand_idx is not None and rand_logits is not None:
+                    ex["rand_idx"] = rand_idx[i]
+                    ex["rand_logits"] = rand_logits[i]
+                yield ex
 
 
-def topk_cache_collate(features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+def topk_cache_collate(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     """
-    Collate cached KD batches.
+    Stacks a list of examples into a batch. Intended for use as DataLoader collate_fn.
     """
-    return {
-        "input_ids": torch.stack([f["input_ids"] for f in features], dim=0),
-        "attention_mask": torch.stack([f["attention_mask"] for f in features], dim=0),
-        "topk_idx": torch.stack([f["topk_idx"] for f in features], dim=0),
-        "topk_logits": torch.stack([f["topk_logits"] for f in features], dim=0),
+    if not batch:
+        raise ValueError("Empty batch in topk_cache_collate")
+
+    input_ids = torch.stack([b["input_ids"] for b in batch], dim=0)
+    attention_mask = torch.stack([b["attention_mask"] for b in batch], dim=0)
+    topk_idx = torch.stack([b["topk_idx"] for b in batch], dim=0)
+    topk_logits = torch.stack([b["topk_logits"] for b in batch], dim=0)
+
+    out = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "topk_idx": topk_idx,
+        "topk_logits": topk_logits,
     }
 
+    # Optional rand negatives
+    if "rand_idx" in batch[0]:
+        out["rand_idx"] = torch.stack([b["rand_idx"] for b in batch], dim=0)
+        out["rand_logits"] = torch.stack([b["rand_logits"] for b in batch], dim=0)
+
+    return out
