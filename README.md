@@ -378,6 +378,11 @@ python scripts/run_inference.py \
   --prompt "Explain QAT and why LoRA recovery helps."
 ```
 
+Notes:
+- `run_inference.py` now strips special tokens (`<|im_start|>`, `<|endoftext|>`, `<think>` wrappers) by default. Add `--show_special_tokens` if you prefer to inspect the raw template output (useful for debugging chat formatting).
+- Use `--enable_thinking true/false` to render Qwen3 prompts with or without `<think>` blocks, matching how you trained or cached KD data.
+- Keep `--skip_lm_head` aligned with how you trained (set it if you skipped quantizing the head during QAT).
+
 ---
 
 ## Optional: snap weights to the exact 2-bit grid

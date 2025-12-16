@@ -65,6 +65,11 @@ def parse_args():
         choices=["true", "false"],
         help="Controls whether the chat template emits a think block.",
     )
+    p.add_argument(
+        "--show_special_tokens",
+        action="store_true",
+        help="Print decoded text with special tokens (default strips them).",
+    )
     p.add_argument("--max_new_tokens", type=int, default=128)
     p.add_argument(
         "--do_sample",
@@ -211,7 +216,11 @@ def main():
 
     out = model.generate(**gen_kwargs)
     decoded = tokenizer.decode(out[0], skip_special_tokens=False)
-    print(decoded)
+    if args.show_special_tokens:
+        print(decoded)
+    else:
+        cleaned = tokenizer.decode(out[0], skip_special_tokens=True).strip()
+        print(cleaned)
 
 
 if __name__ == "__main__":
