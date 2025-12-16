@@ -543,6 +543,13 @@ def parse_args():
         default=None,
         help="Path to a training checkpoint .pt file. Use auto/latest/last to pick from output_dir.",
     )
+    p.add_argument(
+        "--init_model_state",
+        type=str,
+        default=None,
+        help="Optional model.state_dict .pt to load before training (e.g., previous QAT run). "
+        "Incompatible with --resume_from_checkpoint.",
+    )
 
     # KD cache mode (optional)
     p.add_argument("--kd_cache_dir", type=str, default=None, help="Path to teacher top-k cache dir (meta.json + shards).")
@@ -635,6 +642,31 @@ def main():
 
     # Cast parameters after QATLinear creation
     model = model.to(dtype=param_dtype)
+
+    if args.init_model_state:
+        if args.resume_from_checkpoint:
+            raise ValueError("--init_model_state cannot be combined with --resume_from_checkpoint.")
+        ckpt_path = Path(args.init_model_state)
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"init_model_state path does not exist: {ckpt_path}")
+        print(f"[init] loading model state from {ckpt_path}")
+        obj = torch.load(ckpt_path, map_location="cpu")
+        state_dict = None
+        if isinstance(obj, dict):
+            if all(torch.is_tensor(v) for v in obj.values()):
+                state_dict = obj
+            elif "model" in obj and isinstance(obj["model"], dict):
+                state_dict = obj["model"]
+            elif "state_dict" in obj and isinstance(obj["state_dict"], dict):
+                state_dict = obj["state_dict"]
+        if state_dict is None:
+            raise RuntimeError(f"Could not interpret checkpoint format at {ckpt_path}; expected a model.state_dict.")
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"[init] missing keys: {missing[:10]}{'...' if len(missing) > 10 else ''}")
+        if unexpected:
+            print(f"[init] unexpected keys: {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}")
+        print("[init] model weights loaded.")
 
     # Optional KD cache mode
     if args.kd_cache_dir:

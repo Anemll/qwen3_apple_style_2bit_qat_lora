@@ -116,6 +116,16 @@ Notes:
 - The `--ov-freeze` idea follows recent work on stabilizing low-bit training by freezing the attention `O/V` projections: https://arxiv.org/html/2403.18159v2
 - If you resume from a full training checkpoint while using these freezing options (or `--train_f_only`), the script will automatically resume **model-only** (reinit optimizer/scheduler, but keep step via filename).
 
+Need to restart Stage A but reuse weights from a previous QAT run (e.g., to try a different KD cache) without resuming the old optimizer state? Give `--init_model_state` the path to your earlier `qat_state_dict.pt`:
+
+```bash
+python scripts/train_qat.py \
+  ... \
+  --init_model_state runs/qwen3_kdqat2b_c4_stream/qat_state_dict.pt
+```
+
+This loads the model weights before training begins; it is mutually exclusive with `--resume_from_checkpoint`.
+
 Why streaming is the default here:
 - C4 `en` `train` is extremely large (1024 shards; hundreds of GB if fully downloaded).
 - Streaming lets you train on “infinite” text with low disk usage, at the cost of requiring network access.
