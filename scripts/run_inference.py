@@ -58,7 +58,13 @@ def parse_args():
 
     p.add_argument("--prompt", type=str, required=True)
     p.add_argument("--plain_text", action="store_true", help="Do not apply the chat template; treat prompt as raw text.")
-    p.add_argument("--enable_thinking", action="store_true")
+    p.add_argument(
+        "--enable_thinking",
+        type=str,
+        default="false",
+        choices=["true", "false"],
+        help="Controls whether the chat template emits a think block.",
+    )
     p.add_argument("--max_new_tokens", type=int, default=128)
     p.add_argument(
         "--do_sample",
@@ -135,6 +141,7 @@ def main():
     args = parse_args()
     device = _pick_device(args.device)
     dtype = _resolve_dtype(args.dtype, device)
+    enable_thinking = args.enable_thinking.lower() == "true"
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     if tokenizer.pad_token_id is None:
@@ -183,7 +190,7 @@ def main():
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=args.enable_thinking,
+            enable_thinking=enable_thinking,
         )
         inputs = tokenizer(text, return_tensors="pt", add_special_tokens=False).to(device)
 

@@ -25,7 +25,7 @@ Important notes:
 - We "pack" raw text into contiguous token blocks of length L to maximize token efficiency.
 - The cache stores teacher logits for predicting the NEXT token (positions 0..L-2).
 
-Example:
+Examples:
 python scripts/precompute_teacher_topk.py \
   --teacher_model_name_or_path Qwen/Qwen3-0.6B \
   --dataset_name allenai/c4 \
@@ -42,6 +42,22 @@ python scripts/precompute_teacher_topk.py \
   --device mps \
   --dtype bf16 \
   --output_dir caches/c4_qwen3_topk_L64_K32
+
+python scripts/precompute_teacher_topk.py \
+  --teacher_model_name_or_path Qwen/Qwen3-0.6B \
+  --dataset_name tatsu-lab/alpaca \
+  --dataset_split train \
+  --dataset_format alpaca_chat \
+  --enable_thinking both \
+  --max_length 128 \
+  --topk 32 \
+  --rand_neg 256 \
+  --num_sequences 20000 \
+  --batch_size 1 \
+  --shard_size 512 \
+  --device mps \
+  --dtype bf16 \
+  --output_dir caches/alpaca_chat_think_L128_K32_R256
 """
 
 from __future__ import annotations
@@ -68,6 +84,11 @@ try:
 except Exception:
     pick_device = None
     resolve_param_dtype = None
+
+try:
+    from qat_lora.data import build_alpaca_messages
+except Exception:
+    build_alpaca_messages = None
 
 
 def _from_pretrained_fp32(model_name_or_path: str):
@@ -106,6 +127,46 @@ def _resolve_dtype_fallback(dtype: str, device: str) -> torch.dtype:
     raise ValueError(f"Unknown dtype: {dtype}")
 
 
+def _chat_text_variants(tokenizer, messages: List[dict], thinking_mode: str) -> Iterator[str]:
+    mode = (thinking_mode or "false").lower()
+    if mode not in ("false", "true", "both"):
+        raise ValueError(f"Unknown thinking mode: {thinking_mode}")
+    flags = [False, True] if mode == "both" else [mode == "true"]
+    for enable in flags:
+        yield tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            enable_thinking=enable,
+        )
+
+
+def _iter_text_samples(dataset_iter: Iterator[dict], args, tokenizer) -> Iterator[str]:
+    fmt = args.dataset_format
+    if fmt == "plain":
+        field = args.dataset_text_field
+        for ex in dataset_iter:
+            txt = ex.get(field, None)
+            if not isinstance(txt, str):
+                continue
+            txt = txt.strip()
+            if not txt:
+                continue
+            yield txt
+    elif fmt in ("alpaca", "alpaca_chat"):
+        if build_alpaca_messages is None:
+            raise RuntimeError("dataset_format=alpaca requires qat_lora.data to be importable.")
+        for ex in dataset_iter:
+            messages = build_alpaca_messages(ex)
+            if not messages:
+                continue
+            for rendered in _chat_text_variants(tokenizer, messages, args.enable_thinking):
+                if rendered:
+                    yield rendered
+    else:
+        raise ValueError(f"Unknown dataset_format={fmt}")
+
+
 class PackedTokenStream:
     """
     Packs text samples into fixed-length token blocks.
@@ -113,25 +174,20 @@ class PackedTokenStream:
 
     def __init__(
         self,
-        dataset_iter: Iterator[dict],
+        text_iter: Iterator[str],
         tokenizer,
-        text_field: str,
         max_length: int,
         add_eos: bool = True,
     ):
-        self.dataset_iter = dataset_iter
+        self.text_iter = text_iter
         self.tokenizer = tokenizer
-        self.text_field = text_field
         self.max_length = max_length
         self.add_eos = add_eos
         self._buf: List[int] = []
 
     def __iter__(self):
         eos = self.tokenizer.eos_token_id
-        for ex in self.dataset_iter:
-            txt = ex.get(self.text_field, None)
-            if txt is None:
-                continue
+        for txt in self.text_iter:
             ids = self.tokenizer(txt, add_special_tokens=False).input_ids
             if not ids:
                 continue
@@ -152,9 +208,23 @@ def parse_args():
     p.add_argument("--dataset_name", type=str, required=True)
     p.add_argument("--dataset_config_name", type=str, default=None)
     p.add_argument("--dataset_split", type=str, default="train")
-    p.add_argument("--dataset_text_field", type=str, default="text")
+    p.add_argument(
+        "--dataset_format",
+        type=str,
+        default="plain",
+        choices=["plain", "alpaca", "alpaca_chat"],
+        help="plain=use dataset_text_field contents. alpaca/alpaca_chat render a chat template.",
+    )
+    p.add_argument("--dataset_text_field", type=str, default="text", help="Used when dataset_format=plain.")
     p.add_argument("--streaming", action="store_true")
     p.add_argument("--shuffle_buffer", type=int, default=0, help="If streaming, shuffle with this buffer size.")
+    p.add_argument(
+        "--enable_thinking",
+        type=str,
+        default="false",
+        choices=["false", "true", "both"],
+        help="When dataset_format uses chat templates, control whether thinking is disabled, enabled, or both per sample.",
+    )
 
     p.add_argument("--max_length", type=int, default=64)
     p.add_argument("--topk", type=int, default=32)
@@ -223,10 +293,11 @@ def main():
         ds = ds.shuffle(seed=args.seed)
         ds_iter = iter(ds)
 
+    text_iter = _iter_text_samples(ds_iter, args, tokenizer)
+
     packed = PackedTokenStream(
-        dataset_iter=ds_iter,
+        text_iter=text_iter,
         tokenizer=tokenizer,
-        text_field=args.dataset_text_field,
         max_length=args.max_length,
         add_eos=True,
     )
@@ -236,6 +307,12 @@ def main():
         "format": "qwen_kd_topk_cache_v1",
         "teacher_model": args.teacher_model_name_or_path,
         "tokenizer": args.teacher_model_name_or_path,
+        "dataset_name": args.dataset_name,
+        "dataset_config_name": args.dataset_config_name,
+        "dataset_split": args.dataset_split,
+        "dataset_format": args.dataset_format,
+        "dataset_text_field": args.dataset_text_field,
+        "chat_thinking": args.enable_thinking,
         "max_length": args.max_length,
         "topk": args.topk,
         "rand_neg": int(args.rand_neg),

@@ -250,6 +250,34 @@ python scripts/precompute_teacher_topk.py \
   --output_dir caches/c4_qwen3_L64_K32_R256
 ```
 
+Need a cache that reflects **Qwen3's chat template with optional thinking traces**? Set `--dataset_format alpaca_chat` (or `alpaca`) and choose a thinking mode:
+
+- `--enable_thinking false` renders the chat template without `<think>` content.
+- `--enable_thinking true` forces the template to include the model’s reasoning block.
+- `--enable_thinking both` duplicates each conversation twice (thinking disabled+enabled) before packing, so distillation sees the same variants the student will see at inference time.
+
+Example:
+
+```bash
+python scripts/precompute_teacher_topk.py \
+  --teacher_model_name_or_path Qwen/Qwen3-0.6B \
+  --dataset_name tatsu-lab/alpaca \
+  --dataset_split train \
+  --dataset_format alpaca_chat \
+  --enable_thinking both \
+  --max_length 128 \
+  --topk 32 \
+  --rand_neg 256 \
+  --num_sequences 20000 \
+  --batch_size 1 \
+  --shard_size 512 \
+  --device mps \
+  --dtype bf16 \
+  --output_dir caches/alpaca_chat_think_both_L128_K32_R256
+```
+
+Why store both? Some downstream configs ask the student to answer with thinking on, others with thinking off. If we cache only one template, the KD loss encourages the LoRA/QAT model to imitate logits for that template, but greedy decoding on the other template can diverge (different BOS tokens, different `<think>` span). Building a mixed cache lets us reuse the same teacher run for both inference styles and reduces the risk of “word salad” or repetition when toggling thinking at generation time.
+
 2) Train LoRA with the cache (no teacher model loaded during training):
 
 ```bash
