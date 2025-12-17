@@ -63,6 +63,12 @@ from torch.utils.data import DataLoader, IterableDataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.utils import __version__ as transformers_version
 
+# Optional collator for plain-text LM datasets
+try:
+    from transformers import DataCollatorForLanguageModeling
+except Exception:  # pragma: no cover
+    DataCollatorForLanguageModeling = None  # type: ignore
+
 # Ensure local package imports work without installation.
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
@@ -86,6 +92,75 @@ def _from_pretrained_fp32(model_name_or_path: str):
         return AutoModelForCausalLM.from_pretrained(model_name_or_path, dtype=torch.float32)
     except TypeError:
         return AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float32)
+
+
+def _install_teacher_kd_forward(
+    student_model: torch.nn.Module,
+    teacher_model: torch.nn.Module,
+    *,
+    distill_weight: float,
+    temperature: float,
+) -> None:
+    """
+    Monkeypatch student_model.forward so it returns .loss computed as:
+      loss = w * KL(teacher || student) + (1-w) * CE(labels)
+    over next-token distributions (shifted like standard causal LM loss).
+    """
+    if not (0.0 <= distill_weight <= 1.0):
+        raise ValueError(f"distill_weight must be in [0,1]. Got {distill_weight}")
+    if temperature <= 0:
+        raise ValueError(f"distill_temperature must be >0. Got {temperature}")
+
+    orig_forward = student_model.forward
+    T = float(temperature)
+    w = float(distill_weight)
+
+    def forward_kd(input_ids=None, attention_mask=None, labels=None, **kwargs):
+        kwargs.setdefault("return_dict", True)
+        kwargs.setdefault("use_cache", False)
+
+        # Student forward; compute CE only if needed.
+        if w < 1.0 and labels is not None:
+            s_out = orig_forward(input_ids=input_ids, attention_mask=attention_mask, labels=labels, **kwargs)
+            ce_loss = s_out.loss
+        else:
+            s_out = orig_forward(input_ids=input_ids, attention_mask=attention_mask, labels=None, **kwargs)
+            ce_loss = None
+
+        s_logits = s_out.logits
+
+        with torch.no_grad():
+            t_out = teacher_model(input_ids=input_ids, attention_mask=attention_mask, labels=None, **kwargs)
+            t_logits = t_out.logits
+
+        s = s_logits[:, :-1, :]
+        t = t_logits[:, :-1, :]
+
+        if labels is not None:
+            y = labels[:, 1:]
+            mask = (y != -100)
+        elif attention_mask is not None:
+            mask = attention_mask[:, 1:].bool()
+        else:
+            mask = torch.ones(s.shape[:2], dtype=torch.bool, device=s.device)
+
+        log_p_s = F.log_softmax(s / T, dim=-1)
+        p_t = F.softmax(t / T, dim=-1)
+        kd_per_tok = F.kl_div(log_p_s, p_t, reduction="none").sum(-1)  # [B,S]
+
+        denom = mask.sum().clamp(min=1)
+        kd_loss = (kd_per_tok * mask).sum() / denom
+        kd_loss = kd_loss * (T * T)
+
+        if ce_loss is not None and w < 1.0:
+            loss = w * kd_loss + (1.0 - w) * ce_loss
+        else:
+            loss = kd_loss
+
+        s_out.loss = loss
+        return s_out
+
+    student_model.forward = forward_kd  # type: ignore[attr-defined]
 
 
 def _get_base_transformer(causal_lm: torch.nn.Module) -> torch.nn.Module:
@@ -496,8 +571,14 @@ def parse_args():
 
     # Dataset (used only when NOT using kd_cache_dir)
     p.add_argument("--dataset_name", type=str, default="tatsu-lab/alpaca")
+    p.add_argument("--dataset_config_name", type=str, default=None, help="Optional HF dataset config name (e.g. c4: en).")
     p.add_argument("--dataset_split", type=str, default="train")
-    p.add_argument("--dataset_format", type=str, choices=["alpaca"], default="alpaca")
+    p.add_argument("--dataset_format", type=str, choices=["alpaca", "text"], default="alpaca")
+    p.add_argument("--dataset_text_field", type=str, default="text", help="For dataset_format=text, which field contains the text.")
+    p.add_argument("--streaming", action="store_true", help="Stream the dataset (avoid full download).")
+    p.add_argument("--shuffle_buffer", type=int, default=10_000, help="Streaming shuffle buffer size (0 disables).")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--trust_remote_code", action="store_true", help="Pass trust_remote_code=True to HF dataset/model loaders.")
 
     # Training
     p.add_argument("--max_length", type=int, default=1024)
@@ -556,6 +637,14 @@ def parse_args():
     p.add_argument("--kd_cache_shuffle_files", action="store_true", help="Shuffle cache shard file order each epoch.")
     p.add_argument("--distill_temperature", type=float, default=2.0, help="KD temperature (typical: 1.0 or 2.0).")
     p.add_argument("--distill_weight", type=float, default=1.0, help="Weight for KD term (candidate-set KL).")
+    p.add_argument(
+        "--teacher_model_name_or_path",
+        type=str,
+        default=None,
+        help="Enable online KD-QAT (full-vocab KL) with a frozen teacher model. "
+        "If set, KD is applied on top of the chosen dataset (alpaca or text). "
+        "For MPS, cached KD via --kd_cache_dir is usually faster/cheaper.",
+    )
 
     p.add_argument(
         "--hard-top1-weight", "--hard_top1_weight",
@@ -668,6 +757,22 @@ def main():
             print(f"[init] unexpected keys: {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}")
         print("[init] model weights loaded.")
 
+    # Optional online teacher KD (full-vocab KL). (Cache KD is handled below.)
+    if args.teacher_model_name_or_path and not args.kd_cache_dir:
+        teacher = _from_pretrained_fp32(args.teacher_model_name_or_path)
+        teacher.config.use_cache = False
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad = False
+        teacher = teacher.to(device=device, dtype=param_dtype)
+        print(f"[kd] teacher={args.teacher_model_name_or_path} | weight={args.distill_weight} | T={args.distill_temperature}")
+        _install_teacher_kd_forward(
+            model,
+            teacher,
+            distill_weight=float(args.distill_weight),
+            temperature=float(args.distill_temperature),
+        )
+
     # Optional KD cache mode
     if args.kd_cache_dir:
         ds_cache = TopKCacheIterableDataset(
@@ -708,24 +813,55 @@ def main():
             drop_last=True,
         )
     else:
-        # Standard SFT-QAT over dataset
-        ds = load_dataset(args.dataset_name, split=args.dataset_split)
+        # Dataset-driven training (SFT-QAT or online KD-QAT depending on teacher flag).
+        ds_kwargs = {"split": args.dataset_split, "streaming": bool(args.streaming)}
+        if args.dataset_config_name:
+            ds_kwargs["name"] = args.dataset_config_name
+        if args.trust_remote_code:
+            ds_kwargs["trust_remote_code"] = True
+        ds = load_dataset(args.dataset_name, **ds_kwargs)
 
-        def map_fn(ex):
-            msgs = build_alpaca_messages(ex)
-            return tokenize_chat_sft(
-                tokenizer=tokenizer,
-                messages=msgs,
-                max_length=args.max_length,
-                enable_thinking=args.enable_thinking,
-            )
+        if args.streaming and args.shuffle_buffer and args.shuffle_buffer > 0:
+            try:
+                ds = ds.shuffle(buffer_size=int(args.shuffle_buffer), seed=int(args.seed))
+            except Exception as e:
+                print(f"[warn] dataset.shuffle failed in streaming mode: {e}. Continuing without shuffle.")
 
-        ds = ds.map(map_fn, remove_columns=ds.column_names)
-        collator = DataCollatorForSFT(tokenizer)
+        if args.dataset_format == "alpaca":
+            def map_fn(ex):
+                msgs = build_alpaca_messages(ex)
+                return tokenize_chat_sft(
+                    tokenizer=tokenizer,
+                    messages=msgs,
+                    max_length=args.max_length,
+                    enable_thinking=args.enable_thinking,
+                )
+
+            ds = ds.map(map_fn, remove_columns=getattr(ds, "column_names", None))
+            # With small max_length, some examples may truncate away all assistant tokens (labels all -100).
+            ds = ds.filter(lambda ex: any(l != -100 for l in ex["labels"]))
+            collator = DataCollatorForSFT(tokenizer)
+        elif args.dataset_format == "text":
+            if DataCollatorForLanguageModeling is None:
+                raise RuntimeError("DataCollatorForLanguageModeling not available; upgrade transformers.")
+
+            field = args.dataset_text_field
+
+            def map_fn(ex):
+                txt = ex.get(field, None)
+                if txt is None:
+                    raise KeyError(f"dataset_format=text expects field '{field}'. Keys: {list(ex.keys())}")
+                return tokenizer(txt, truncation=True, max_length=args.max_length)
+
+            ds = ds.map(map_fn, remove_columns=getattr(ds, "column_names", None))
+            collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+        else:
+            raise ValueError(f"Unsupported dataset_format: {args.dataset_format}")
+
         dl = DataLoader(
             ds,
             batch_size=args.per_device_train_batch_size,
-            shuffle=True,
+            shuffle=not bool(args.streaming),
             collate_fn=collator,
             drop_last=True,
         )
