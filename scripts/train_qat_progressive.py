@@ -465,6 +465,10 @@ def train_progressive_qat(args):
                             'step': step, 'local': local_loss.item(), 'global': global_loss.item(),
                         })
 
+                # Skip normal cleanup if early backtrack already cleaned up
+                if early_backtrack:
+                    break
+
                 # Track final global loss for this repeat
                 final_global_loss = global_loss.item()
 
