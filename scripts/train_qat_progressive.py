@@ -56,6 +56,10 @@ from qat_lora.quantizer import QATQuantConfig
 # repeat training for that layer up to max_layer_repeats times
 LAYER_CONVERGE_THRESHOLD = 0.5  # Global loss threshold for "converged"
 
+# Jump detection: if new layer's starting loss > prev_layer_final * JUMP_MULTIPLIER,
+# trigger backtracking to retrain previous layer
+JUMP_MULTIPLIER = 10.0  # e.g., 0.02 * 10 = 0.2, so 5.5 would trigger backtrack
+
 # -----------------------------------------------------------------------------
 # Utilities
 # -----------------------------------------------------------------------------
@@ -116,7 +120,11 @@ class TopKCacheIterableDataset(IterableDataset):
             rng.shuffle(files)
 
         for path in files:
-            obj = torch.load(path, map_location="cpu")
+            try:
+                obj = torch.load(path, map_location="cpu")
+            except Exception as e:
+                print(f"[WARN] Skipping corrupted cache file {path}: {e}")
+                continue
             if not isinstance(obj, dict):
                 continue
 
@@ -328,10 +336,17 @@ def train_progressive_qat(args):
         print("PASS 1: Progressive MLP Training")
         print("=" * 60)
         converge_threshold = args.layer_converge_threshold
+        jump_multiplier = args.jump_multiplier
 
-        for layer_idx in range(num_layers):
+        # Use while loop to allow backtracking
+        layer_idx = 0
+        layer_final_losses = {}  # Track final loss per layer
+        backtrack_count = {}  # Track how many times we've backtracked per layer
+
+        while layer_idx < num_layers:
             # Adaptive repeats: train layer multiple times if not converged
             final_global_loss = float('inf')
+            initial_global_loss = None  # Track starting loss for jump detection
 
             for repeat_idx in range(args.max_layer_repeats):
                 repeat_str = f" (repeat {repeat_idx+1}/{args.max_layer_repeats})" if repeat_idx > 0 else ""
@@ -416,6 +431,10 @@ def train_progressive_qat(args):
                     scaler.step(optimizer)
                     scaler.update()
 
+                    # Capture initial loss for jump detection (first step of first repeat)
+                    if step == 0 and repeat_idx == 0:
+                        initial_global_loss = global_loss.item()
+
                     if step % args.logging_steps == 0:
                         print(f"  step {step}: local={local_loss.item():.4f} global={global_loss.item():.4f}")
                         loss_log.append({
@@ -441,9 +460,31 @@ def train_progressive_qat(args):
             if final_global_loss > converge_threshold:
                 print(f"  [WARN] Layer {layer_idx} did not converge after {args.max_layer_repeats} repeats (global={final_global_loss:.4f})")
 
+            # Store final loss for this layer
+            layer_final_losses[layer_idx] = final_global_loss
+
+            # Jump detection: check if this layer had a big jump from previous
+            # If so, backtrack to retrain previous layer (up to max_backtrack times)
+            prev_loss = layer_final_losses.get(layer_idx - 1, 0.0)
+            if layer_idx > 0 and initial_global_loss is not None and prev_loss > 0:
+                expected_max = prev_loss * jump_multiplier
+                if initial_global_loss > expected_max:
+                    bt_count = backtrack_count.get(layer_idx - 1, 0)
+                    if bt_count < args.max_backtrack:
+                        print(f"  [BACKTRACK] Layer {layer_idx} started at {initial_global_loss:.4f} "
+                              f"(>{expected_max:.4f} = {prev_loss:.4f} * {jump_multiplier})")
+                        print(f"  [BACKTRACK] Going back to retrain layer {layer_idx - 1} "
+                              f"(backtrack {bt_count + 1}/{args.max_backtrack})")
+                        backtrack_count[layer_idx - 1] = bt_count + 1
+                        layer_idx -= 1  # Go back to previous layer
+                        continue  # Skip the layer_idx += 1 below
+
             # Optional: save per-layer checkpoint
             if args.save_layer_checkpoints:
                 torch.save(model.state_dict(), out / f"checkpoint_mlp_layer{layer_idx}.pt")
+
+            # Move to next layer
+            layer_idx += 1
 
     # =========================================================================
     # PASS 2: Attention Training (global KD only) [v2+]
@@ -725,6 +766,12 @@ def parse_args():
                    help="Max repeats per layer if global loss > threshold (default 1 = no repeats)")
     p.add_argument("--layer_converge_threshold", type=float, default=0.5,
                    help="Global loss threshold for layer convergence (default 0.5)")
+
+    # Backtracking on big loss jumps
+    p.add_argument("--jump_multiplier", type=float, default=10.0,
+                   help="If new layer's starting loss > prev_final * this, trigger backtrack (default 10.0)")
+    p.add_argument("--max_backtrack", type=int, default=2,
+                   help="Max times to backtrack per layer (default 2)")
 
     # Loss weights
     p.add_argument("--local_weight", type=float, default=0.3,
