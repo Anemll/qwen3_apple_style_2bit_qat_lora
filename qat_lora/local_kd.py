@@ -149,12 +149,17 @@ class LocalMLPReconstructionLoss(nn.Module):
             return torch.tensor(self.max_loss, device=mlp_input.device, dtype=mlp_input.dtype)
 
         # MIXED LOSS for scale preservation
-        # L = α * MSE(RMSNorm(y_q), RMSNorm(y_fp)) + (1-α) * MSE(y_q, y_fp)
+        # L = α * MSE(RMSNorm(y_q), RMSNorm(y_fp)) + (1-α) * relative_MSE(y_q, y_fp)
+        # Relative MSE = MSE / mean(y_fp²) makes the raw component scale-invariant
         y_q_norm = self._rms_norm(mlp_output_q_sub)
         y_fp_norm = self._rms_norm(mlp_output_fp_sub)
 
         loss_norm = F.mse_loss(y_q_norm, y_fp_norm)
-        loss_raw = F.mse_loss(mlp_output_q_sub, mlp_output_fp_sub)
+
+        # Use RELATIVE MSE to avoid scale issues in deeper layers
+        # Dividing by mean(y_fp²) normalizes by output magnitude
+        fp_scale = mlp_output_fp_sub.pow(2).mean().clamp(min=1e-8)
+        loss_raw = F.mse_loss(mlp_output_q_sub, mlp_output_fp_sub) / fp_scale
 
         loss = self.norm_weight * loss_norm + (1 - self.norm_weight) * loss_raw
 

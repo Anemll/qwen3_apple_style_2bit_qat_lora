@@ -264,6 +264,9 @@ def set_quantized_prefix(
     CRITICAL: Suffix layers (> up_to_layer_idx) must be FULLY fp (both MLP+attn)
     to provide stable downstream gradients.
 
+    IMPORTANT: During MLP pass (Pass 1), only quantize MLP in prefix - keep attention
+    in fp since it hasn't been trained yet. This prevents cumulative quantization error.
+
     Args:
         model: The model to modify
         up_to_layer_idx: Current layer being trained
@@ -282,8 +285,14 @@ def set_quantized_prefix(
             # SUFFIX: fully fp (both MLP and attn)
             m.enable_fake_quant = False
         elif layer_i < up_to_layer_idx:
-            # PREFIX: fully quantized (finalized)
-            m.enable_fake_quant = True
+            # PREFIX: quantize based on pass type
+            if pass_type == 'mlp':
+                # During MLP pass: only quantize MLP, keep attention in fp
+                # (attention hasn't been trained yet)
+                m.enable_fake_quant = is_mlp
+            else:
+                # During attn pass or E2E: both MLP and attention quantized
+                m.enable_fake_quant = True
         else:
             # CURRENT LAYER (layer_i == up_to_layer_idx)
             if pass_type == 'mlp':

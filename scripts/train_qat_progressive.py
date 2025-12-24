@@ -49,6 +49,14 @@ from qat_lora.quantizer import QATQuantConfig
 
 
 # -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+
+# Adaptive layer training: if global loss > threshold after first pass,
+# repeat training for that layer up to max_layer_repeats times
+LAYER_CONVERGE_THRESHOLD = 0.5  # Global loss threshold for "converged"
+
+# -----------------------------------------------------------------------------
 # Utilities
 # -----------------------------------------------------------------------------
 
@@ -303,6 +311,7 @@ def train_progressive_qat(args):
 
     num_layers = infer_num_layers(model)
     print(f"[model] {num_layers} transformer layers")
+    print(f"[training] batch_size={args.batch_size} steps_per_mlp={args.steps_per_layer_mlp} e2e_steps={args.e2e_steps}")
 
     loss_log = []  # For per-layer CSV logging
     base = _get_base_transformer(model)
@@ -318,98 +327,119 @@ def train_progressive_qat(args):
         print("\n" + "=" * 60)
         print("PASS 1: Progressive MLP Training")
         print("=" * 60)
+        converge_threshold = args.layer_converge_threshold
 
         for layer_idx in range(num_layers):
-            print(f"\n--- Layer {layer_idx}/{num_layers-1} MLP ---")
+            # Adaptive repeats: train layer multiple times if not converged
+            final_global_loss = float('inf')
 
-            # 1. Store frozen fp copy BEFORE training
-            frozen_weights = get_frozen_mlp_copy(model, layer_idx)
+            for repeat_idx in range(args.max_layer_repeats):
+                repeat_str = f" (repeat {repeat_idx+1}/{args.max_layer_repeats})" if repeat_idx > 0 else ""
+                print(f"\n--- Layer {layer_idx}/{num_layers-1} MLP{repeat_str} ---")
 
-            # 2. Set quantized prefix + fp suffix
-            set_quantized_prefix(model, layer_idx, pass_type='mlp')
+                # 1. Store frozen fp copy BEFORE training
+                frozen_weights = get_frozen_mlp_copy(model, layer_idx)
 
-            # 3. Freeze all except current layer's MLP
-            trainable = freeze_all_except_layer(
-                model, layer_idx, component='mlp', train_f_only=args.train_f_only
-            )
-            print(f"  Trainable params: {trainable:,}" + (" (f-only)" if args.train_f_only else ""))
+                # 2. Set quantized prefix + fp suffix
+                set_quantized_prefix(model, layer_idx, pass_type='mlp')
 
-            # 4. Create local loss module
-            local_loss_fn = LocalMLPReconstructionLoss(
-                frozen_weights,
-                norm_weight=args.local_norm_weight,
-            ).to(device)
+                # 3. Freeze all except current layer's MLP
+                trainable = freeze_all_except_layer(
+                    model, layer_idx, component='mlp', train_f_only=args.train_f_only
+                )
+                print(f"  Trainable params: {trainable:,}" + (" (f-only)" if args.train_f_only else ""))
 
-            # 5. Create optimizer
-            optimizer = torch.optim.AdamW(
-                [p for p in model.parameters() if p.requires_grad],
-                lr=args.learning_rate,
-                weight_decay=args.weight_decay,
-            )
+                # 4. Create local loss module
+                local_loss_fn = LocalMLPReconstructionLoss(
+                    frozen_weights,
+                    norm_weight=args.local_norm_weight,
+                ).to(device)
 
-            # 6. Register hook to capture MLP input/output
-            mlp_io = {'input': None, 'output': None}
+                # 5. Create optimizer
+                optimizer = torch.optim.AdamW(
+                    [p for p in model.parameters() if p.requires_grad],
+                    lr=args.learning_rate,
+                    weight_decay=args.weight_decay,
+                )
 
-            def capture_mlp_io(module, inp, out):
-                mlp_io['input'] = inp[0]
-                mlp_io['output'] = out
+                # 6. Register hook to capture MLP input/output
+                mlp_io = {'input': None, 'output': None}
 
-            hook = model.model.layers[layer_idx].mlp.register_forward_hook(capture_mlp_io)
+                def capture_mlp_io(module, inp, out):
+                    mlp_io['input'] = inp[0]
+                    mlp_io['output'] = out
 
-            # 7. Train for N steps
-            model.train()
-            for step in range(args.steps_per_layer_mlp):
-                batch = next(data_iter)
-                batch = {k: v.to(device) for k, v in batch.items()}
+                hook = model.model.layers[layer_idx].mlp.register_forward_hook(capture_mlp_io)
 
-                optimizer.zero_grad(set_to_none=True)
+                # 7. Train for N steps
+                model.train()
+                for step in range(args.steps_per_layer_mlp):
+                    batch = next(data_iter)
+                    batch = {k: v.to(device) for k, v in batch.items()}
 
-                with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-                    # Forward pass to get hidden states
-                    outputs = base(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                        use_cache=False,
-                        return_dict=True,
-                    )
-                    hidden = outputs.last_hidden_state[:, :-1, :]  # [B, S, H]
+                    optimizer.zero_grad(set_to_none=True)
 
-                    # Local reconstruction loss
-                    # Note: slice attention_mask to match the :-1 on MLP tensors
-                    attn_mask = batch.get('attention_mask')
-                    if attn_mask is not None:
-                        attn_mask = attn_mask[:, :-1]  # Align with prediction positions
-                    local_loss = local_loss_fn(
-                        mlp_io['input'][:, :-1, :],
-                        mlp_io['output'][:, :-1, :],
-                        attn_mask,
-                        num_tokens=args.local_token_samples,
-                    )
+                    with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
+                        # Forward pass to get hidden states
+                        outputs = base(
+                            input_ids=batch["input_ids"],
+                            attention_mask=batch["attention_mask"],
+                            use_cache=False,
+                            return_dict=True,
+                        )
+                        hidden = outputs.last_hidden_state[:, :-1, :]  # [B, S, H]
 
-                    # Global KD loss
-                    global_loss = compute_cached_kd_loss(
-                        model, hidden, batch,
-                        temperature=args.distill_temperature,
-                        hard_top1_weight=args.hard_top1_weight,
-                    )
+                        # Local reconstruction loss
+                        # Note: slice attention_mask to match the :-1 on MLP tensors
+                        attn_mask = batch.get('attention_mask')
+                        if attn_mask is not None:
+                            attn_mask = attn_mask[:, :-1]  # Align with prediction positions
+                        local_loss = local_loss_fn(
+                            mlp_io['input'][:, :-1, :],
+                            mlp_io['output'][:, :-1, :],
+                            attn_mask,
+                            num_tokens=args.local_token_samples,
+                        )
 
-                    loss = args.local_weight * local_loss + args.global_weight * global_loss
+                        # Global KD loss
+                        global_loss = compute_cached_kd_loss(
+                            model, hidden, batch,
+                            temperature=args.distill_temperature,
+                            hard_top1_weight=args.hard_top1_weight,
+                        )
 
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
+                        loss = args.local_weight * local_loss + args.global_weight * global_loss
 
-                if step % args.logging_steps == 0:
-                    print(f"  step {step}: local={local_loss.item():.4f} global={global_loss.item():.4f}")
-                    loss_log.append({
-                        'pass': 1, 'component': 'mlp', 'layer': layer_idx,
-                        'step': step, 'local': local_loss.item(), 'global': global_loss.item(),
-                    })
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
 
-            hook.remove()
-            del local_loss_fn, frozen_weights, optimizer
+                    if step % args.logging_steps == 0:
+                        print(f"  step {step}: local={local_loss.item():.4f} global={global_loss.item():.4f}")
+                        loss_log.append({
+                            'pass': 1, 'component': 'mlp', 'layer': layer_idx,
+                            'step': step, 'local': local_loss.item(), 'global': global_loss.item(),
+                        })
+
+                # Track final global loss for this repeat
+                final_global_loss = global_loss.item()
+
+                hook.remove()
+                del local_loss_fn, frozen_weights, optimizer
+
+                # Check convergence - break if loss is low enough
+                if final_global_loss <= converge_threshold:
+                    if repeat_idx > 0:
+                        print(f"  Layer {layer_idx} converged after {repeat_idx+1} repeats (global={final_global_loss:.4f})")
+                    break
+                elif repeat_idx < args.max_layer_repeats - 1:
+                    print(f"  Layer {layer_idx} not converged (global={final_global_loss:.4f} > {converge_threshold}), repeating...")
+
+            # Final status for this layer
+            if final_global_loss > converge_threshold:
+                print(f"  [WARN] Layer {layer_idx} did not converge after {args.max_layer_repeats} repeats (global={final_global_loss:.4f})")
 
             # Optional: save per-layer checkpoint
             if args.save_layer_checkpoints:
@@ -689,6 +719,12 @@ def parse_args():
                    help="Training steps per attention layer (Pass 2)")
     p.add_argument("--e2e_steps", type=int, default=200,
                    help="E2E quantizer-only tuning steps (Pass 4)")
+
+    # Adaptive layer repeats
+    p.add_argument("--max_layer_repeats", type=int, default=1,
+                   help="Max repeats per layer if global loss > threshold (default 1 = no repeats)")
+    p.add_argument("--layer_converge_threshold", type=float, default=0.5,
+                   help="Global loss threshold for layer convergence (default 0.5)")
 
     # Loss weights
     p.add_argument("--local_weight", type=float, default=0.3,
