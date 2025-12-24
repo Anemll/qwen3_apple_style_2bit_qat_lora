@@ -74,8 +74,9 @@ class LocalMLPReconstructionLoss(nn.Module):
             Indices tensor [num_samples] for gathering from flattened [B*T, H]
         """
         # Flatten batch dimension for simplicity
-        valid_mask = attention_mask.view(-1).bool()  # [B*T]
-        valid_indices = torch.where(valid_mask)[0]   # [num_valid]
+        # Use reshape() instead of view() to handle non-contiguous tensors (e.g., from slicing)
+        valid_mask = attention_mask.reshape(-1).bool()  # [B*T]
+        valid_indices = torch.where(valid_mask)[0]      # [num_valid]
 
         if len(valid_indices) <= num_tokens:
             return valid_indices
