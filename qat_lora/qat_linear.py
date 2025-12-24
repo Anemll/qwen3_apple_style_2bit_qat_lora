@@ -53,6 +53,10 @@ class QATLinear(nn.Module):
         # We parameterize f with softplus to enforce positivity.
         self._f_param = nn.Parameter(torch.tensor(0.0))  # softplus(0)=0.693...
 
+        # Progressive QAT: flag to enable/disable fake quantization per module
+        # When False, forward uses full-precision weights (for suffix layers)
+        self.enable_fake_quant = True
+
         # LoRA
         self.lora_r = int(lora_r)
         self.lora_alpha = float(lora_alpha)
@@ -134,8 +138,12 @@ class QATLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Apple-style fake-quantized weight in forward (2/4-bit), with STE.
-        qc = QATQuantConfig(n_bits=self.n_bits)
-        w_q = fake_quant_weight_nbit(self.weight, self.f(), qc)
+        # Progressive QAT: skip fake-quant when disabled (for suffix layers)
+        if self.enable_fake_quant:
+            qc = QATQuantConfig(n_bits=self.n_bits)
+            w_q = fake_quant_weight_nbit(self.weight, self.f(), qc)
+        else:
+            w_q = self.weight  # Full precision forward
         y = F.linear(x, w_q, self.bias)
 
         # Optional LoRA residual (kept in FP)

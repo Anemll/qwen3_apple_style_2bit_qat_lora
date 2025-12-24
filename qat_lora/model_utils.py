@@ -197,3 +197,154 @@ def extract_lora_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
             sd[f"{name}.lora_A"] = m.lora_A.detach().cpu()
             sd[f"{name}.lora_B"] = m.lora_B.detach().cpu()
     return sd
+
+
+# ============================================================================
+# Progressive Layer-by-Layer QAT Utilities
+# ============================================================================
+
+def freeze_all_except_layer(
+    model: nn.Module,
+    layer_idx: int,
+    component: str = 'mlp',
+    train_layernorm: bool = False,
+    train_f_only: bool = False,
+) -> int:
+    """
+    Freeze all parameters except specified layer's component.
+
+    Args:
+        model: The model to modify
+        layer_idx: Which layer to keep trainable
+        component: 'mlp' or 'attn'
+        train_layernorm: Also train RMSNorm scale for this block (stabilizer)
+        train_f_only: If True, only train _f_param (quantization scales), not weights.
+                      This is more stable for ultra-low-bit quantization.
+
+    Returns:
+        Number of trainable parameters after freezing
+    """
+    # Freeze everything first
+    for p in model.parameters():
+        p.requires_grad = False
+
+    # Patterns for target component
+    if component == 'mlp':
+        patterns = [f'model.layers.{layer_idx}.mlp.']
+        if train_layernorm:
+            patterns.append(f'model.layers.{layer_idx}.post_attention_layernorm.')
+    else:  # attn
+        patterns = [f'model.layers.{layer_idx}.self_attn.']
+        if train_layernorm:
+            patterns.append(f'model.layers.{layer_idx}.input_layernorm.')
+
+    for name, p in model.named_parameters():
+        if any(pat in name for pat in patterns):
+            if train_f_only:
+                # Only train _f_param (quantization scale) - more stable
+                if name.endswith('_f_param'):
+                    p.requires_grad = True
+            else:
+                # Train weight and _f_param (quantization scale)
+                if name.endswith('.weight') or name.endswith('_f_param'):
+                    p.requires_grad = True
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return trainable
+
+
+def set_quantized_prefix(
+    model: nn.Module,
+    up_to_layer_idx: int,
+    pass_type: str = 'mlp',
+) -> None:
+    """
+    Enable fake-quant for finalized prefix, keep suffix fully fp.
+
+    CRITICAL: Suffix layers (> up_to_layer_idx) must be FULLY fp (both MLP+attn)
+    to provide stable downstream gradients.
+
+    Args:
+        model: The model to modify
+        up_to_layer_idx: Current layer being trained
+        pass_type: 'mlp' (Pass 1/3), 'attn' (Pass 2), or 'all' (E2E phase)
+    """
+    for name, m in model.named_modules():
+        if not isinstance(m, QATLinear):
+            continue
+        match = re.search(r'model\.layers\.(\d+)', name)
+        if not match:
+            continue
+        layer_i = int(match.group(1))
+        is_mlp = '.mlp.' in name
+
+        if layer_i > up_to_layer_idx:
+            # SUFFIX: fully fp (both MLP and attn)
+            m.enable_fake_quant = False
+        elif layer_i < up_to_layer_idx:
+            # PREFIX: fully quantized (finalized)
+            m.enable_fake_quant = True
+        else:
+            # CURRENT LAYER (layer_i == up_to_layer_idx)
+            if pass_type == 'mlp':
+                m.enable_fake_quant = is_mlp  # Only MLP quantized
+            elif pass_type == 'attn':
+                m.enable_fake_quant = True  # Both quantized (MLP already done)
+            else:  # 'all'
+                m.enable_fake_quant = True
+
+
+def get_frozen_mlp_copy(model: nn.Module, layer_idx: int) -> Dict[str, torch.Tensor]:
+    """
+    Create a frozen fp copy of a single MLP for local reconstruction loss.
+    Returns dict of detached weight tensors.
+
+    NOTE: In 4→2 curriculum, stage2 will use stage1-trained weights as target.
+    This is intentional - global KD anchors to original teacher behavior.
+
+    Args:
+        model: The model (expects Qwen-style architecture)
+        layer_idx: Which layer's MLP to copy
+
+    Returns:
+        Dict with 'gate', 'up', 'down' weight tensors (detached, cloned)
+    """
+    mlp = model.model.layers[layer_idx].mlp
+    return {
+        'gate': mlp.gate_proj.weight.detach().clone(),
+        'up': mlp.up_proj.weight.detach().clone(),
+        'down': mlp.down_proj.weight.detach().clone(),
+    }
+
+
+def infer_num_layers(model: nn.Module) -> int:
+    """
+    Infer the number of transformer layers in the model.
+
+    Args:
+        model: The model (expects model.model.layers structure)
+
+    Returns:
+        Number of layers
+    """
+    return len(model.model.layers)
+
+
+def apply_train_f_only(model: nn.Module) -> int:
+    """
+    Freeze all parameters except _f_param (quantization scale) in QATLinear layers.
+    Used for E2E quantizer-only tuning phase.
+
+    Returns:
+        Number of trainable f parameters
+    """
+    for p in model.parameters():
+        p.requires_grad = False
+
+    count = 0
+    for name, p in model.named_parameters():
+        if name.endswith('_f_param'):
+            p.requires_grad = True
+            count += 1
+
+    return count
