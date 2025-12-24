@@ -347,8 +347,11 @@ def train_progressive_qat(args):
             # Adaptive repeats: train layer multiple times if not converged
             final_global_loss = float('inf')
             initial_global_loss = None  # Track starting loss for jump detection
+            early_backtrack = False  # Flag for early abort due to jump detection
 
             for repeat_idx in range(args.max_layer_repeats):
+                if early_backtrack:
+                    break  # Exit repeat loop if early backtrack triggered
                 repeat_str = f" (repeat {repeat_idx+1}/{args.max_layer_repeats})" if repeat_idx > 0 else ""
                 print(f"\n--- Layer {layer_idx}/{num_layers-1} MLP{repeat_str} ---")
 
@@ -435,6 +438,26 @@ def train_progressive_qat(args):
                     if step == 0 and repeat_idx == 0:
                         initial_global_loss = global_loss.item()
 
+                        # EARLY jump detection: check immediately on first step
+                        # If there's a huge jump from previous layer, abort early and backtrack
+                        if layer_idx > 0:
+                            prev_loss = layer_final_losses.get(layer_idx - 1, 0.0)
+                            if prev_loss > 0:
+                                expected_max = prev_loss * jump_multiplier
+                                if initial_global_loss > expected_max:
+                                    bt_count = backtrack_count.get(layer_idx - 1, 0)
+                                    if bt_count < args.max_backtrack:
+                                        print(f"\n  [EARLY BACKTRACK] Layer {layer_idx} started at {initial_global_loss:.4f} "
+                                              f"(>{expected_max:.4f} = {prev_loss:.4f} * {jump_multiplier})")
+                                        print(f"  [EARLY BACKTRACK] Aborting layer {layer_idx}, going back to retrain layer {layer_idx - 1} "
+                                              f"(backtrack {bt_count + 1}/{args.max_backtrack})")
+                                        hook.remove()
+                                        del local_loss_fn, frozen_weights, optimizer
+                                        backtrack_count[layer_idx - 1] = bt_count + 1
+                                        # Use a flag to signal early abort
+                                        early_backtrack = True
+                                        break  # Exit the step loop
+
                     if step % args.logging_steps == 0:
                         print(f"  step {step}: local={local_loss.item():.4f} global={global_loss.item():.4f}")
                         loss_log.append({
@@ -456,28 +479,17 @@ def train_progressive_qat(args):
                 elif repeat_idx < args.max_layer_repeats - 1:
                     print(f"  Layer {layer_idx} not converged (global={final_global_loss:.4f} > {converge_threshold}), repeating...")
 
+            # Handle early backtrack - go back to previous layer
+            if early_backtrack:
+                layer_idx -= 1
+                continue
+
             # Final status for this layer
             if final_global_loss > converge_threshold:
                 print(f"  [WARN] Layer {layer_idx} did not converge after {args.max_layer_repeats} repeats (global={final_global_loss:.4f})")
 
             # Store final loss for this layer
             layer_final_losses[layer_idx] = final_global_loss
-
-            # Jump detection: check if this layer had a big jump from previous
-            # If so, backtrack to retrain previous layer (up to max_backtrack times)
-            prev_loss = layer_final_losses.get(layer_idx - 1, 0.0)
-            if layer_idx > 0 and initial_global_loss is not None and prev_loss > 0:
-                expected_max = prev_loss * jump_multiplier
-                if initial_global_loss > expected_max:
-                    bt_count = backtrack_count.get(layer_idx - 1, 0)
-                    if bt_count < args.max_backtrack:
-                        print(f"  [BACKTRACK] Layer {layer_idx} started at {initial_global_loss:.4f} "
-                              f"(>{expected_max:.4f} = {prev_loss:.4f} * {jump_multiplier})")
-                        print(f"  [BACKTRACK] Going back to retrain layer {layer_idx - 1} "
-                              f"(backtrack {bt_count + 1}/{args.max_backtrack})")
-                        backtrack_count[layer_idx - 1] = bt_count + 1
-                        layer_idx -= 1  # Go back to previous layer
-                        continue  # Skip the layer_idx += 1 below
 
             # Optional: save per-layer checkpoint
             if args.save_layer_checkpoints:

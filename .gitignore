@@ -1,6 +1,7 @@
 # Training outputs and checkpoints
 runs/
 *.pt
+loss*.csv
 
 # Environments
 .venv/
@@ -12,9 +13,13 @@ runs/
 # Python cache/bytecode
 __pycache__/
 *.py[cod]
+.ipynb_checkpoints/
 
 # Build artifacts
 qat_lora.egg-info/
 __pycache__
 qat_lora/__pycache__/*
 *.pyc
+
+# Teacher top-k caches / local artifacts
+caches/
