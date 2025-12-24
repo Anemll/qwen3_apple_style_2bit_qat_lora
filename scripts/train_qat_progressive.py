@@ -375,10 +375,14 @@ def train_progressive_qat(args):
                     hidden = outputs.last_hidden_state[:, :-1, :]  # [B, S, H]
 
                     # Local reconstruction loss
+                    # Note: slice attention_mask to match the :-1 on MLP tensors
+                    attn_mask = batch.get('attention_mask')
+                    if attn_mask is not None:
+                        attn_mask = attn_mask[:, :-1]  # Align with prediction positions
                     local_loss = local_loss_fn(
-                        mlp_io['input'][:, :-1, :],  # Align with prediction positions
+                        mlp_io['input'][:, :-1, :],
                         mlp_io['output'][:, :-1, :],
-                        batch.get('attention_mask'),
+                        attn_mask,
                         num_tokens=args.local_token_samples,
                     )
 
@@ -530,10 +534,14 @@ def train_progressive_qat(args):
                     )
                     hidden = outputs.last_hidden_state[:, :-1, :]
 
+                    # Note: slice attention_mask to match the :-1 on MLP tensors
+                    attn_mask = batch.get('attention_mask')
+                    if attn_mask is not None:
+                        attn_mask = attn_mask[:, :-1]  # Align with prediction positions
                     local_loss = local_loss_fn(
                         mlp_io['input'][:, :-1, :],
                         mlp_io['output'][:, :-1, :],
-                        batch.get('attention_mask'),
+                        attn_mask,
                         num_tokens=args.local_token_samples,
                     )
 
@@ -552,6 +560,7 @@ def train_progressive_qat(args):
                 scaler.update()
 
                 if step % args.logging_steps == 0:
+                    print(f"  step {step}: local={local_loss.item():.4f} global={global_loss.item():.4f}")
                     loss_log.append({
                         'pass': 3, 'component': 'mlp_refine', 'layer': layer_idx,
                         'step': step, 'local': local_loss.item(), 'global': global_loss.item(),
