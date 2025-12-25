@@ -144,11 +144,14 @@ class QATLinear(nn.Module):
             w_q = fake_quant_weight_nbit(self.weight, self.f(), qc)
         else:
             w_q = self.weight  # Full precision forward
-        y = F.linear(x, w_q.to(x.dtype), self.bias)
+        bias = self.bias.to(x.dtype) if self.bias is not None else None
+        y = F.linear(x, w_q.to(x.dtype), bias)
 
-        # Optional LoRA residual (kept in FP)
+        # Optional LoRA residual (cast to match input dtype)
         if self.lora_r > 0:
             x_d = self.lora_drop(x) if self.lora_drop is not None else x
-            y = y + (x_d @ self.lora_A.t() @ self.lora_B.t()) * self.scaling
+            lora_A = self.lora_A.to(x.dtype)
+            lora_B = self.lora_B.to(x.dtype)
+            y = y + (x_d @ lora_A.t() @ lora_B.t()) * self.scaling
 
         return y
