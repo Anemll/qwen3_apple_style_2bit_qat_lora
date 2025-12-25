@@ -251,3 +251,117 @@ def init_f_from_weight(
     f_init = float(c / absmax)
     # Keep f positive and not too tiny.
     return float(max(1e-4, f_init))
+
+
+@torch.no_grad()
+def init_f_mse_grid_search(
+    weight: torch.Tensor,
+    qc: QATQuantConfig,
+    percentiles: tuple = (99.0, 99.3, 99.5, 99.7, 99.9, 100.0),
+    sample_size: int = 65536,
+) -> float:
+    """
+    MSE grid-search for optimal f_init.
+
+    Tries multiple clipping percentiles and picks the one with lowest
+    quantization MSE. More robust than single-percentile methods for 2-bit.
+
+    Args:
+        weight: Weight tensor to calibrate
+        qc: Quantization config
+        percentiles: Percentiles to try (default covers 99.0-100.0)
+        sample_size: Number of weight samples for MSE calculation
+
+    Returns:
+        f_init: Optimal initialization for f parameter
+    """
+    w = weight.detach().float().flatten()
+
+    # Subsample for speed
+    if w.numel() > sample_size:
+        idx = torch.randint(0, w.numel(), (sample_size,), device=w.device)
+        w = w[idx]
+
+    abs_w = w.abs()
+    amax = float(abs_w.max().clamp(min=1e-8))
+
+    best_mse = float('inf')
+    best_f = 1.0
+
+    for pct in percentiles:
+        # Get clip value for this percentile
+        if pct >= 100.0:
+            c = amax
+        else:
+            k = max(1, int((pct / 100.0) * abs_w.numel()))
+            k = min(k, abs_w.numel())
+            c = float(abs_w.kthvalue(k).values)
+
+        c = max(1e-6, min(c, amax))
+
+        # Compute scale and quantize
+        s = c / float(qc.qmax)
+        w_scaled = w / s + qc.z
+        w_rounded = torch.round(w_scaled)
+        w_q = torch.clamp(w_rounded, qc.qmin, qc.qmax)
+        w_deq = (w_q - qc.z) * s
+
+        mse = float(torch.mean((w - w_deq) ** 2))
+
+        if mse < best_mse:
+            best_mse = mse
+            best_f = c / amax
+
+    return float(max(1e-4, best_f))
+
+
+@torch.no_grad()
+def calibrate_model_f_init(
+    model: "torch.nn.Module",
+    n_bits: int = 2,
+    method: str = "mse_grid",
+    verbose: bool = True,
+) -> int:
+    """
+    Calibrate f_init for all QATLinear modules in a model.
+
+    This should be called BEFORE training to give QAT a good starting point,
+    especially important for 2-bit where bad init can be catastrophic.
+
+    Args:
+        model: Model with QATLinear modules
+        n_bits: Bit width for calibration
+        method: "mse_grid" (recommended), "newton", or "percentile"
+        verbose: Print calibration progress
+
+    Returns:
+        Number of modules calibrated
+    """
+    from .qat_linear import QATLinear
+
+    qc = QATQuantConfig(n_bits=n_bits)
+    count = 0
+
+    for name, module in model.named_modules():
+        if isinstance(module, QATLinear):
+            weight = module.weight
+
+            if method == "mse_grid":
+                f_init = init_f_mse_grid_search(weight, qc)
+            elif method == "newton":
+                f_init = init_f_from_weight(weight, qc, method="newton")
+            elif method == "percentile":
+                f_init = init_f_from_weight(weight, qc, method="percentile")
+            else:
+                raise ValueError(f"Unknown method: {method}")
+
+            module.set_f_init(f_init)
+            count += 1
+
+            if verbose:
+                print(f"  [calibrate] {name}: f_init={f_init:.4f}")
+
+    if verbose:
+        print(f"[calibrate] Calibrated {count} QATLinear modules with method='{method}'")
+
+    return count
