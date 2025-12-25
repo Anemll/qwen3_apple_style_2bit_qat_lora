@@ -46,7 +46,7 @@ from qat_lora.model_utils import (
 )
 from qat_lora.local_kd import LocalMLPReconstructionLoss
 from qat_lora.mixed_precision import pick_device, resolve_amp_dtype, resolve_param_dtype
-from qat_lora.quantizer import QATQuantConfig
+from qat_lora.quantizer import QATQuantConfig, calibrate_model_f_init
 
 
 # -----------------------------------------------------------------------------
@@ -302,7 +302,11 @@ def train_progressive_qat(args):
     replace_linear_with_qat(model, qc=qc, exclude_regex=exclude, verbose=False)
 
     # Initialize f parameters
-    init_all_f(model, qc=qc, method="newton", verbose=False)
+    if args.calibrate_f_init:
+        print(f"[calibrate] Running f_init calibration with method='{args.calibrate_f_init}'")
+        calibrate_model_f_init(model, n_bits=qc.n_bits, method=args.calibrate_f_init, verbose=True)
+    else:
+        init_all_f(model, qc=qc, method="newton", verbose=False)
 
     # Cast to param dtype
     model = model.to(dtype=param_dtype)
@@ -782,6 +786,10 @@ def parse_args():
     p.add_argument("-q", "--quant_bits", type=int, default=4, choices=[2, 4],
                    help="Weight quantization bits (default: 4 for stability)")
     p.add_argument("--skip_lm_head", action="store_true", help="Don't quantize lm_head")
+    p.add_argument("--calibrate_f_init", type=str, default=None,
+                   choices=["mse_grid", "newton", "percentile"],
+                   help="Calibrate f_init before training using MSE grid-search (recommended for 2-bit), "
+                        "Newton-like optimization, or simple percentile clipping")
 
     # KD cache
     p.add_argument("--kd_cache_dir", type=str, required=True,

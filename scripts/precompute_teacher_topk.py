@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Precompute teacher top-k logits for KD-QAT / KD-LoRA.
 
@@ -91,15 +91,58 @@ except Exception:
     build_alpaca_messages = None
 
 
-def _from_pretrained_fp32(model_name_or_path: str):
+def _call_from_pretrained(fn, model_name_or_path: str, **kwargs):
+    """
+    Call Hugging Face `from_pretrained` with best-effort compatibility across versions.
+    """
+    token = kwargs.pop("token", None)
+
+    def _call(call_kwargs: dict):
+        if token is None:
+            return fn(model_name_or_path, **call_kwargs)
+        try:
+            return fn(model_name_or_path, token=token, **call_kwargs)
+        except TypeError:
+            return fn(model_name_or_path, use_auth_token=token, **call_kwargs)
+
+    try:
+        return _call(dict(kwargs))
+    except TypeError as e:
+        # Some versions don't accept resume_download=...
+        if "resume_download" in str(e) and "resume_download" in kwargs:
+            call_kwargs = dict(kwargs)
+            call_kwargs.pop("resume_download", None)
+            return _call(call_kwargs)
+        raise
+
+
+def _hf_common_kwargs(args):
+    kw = {}
+    if getattr(args, "cache_dir", None):
+        kw["cache_dir"] = args.cache_dir
+    if getattr(args, "local_files_only", False):
+        kw["local_files_only"] = True
+    if getattr(args, "hf_token", None):
+        kw["token"] = args.hf_token
+    if getattr(args, "resume_download", False):
+        # transformers forwards this to the hub; ignore if unsupported.
+        kw["resume_download"] = True
+    return kw
+
+
+def _from_pretrained_fp32(model_name_or_path: str, *, hf_kwargs: Optional[dict] = None):
     """
     Transformers is deprecating torch_dtype= in favor of dtype= in some versions.
     Support both to avoid warnings/breakage across installs.
     """
+    hf_kwargs = dict(hf_kwargs or {})
     try:
-        return AutoModelForCausalLM.from_pretrained(model_name_or_path, dtype=torch.float32)
+        return _call_from_pretrained(AutoModelForCausalLM.from_pretrained, model_name_or_path, dtype=torch.float32, **hf_kwargs)
     except TypeError:
-        return AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float32)
+        hf_kwargs.pop("resume_download", None)
+        return _call_from_pretrained(
+            AutoModelForCausalLM.from_pretrained, model_name_or_path, torch_dtype=torch.float32, **hf_kwargs
+        )
 
 
 def _pick_device_fallback(device: str) -> str:
@@ -209,6 +252,19 @@ def parse_args():
     p.add_argument("--dataset_config_name", type=str, default=None)
     p.add_argument("--dataset_split", type=str, default="train")
     p.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="Hugging Face cache directory (models/tokenizers/datasets). Useful on Colab to point at Drive.",
+    )
+    p.add_argument("--hf_token", type=str, default=None, help="HF token for gated models (or set HF_TOKEN env var).")
+    p.add_argument("--local_files_only", action="store_true", help="Do not attempt to download anything from the Hub.")
+    p.add_argument(
+        "--resume_download",
+        action="store_true",
+        help="Resume partial Hugging Face downloads when possible (best-effort, depends on hub/transformers version).",
+    )
+    p.add_argument(
         "--dataset_format",
         type=str,
         default="plain",
@@ -238,6 +294,16 @@ def parse_args():
     p.add_argument("--dtype", type=str, default="auto", choices=["auto", "fp32", "bf16", "fp16"])
 
     p.add_argument("--output_dir", type=str, required=True)
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume writing into an existing output_dir (uses output_dir/progress.json).",
+    )
+    p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow overwriting existing shard_*.pt files in output_dir.",
+    )
 
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
@@ -245,8 +311,23 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.hf_token is None:
+        args.hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    progress_path = out / "progress.json"
+
+    existing_shards = sorted(out.glob("shard_*.pt"))
+    if args.resume and existing_shards and not progress_path.exists():
+        raise RuntimeError(
+            f"--resume requires {progress_path.name} when shard files already exist in: {out} "
+            "(use --overwrite to start over)."
+        )
+    if existing_shards and not args.resume and not args.overwrite:
+        print(
+            f"[warn] output_dir already has {len(existing_shards)} shard files; "
+            "this run will overwrite them (use --resume to continue, or --overwrite to silence)."
+        )
 
     if tuple(map(int, transformers_version.split(".")[:2])) < (4, 51):
         # Not strictly required for precompute, but keeps versions aligned with Qwen3.
@@ -267,12 +348,21 @@ def main():
 
     print(f"[device] {device} | dtype={param_dtype}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.teacher_model_name_or_path)
+    hf_kwargs = _hf_common_kwargs(args)
+    try:
+        tokenizer = _call_from_pretrained(AutoTokenizer.from_pretrained, args.teacher_model_name_or_path, **hf_kwargs)
+    except KeyboardInterrupt:
+        print("[interrupt] tokenizer download/load interrupted; re-run to resume/continue.")
+        raise
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     # Load teacher on CPU fp32 first, then cast.
-    teacher = _from_pretrained_fp32(args.teacher_model_name_or_path)
+    try:
+        teacher = _from_pretrained_fp32(args.teacher_model_name_or_path, hf_kwargs=hf_kwargs)
+    except KeyboardInterrupt:
+        print("[interrupt] model download/load interrupted; re-run to resume/continue.")
+        raise
     teacher.config.use_cache = False
     teacher.eval()
     teacher.to(device=device, dtype=param_dtype)
@@ -281,6 +371,8 @@ def main():
     ds_kwargs = {}
     if args.dataset_config_name:
         ds_kwargs["name"] = args.dataset_config_name
+    if args.cache_dir:
+        ds_kwargs["cache_dir"] = args.cache_dir
 
     if args.streaming:
         ds = load_dataset(args.dataset_name, **ds_kwargs, split=args.dataset_split, streaming=True)
@@ -302,25 +394,48 @@ def main():
         add_eos=True,
     )
 
-    # Write meta.json
-    meta = {
-        "format": "qwen_kd_topk_cache_v1",
-        "teacher_model": args.teacher_model_name_or_path,
-        "tokenizer": args.teacher_model_name_or_path,
-        "dataset_name": args.dataset_name,
-        "dataset_config_name": args.dataset_config_name,
-        "dataset_split": args.dataset_split,
-        "dataset_format": args.dataset_format,
-        "dataset_text_field": args.dataset_text_field,
-        "chat_thinking": args.enable_thinking,
-        "max_length": args.max_length,
-        "topk": args.topk,
-        "rand_neg": int(args.rand_neg),
-        "vocab_size": int(getattr(teacher.config, "vocab_size", 0) or 0),
-        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    with open(out / "meta.json", "w") as f:
-        json.dump(meta, f, indent=2)
+    # Meta/progress
+    meta_path = out / "meta.json"
+    if not (args.resume and meta_path.exists()):
+        meta = {
+            "format": "qwen_kd_topk_cache_v1",
+            "teacher_model": args.teacher_model_name_or_path,
+            "tokenizer": args.teacher_model_name_or_path,
+            "dataset_name": args.dataset_name,
+            "dataset_config_name": args.dataset_config_name,
+            "dataset_split": args.dataset_split,
+            "dataset_format": args.dataset_format,
+            "dataset_text_field": args.dataset_text_field,
+            "chat_thinking": args.enable_thinking,
+            "max_length": args.max_length,
+            "topk": args.topk,
+            "top_k": args.topk,  # backwards/for notebooks
+            "rand_neg": int(args.rand_neg),
+            "random_negatives": int(args.rand_neg),  # backwards/for notebooks
+            "num_sequences": int(args.num_sequences),
+            "total_sequences": int(args.num_sequences),  # backwards/for notebooks
+            "vocab_size": int(getattr(teacher.config, "vocab_size", 0) or 0),
+            "transformers_version": transformers_version,
+            "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+    else:
+        try:
+            prev = json.loads(meta_path.read_text())
+        except Exception:
+            prev = {}
+        for k, v in {
+            "teacher_model": args.teacher_model_name_or_path,
+            "dataset_name": args.dataset_name,
+            "dataset_split": args.dataset_split,
+            "dataset_format": args.dataset_format,
+            "max_length": args.max_length,
+            "topk": args.topk,
+            "rand_neg": int(args.rand_neg),
+        }.items():
+            if k in prev and prev.get(k) != v:
+                raise RuntimeError(f"--resume but meta.json mismatch for {k}: {prev.get(k)} != {v}")
 
     # Accumulators for current shard
     shard_inputs: List[torch.Tensor] = []
@@ -350,6 +465,8 @@ def main():
             obj["rand_logits"] = torch.stack(shard_rand_logits, dim=0).to(torch.float16)
         torch.save(obj, shard_path)
         print(f"[write] {shard_path.name} | N={input_ids.shape[0]}")
+        with open(progress_path, "w") as f:
+            json.dump({"n_written": int(n_written), "next_shard_id": int(shard_id) + 1}, f, indent=2)
         shard_inputs.clear()
         shard_attn.clear()
         shard_topk_idx.clear()
@@ -360,80 +477,100 @@ def main():
     # Main loop
     shard_id = 0
     n_written = 0
+    if args.resume and progress_path.exists():
+        try:
+            prog = json.loads(progress_path.read_text())
+            shard_id = int(prog.get("next_shard_id", 0) or 0)
+            n_written = int(prog.get("n_written", 0) or 0)
+            print(f"[resume] shard_id={shard_id} | cached sequences={n_written}")
+        except Exception as e:
+            print(f"[warn] failed to read {progress_path.name}: {e}; starting from scratch.")
 
     # Build a small batcher from packed iterator
     batch: List[List[int]] = []
 
-    with torch.inference_mode():
-        for block in packed:
-            batch.append(block)
-            if len(batch) < args.batch_size:
-                continue
+    try:
+        with torch.inference_mode():
+            for block in packed:
+                batch.append(block)
+                if len(batch) < args.batch_size:
+                    continue
 
-            # [B, L]
-            input_ids = torch.tensor(batch, dtype=torch.long, device=device)
-            attn = torch.ones_like(input_ids, dtype=torch.long, device=device)
+                # [B, L]
+                input_ids = torch.tensor(batch, dtype=torch.long, device=device)
+                attn = torch.ones_like(input_ids, dtype=torch.long, device=device)
 
-            # Teacher forward (full vocab logits; we do this only ONCE in cache build)
-            out_obj = teacher(input_ids=input_ids, attention_mask=attn, use_cache=False, return_dict=True)
-            logits = out_obj.logits  # [B, L, V]
-            logits = logits[:, :-1, :]  # [B, L-1, V]
+                # Teacher forward (full vocab logits; we do this only ONCE in cache build)
+                out_obj = teacher(input_ids=input_ids, attention_mask=attn, use_cache=False, return_dict=True)
+                logits = out_obj.logits  # [B, L, V]
+                logits = logits[:, :-1, :]  # [B, L-1, V]
 
-            # Extract top-k
-            topk_vals, topk_idx = torch.topk(logits, k=args.topk, dim=-1)
+                # Extract top-k
+                topk_vals, topk_idx = torch.topk(logits, k=args.topk, dim=-1)
 
-            rand_idx = None
-            rand_vals = None
-            if args.rand_neg and args.rand_neg > 0:
-                V = logits.shape[-1]
-                # Random token ids per position (uniform). Duplicates are extremely unlikely at typical vocab sizes.
-                rand_idx = torch.randint(
-                    low=0,
-                    high=V,
-                    size=(logits.shape[0], logits.shape[1], int(args.rand_neg)),
-                    device=logits.device,
-                    dtype=torch.long,
-                )
-                rand_vals = logits.gather(dim=-1, index=rand_idx)
+                rand_idx = None
+                rand_vals = None
+                if args.rand_neg and args.rand_neg > 0:
+                    V = logits.shape[-1]
+                    # Random token ids per position (uniform). Duplicates are extremely unlikely at typical vocab sizes.
+                    rand_idx = torch.randint(
+                        low=0,
+                        high=V,
+                        size=(logits.shape[0], logits.shape[1], int(args.rand_neg)),
+                        device=logits.device,
+                        dtype=torch.long,
+                    )
+                    rand_vals = logits.gather(dim=-1, index=rand_idx)
 
-            # Move to CPU + compact dtypes
-            input_ids_cpu = input_ids.detach().to("cpu", dtype=torch.int32)
-            attn_cpu = attn.detach().to("cpu", dtype=torch.uint8)
-            topk_idx_cpu = topk_idx.detach().to("cpu", dtype=torch.int32)
-            topk_vals_cpu = topk_vals.detach().to("cpu", dtype=torch.float16)
+                # Move to CPU + compact dtypes
+                input_ids_cpu = input_ids.detach().to("cpu", dtype=torch.int32)
+                attn_cpu = attn.detach().to("cpu", dtype=torch.uint8)
+                topk_idx_cpu = topk_idx.detach().to("cpu", dtype=torch.int32)
+                topk_vals_cpu = topk_vals.detach().to("cpu", dtype=torch.float16)
 
-            rand_idx_cpu = None
-            rand_vals_cpu = None
-            if rand_idx is not None:
-                rand_idx_cpu = rand_idx.detach().to("cpu", dtype=torch.int32)
-                rand_vals_cpu = rand_vals.detach().to("cpu", dtype=torch.float16)
+                rand_idx_cpu = None
+                rand_vals_cpu = None
+                if rand_idx is not None:
+                    rand_idx_cpu = rand_idx.detach().to("cpu", dtype=torch.int32)
+                    rand_vals_cpu = rand_vals.detach().to("cpu", dtype=torch.float16)
 
-            # Append each sequence in batch to shard buffers
-            bsz = input_ids_cpu.shape[0]
-            for i in range(bsz):
-                shard_inputs.append(input_ids_cpu[i])
-                shard_attn.append(attn_cpu[i])
-                shard_topk_idx.append(topk_idx_cpu[i])
-                shard_topk_logits.append(topk_vals_cpu[i])
-                if rand_idx_cpu is not None:
-                    shard_rand_idx.append(rand_idx_cpu[i])
-                    shard_rand_logits.append(rand_vals_cpu[i])
+                # Append each sequence in batch to shard buffers
+                bsz = input_ids_cpu.shape[0]
+                for i in range(bsz):
+                    shard_inputs.append(input_ids_cpu[i])
+                    shard_attn.append(attn_cpu[i])
+                    shard_topk_idx.append(topk_idx_cpu[i])
+                    shard_topk_logits.append(topk_vals_cpu[i])
+                    if rand_idx_cpu is not None:
+                        shard_rand_idx.append(rand_idx_cpu[i])
+                        shard_rand_logits.append(rand_vals_cpu[i])
 
-            n_written += bsz
-            batch.clear()
+                n_written += bsz
+                batch.clear()
 
-            if len(shard_inputs) >= args.shard_size:
-                flush_shard(shard_id)
-                shard_id += 1
+                if len(shard_inputs) >= args.shard_size:
+                    flush_shard(shard_id)
+                    shard_id += 1
 
-            if n_written >= args.num_sequences:
-                break
+                if n_written >= args.num_sequences:
+                    break
+    except KeyboardInterrupt:
+        # Save whatever we've accumulated so far, then exit cleanly.
+        flush_shard(shard_id)
+        print(f"[interrupt] stopping early; cached sequences={n_written} | out_dir={out}")
+        raise
 
     # Flush remainder
     flush_shard(shard_id)
+    with open(progress_path, "w") as f:
+        json.dump({"n_written": int(n_written), "next_shard_id": int(shard_id) + 1, "done": True}, f, indent=2)
 
     print(f"Done. Cached sequences={n_written} | out_dir={out}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Avoid a long stack trace on user cancel / Colab stop.
+        sys.exit(130)
