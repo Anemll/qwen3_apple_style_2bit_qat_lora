@@ -21,6 +21,7 @@ import json
 import os
 import random
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Iterator, List, Optional
@@ -260,6 +261,7 @@ def compute_cached_kd_loss(
 
 def train_progressive_qat(args):
     """Main progressive QAT training function."""
+    training_start_time = time.time()
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -342,8 +344,11 @@ def train_progressive_qat(args):
         layer_idx = 0
         layer_final_losses = {}  # Track final loss per layer
         backtrack_count = {}  # Track how many times we've backtracked per layer
+        layer_times = []  # Track time per layer for ETA
+        pass_start_time = time.time()
 
         while layer_idx < num_layers:
+            layer_start_time = time.time()
             # Adaptive repeats: train layer multiple times if not converged
             final_global_loss = float('inf')
             initial_global_loss = None  # Track starting loss for jump detection
@@ -494,6 +499,17 @@ def train_progressive_qat(args):
 
             # Store final loss for this layer
             layer_final_losses[layer_idx] = final_global_loss
+
+            # Timing info
+            layer_elapsed = time.time() - layer_start_time
+            layer_times.append(layer_elapsed)
+            total_elapsed = time.time() - pass_start_time
+            avg_time_per_layer = sum(layer_times) / len(layer_times)
+            remaining_layers = num_layers - layer_idx - 1
+            eta_seconds = avg_time_per_layer * remaining_layers
+            print(f"  [TIME] Layer {layer_idx} took {layer_elapsed:.1f}s | "
+                  f"Total: {total_elapsed/60:.1f}min | "
+                  f"ETA: {eta_seconds/60:.1f}min ({remaining_layers} layers left)")
 
             # Optional: save per-layer checkpoint
             if args.save_layer_checkpoints:
@@ -662,6 +678,7 @@ def train_progressive_qat(args):
     print("\n" + "=" * 60)
     print("PASS 4: E2E Quantizer Tuning (f-only)")
     print("=" * 60)
+    e2e_start_time = time.time()
 
     # Enable fake-quant on all layers
     set_quantized_prefix(model, num_layers - 1, pass_type='all')
@@ -711,6 +728,9 @@ def train_progressive_qat(args):
                 'step': step, 'global': loss.item(),
             })
 
+    e2e_elapsed = time.time() - e2e_start_time
+    print(f"  [TIME] E2E pass took {e2e_elapsed/60:.1f}min")
+
     # =========================================================================
     # Save outputs
     # =========================================================================
@@ -736,7 +756,8 @@ def train_progressive_qat(args):
     with open(out / "training_args.json", "w") as f:
         json.dump(vars(args), f, indent=2)
 
-    print("\nDone!")
+    total_time = time.time() - training_start_time
+    print(f"\nDone! Total training time: {total_time/60:.1f}min ({total_time/3600:.2f}h)")
 
 
 # -----------------------------------------------------------------------------
