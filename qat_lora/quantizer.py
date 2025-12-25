@@ -101,6 +101,8 @@ def fake_quant_weight_nbit(
     Returns:
         dequantized tensor (same dtype as weight), but constrained to 2^b levels per scale.
     """
+    # Cast f to match weight dtype to avoid BFloat16/float32 mismatch
+    f = f.to(weight.dtype)
     s = qc.compute_scale(weight, f)
 
     # Normalize into "quant space"
