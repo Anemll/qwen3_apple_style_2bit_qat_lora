@@ -248,12 +248,22 @@ class AnemllQATLinear(nn.Module):
         return dequant.view(num_rows, self.padded_in)
 
     def fake_quant_weight(self) -> torch.Tensor:
-        """Apply fake quantization to weights."""
-        w = self.weight.float()
+        """Apply fake quantization to weights with STE for gradient flow.
+
+        Uses Straight-Through Estimator (STE):
+        - Forward: returns quantized-dequantized weights
+        - Backward: gradients flow directly to original weights
+        """
+        # Keep reference to original weight for STE gradient path
+        w_orig = self.weight
+        w = w_orig.float()
 
         # Pad if needed
         if self.pad > 0:
             w = F.pad(w, (0, self.pad))
+            w_orig_padded = F.pad(w_orig.float(), (0, self.pad))
+        else:
+            w_orig_padded = w_orig.float()
 
         # Get scales
         scales = self.get_scales()  # [out, groups]
@@ -279,8 +289,14 @@ class AnemllQATLinear(nn.Module):
         # Remove padding
         if self.pad > 0:
             dequant = dequant[:, :self.in_features]
+            w_orig_padded = w_orig_padded[:, :self.in_features]
 
-        return dequant.to(self.weight.dtype)
+        # STE: forward uses quantized values, backward flows through original weights
+        # w_q = w_orig + (dequant - w_orig).detach()
+        # This makes d(w_q)/d(w_orig) = 1, so gradients flow to original weights
+        w_q = w_orig_padded + (dequant - w_orig_padded).detach()
+
+        return w_q.to(self.weight.dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.enable_fake_quant:
