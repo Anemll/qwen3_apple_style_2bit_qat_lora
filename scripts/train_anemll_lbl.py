@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """
-Test script for AnemllQATLinear with groupwise LUT quantization.
+Layer-by-layer (LBL) training script for AnemllQATLinear.
 
-Tests the Anemll-style fake quantization on Qwen3 models with optional
-KD cache evaluation.
+Supports layer-by-layer scale optimization and KD cache evaluation.
 
 Examples:
   # Basic test with 4-bit LUT
-  python scripts/test_anemll_qat.py --lut-size 16 --scale-rank 4 --group-size 32
+  python scripts/train_anemll_lbl.py --lut-size 16 --scale-rank 4 --group-size 32
 
   # With attention quantization
-  python scripts/test_anemll_qat.py --lut-size 16 --scale-rank 4 --quantize-attn \
+  python scripts/train_anemll_lbl.py --lut-size 16 --scale-rank 4 --quantize-attn \
       --attn-scale-rank 8 --attn-lut-size 16 --attn-group-size 32
 
   # With KD cache evaluation
-  python scripts/test_anemll_qat.py --lut-size 16 --scale-rank 4 --group-size 32 \
+  python scripts/train_anemll_lbl.py --lut-size 16 --scale-rank 4 --group-size 32 \
       --kd-cache-dir caches/alpaca_chat_think_both_L128_K32_R256 --eval-samples 100
 
-  # Save quantized model
-  python scripts/test_anemll_qat.py --lut-size 16 --scale-rank 4 --group-size 32 \
-      --save-quantized-dir /tmp/anemll_q4
+  # Optimize scales layer-by-layer and save
+  python scripts/train_anemll_lbl.py --lut-size 16 --scale-rank 4 --group-size 32 \
+      --optimize-scales --save-quantized-dir runs/anemll_scales_v1
 """
 
 from __future__ import annotations
@@ -455,7 +454,7 @@ def main():
     parser.add_argument("--eval-samples", type=int, default=100, help="Number of samples for KD eval")
     parser.add_argument("--eval-cpu", action="store_true", help="Run KD evaluation on CPU (avoids MPS memory issues)")
     parser.add_argument("--skip-inference", action="store_true", help="Skip inference test")
-    parser.add_argument("--skip-kd-eval", action="store_true", help="Skip KD cache evaluation (still usable for --optimize-scales)")
+    parser.add_argument("--skip-kd-eval", action="store_true", help="Skip KD cache evaluation (auto-skipped when --optimize-scales is used)")
     parser.add_argument("--run-baseline", action="store_true", help="Run baseline inference before quantization")
 
     # Scale optimization args
@@ -657,7 +656,9 @@ def main():
         print(f"Total: A@B params={total_ab_params:,}, full_scales params={total_full_scales:,}")
 
     # KD cache evaluation
-    if args.kd_cache_dir and not args.skip_kd_eval:
+    # Skip by default when --optimize-scales is used (it already evaluates before/after)
+    skip_kd = args.skip_kd_eval or args.optimize_scales
+    if args.kd_cache_dir and not skip_kd:
         print(f"\n--- KD Cache Evaluation ---")
         cache_info = load_kd_cache(args.kd_cache_dir, limit=args.eval_samples)
         if cache_info:

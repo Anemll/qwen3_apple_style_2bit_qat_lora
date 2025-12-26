@@ -220,6 +220,8 @@ def compute_kd_loss_batch(
     device: torch.device,
     temperature: float = 2.0,
     no_grad: bool = False,
+    hard_top1_weight: float = 0.0,
+    hard_full_weight: float = 0.0,
 ) -> torch.Tensor:
     """Compute KD loss for a batch using memory-efficient approach.
 
@@ -230,9 +232,11 @@ def compute_kd_loss_batch(
         temperature: Distillation temperature
         no_grad: If True, wrap forward pass in no_grad (for evaluation).
                  During training, set to False to allow gradients.
+        hard_top1_weight: Weight for hard label loss on top-1 (helps stabilize training)
+        hard_full_weight: Weight for hard label loss on full vocab (small value helps)
 
     Returns:
-        KL divergence loss scalar
+        Combined loss scalar (KL + hard label losses)
     """
     input_ids = batch['input_ids'].to(device)
     attention_mask = batch.get('attention_mask')
@@ -279,9 +283,33 @@ def compute_kd_loss_batch(
 
     # KL = sum over K dimension, then mean over B*S tokens
     kl_per_token = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)  # [B, S]
-    kl = kl_per_token.mean() * (temperature ** 2)
+    kl_loss = kl_per_token.mean() * (temperature ** 2)
 
-    return kl
+    total_loss = kl_loss
+
+    # Hard label loss on top-1 (cross-entropy with teacher's top prediction)
+    if hard_top1_weight > 0:
+        # Teacher's top-1 index within top-k (index 0 is highest logit)
+        # We want student to predict the top-1 token
+        top1_targets = idx[:, 0]  # [B*S] - actual vocab indices of top-1
+
+        # Compute full student logits for hard label loss
+        student_full_logits = h @ model.lm_head.weight.T  # [B*S, V]
+        hard_top1_loss = F.cross_entropy(student_full_logits, top1_targets)
+        total_loss = total_loss + hard_top1_weight * hard_top1_loss
+
+    # Hard label loss on full vocab (smaller weight, helps with stability)
+    if hard_full_weight > 0 and hard_top1_weight == 0:
+        # Only compute full logits if not already computed above
+        top1_targets = idx[:, 0]
+        student_full_logits = h @ model.lm_head.weight.T
+        hard_full_loss = F.cross_entropy(student_full_logits, top1_targets)
+        total_loss = total_loss + hard_full_weight * hard_full_loss
+    elif hard_full_weight > 0:
+        # Reuse the already computed loss
+        total_loss = total_loss + hard_full_weight * hard_top1_loss
+
+    return total_loss
 
 
 class KDCacheDataset(IterableDataset):
@@ -512,10 +540,13 @@ def train_layer(
     local_weight: float = 0.5,
     global_weight: float = 0.5,
     local_tokens: int = 128,
+    hard_top1_weight: float = 0.0,
+    hard_full_weight: float = 0.0,
 ) -> dict:
     """Train a single layer with local MLP reconstruction + global KD loss.
 
     Loss = local_weight * LocalMLPLoss + global_weight * GlobalKDLoss
+         + hard_top1_weight * HardTop1Loss + hard_full_weight * HardFullLoss
 
     Training modes:
     - train_weights=True, train_scales=False: Train weights only (default QAT)
@@ -524,6 +555,7 @@ def train_layer(
 
     Local loss: Compares quantized MLP output to frozen FP MLP output.
     Global loss: Compares final model output to cached teacher top-k logits.
+    Hard label loss: Cross-entropy with teacher's top-1 prediction (helps convergence).
 
     Args:
         model: The model to train
@@ -543,6 +575,8 @@ def train_layer(
         local_weight: Weight for local MLP reconstruction loss
         global_weight: Weight for global KD loss
         local_tokens: Number of tokens to sample for local loss
+        hard_top1_weight: Weight for hard label top-1 loss (helps convergence)
+        hard_full_weight: Weight for hard label full vocab loss
 
     Returns:
         Dict with 'layer', 'before', 'after', 'improvement', 'time_sec', etc.
@@ -563,6 +597,8 @@ def train_layer(
         mode = "frozen (no training)"
     if verbose:
         print(f'\n=== Layer {layer_idx} === ({trainable:,} trainable params, mode={mode})')
+        if hard_top1_weight > 0 or hard_full_weight > 0:
+            print(f'  Hard label: top1={hard_top1_weight}, full={hard_full_weight}')
 
     # Get model dtype
     model_dtype = next(model.parameters()).dtype
@@ -627,7 +663,12 @@ def train_layer(
 
         for i, batch in enumerate(dataloader):
             # Global KD loss (forward pass also captures MLP I/O via hook)
-            global_loss = compute_kd_loss_batch(model, batch, device, temperature, no_grad=False)
+            global_loss = compute_kd_loss_batch(
+                model, batch, device, temperature,
+                no_grad=False,
+                hard_top1_weight=hard_top1_weight,
+                hard_full_weight=hard_full_weight,
+            )
 
             # Local MLP reconstruction loss
             if use_local:
@@ -744,6 +785,8 @@ def train_all_layers(
     local_weight: float = 0.5,
     global_weight: float = 0.5,
     local_tokens: int = 128,
+    hard_top1_weight: float = 0.0,
+    hard_full_weight: float = 0.0,
 ) -> List[dict]:
     """Train all layers sequentially with local + global loss.
 
@@ -769,6 +812,8 @@ def train_all_layers(
         local_weight: Weight for local reconstruction loss
         global_weight: Weight for global KD loss
         local_tokens: Number of tokens to sample for local loss
+        hard_top1_weight: Weight for hard label top-1 loss (helps convergence)
+        hard_full_weight: Weight for hard label full vocab loss
 
     Returns:
         List of dicts with layer stats including local/global loss
@@ -805,6 +850,8 @@ def train_all_layers(
             print(f'LR: {lr}, Steps per layer: {steps_per_layer}')
         else:
             print(f'LR: {lr}, Epochs per layer: {epochs_per_layer}')
+        if hard_top1_weight > 0 or hard_full_weight > 0:
+            print(f'Hard label: top1={hard_top1_weight}, full={hard_full_weight}')
 
     # Get initial global loss
     initial_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=40, temperature=temperature)
@@ -839,6 +886,8 @@ def train_all_layers(
             local_weight=local_weight,
             global_weight=global_weight,
             local_tokens=local_tokens,
+            hard_top1_weight=hard_top1_weight,
+            hard_full_weight=hard_full_weight,
         )
         layer_results.append(result)
         layer_times.append(result['time_sec'])
@@ -875,3 +924,280 @@ def train_all_layers(
             print(f"{r['layer']:>6} {before:>12.4f} {r['after']:>12.4f} {imp:>+10.4f} {local_first:>10.4f} {local_last:>10.4f} {global_first:>11.4f} {global_last:>12.4f} {r['time_sec']:>7.1f}s")
 
     return layer_results
+
+
+def save_checkpoint(
+    model: nn.Module,
+    save_dir: str,
+    config: dict = None,
+    name: str = "model_state_dict.pt",
+    save_indices: bool = True,
+    verbose: bool = True,
+) -> str:
+    """Save model checkpoint with optional config and indices.
+
+    Args:
+        model: Model to save
+        save_dir: Directory to save to
+        config: Optional config dict to save as config.json
+        name: Filename for state dict (default: model_state_dict.pt)
+        save_indices: If True, compute and save quantization indices
+        verbose: Print save info
+
+    Returns:
+        Path to saved state dict
+    """
+    import os
+    import json
+    from .ane_qat_linear import compute_all_indices
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Save state dict
+    state_path = os.path.join(save_dir, name)
+    torch.save(model.state_dict(), state_path)
+
+    if verbose:
+        print(f"Saved checkpoint to {save_dir}/")
+        print(f"  - {name}")
+
+    # Save indices
+    if save_indices:
+        indices_dict = compute_all_indices(model, verbose=False)
+        if indices_dict:
+            indices_path = os.path.join(save_dir, "indices.pt")
+            torch.save(indices_dict, indices_path)
+            # Compute size
+            total_bytes = sum(idx.numel() * idx.element_size() for idx in indices_dict.values())
+            if verbose:
+                print(f"  - indices.pt ({len(indices_dict)} layers, {total_bytes / 1024 / 1024:.1f} MB)")
+
+    # Save config if provided
+    if config is not None:
+        config_path = os.path.join(save_dir, "config.json")
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2, default=str)
+        if verbose:
+            print(f"  - config.json")
+
+    return state_path
+
+
+def load_checkpoint(
+    model: nn.Module,
+    checkpoint_path: str,
+    device: torch.device = None,
+    verbose: bool = True,
+) -> dict:
+    """Load checkpoint into model.
+
+    Args:
+        model: Model to load into (must have AnemllQATLinear layers already)
+        checkpoint_path: Path to state dict .pt file
+        device: Device to map to
+        verbose: Print load info
+
+    Returns:
+        Dict with 'missing_keys' and 'unexpected_keys'
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    state = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    result = model.load_state_dict(state, strict=False)
+
+    if verbose:
+        print(f"Loaded checkpoint: {checkpoint_path}")
+        if result.missing_keys:
+            print(f"  Missing keys: {len(result.missing_keys)}")
+        if result.unexpected_keys:
+            print(f"  Unexpected keys: {len(result.unexpected_keys)}")
+        if not result.missing_keys and not result.unexpected_keys:
+            print(f"  All keys matched")
+
+    return {
+        'missing_keys': result.missing_keys,
+        'unexpected_keys': result.unexpected_keys,
+    }
+
+
+def train_e2e(
+    model: nn.Module,
+    cache_dir: str,
+    device: torch.device,
+    max_steps: int = 1000,
+    batch_size: int = 32,
+    lr: float = 1e-5,
+    temperature: float = 2.0,
+    train_weights: bool = True,
+    train_scales: bool = False,
+    hard_top1_weight: float = 0.0,
+    hard_full_weight: float = 0.0005,
+    logging_steps: int = 50,
+    eval_steps: int = 200,
+    eval_samples: int = 40,
+    save_dir: str = None,
+    verbose: bool = True,
+) -> dict:
+    """End-to-end KD-QAT training (all layers unfrozen).
+
+    Args:
+        model: Model with AnemllQATLinear layers
+        cache_dir: Path to KD cache directory
+        device: Device to run on
+        max_steps: Maximum training steps
+        batch_size: Batch size
+        lr: Learning rate
+        temperature: Distillation temperature
+        train_weights: If True, train weight parameters
+        train_scales: If True, train scale_A/scale_B parameters
+        hard_top1_weight: Weight for hard label top-1 loss (0 to disable)
+        hard_full_weight: Weight for hard label full vocab loss (default 0.0005, helps stability)
+        logging_steps: Log every N steps
+        eval_steps: Evaluate every N steps
+        eval_samples: Samples for evaluation
+        save_dir: Directory to save best checkpoint (optional)
+        verbose: Print progress
+
+    Returns:
+        Dict with 'initial_loss', 'final_loss', 'best_loss', 'steps', 'time_sec'
+    """
+    import time
+    import os
+    from torch.optim import AdamW
+    from torch.utils.data import DataLoader
+
+    t_start = time.time()
+
+    # Set trainable parameters
+    trainable = 0
+    for p in model.parameters():
+        p.requires_grad = False
+
+    for name, module in model.named_modules():
+        if type(module).__name__ == 'AnemllQATLinear':
+            if train_weights:
+                module.weight.requires_grad = True
+                trainable += module.weight.numel()
+            if train_scales:
+                if hasattr(module, 'scale_A') and module.scale_A is not None:
+                    module.scale_A.requires_grad = True
+                    module.scale_B.requires_grad = True
+                    trainable += module.scale_A.numel() + module.scale_B.numel()
+
+    # Describe mode
+    mode_parts = []
+    if train_weights:
+        mode_parts.append("weights")
+    if train_scales:
+        mode_parts.append("scales")
+    mode = "+".join(mode_parts) if mode_parts else "none"
+
+    if verbose:
+        print(f"=== End-to-End KD-QAT ===")
+        print(f"Mode: {mode}")
+        print(f"Trainable params: {trainable:,}")
+        print(f"Steps: {max_steps}, LR: {lr}, Batch: {batch_size}")
+        if hard_top1_weight > 0 or hard_full_weight > 0:
+            print(f"Hard label: top1={hard_top1_weight}, full={hard_full_weight}")
+
+    # Optimizer
+    params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        raise ValueError("No trainable parameters! Check train_weights/train_scales flags.")
+    optimizer = AdamW(params, lr=lr)
+
+    # Initial evaluation
+    model.eval()
+    initial_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=eval_samples, temperature=temperature)
+    if verbose:
+        print(f"\nInitial KD Loss: {initial_loss:.4f}")
+
+    # Training loop
+    model.train()
+    step = 0
+    total_loss = 0.0
+    best_loss = initial_loss
+    best_state = None
+    loss_history = []
+
+    while step < max_steps:
+        dataset = KDCacheDataset(cache_dir, shuffle=True)
+        dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
+
+        for batch in dataloader:
+            if step >= max_steps:
+                break
+
+            loss = compute_kd_loss_batch(
+                model, batch, device, temperature,
+                no_grad=False,
+                hard_top1_weight=hard_top1_weight,
+                hard_full_weight=hard_full_weight,
+            )
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+            total_loss += loss.item()
+            step += 1
+
+            # Logging
+            if verbose and step % logging_steps == 0:
+                avg_loss = total_loss / logging_steps
+                elapsed = time.time() - t_start
+                eta = elapsed / step * (max_steps - step) if step > 0 else 0
+                print(f"[{step}/{max_steps}] loss={avg_loss:.4f} ({elapsed:.0f}s, ETA {eta:.0f}s)")
+                loss_history.append(avg_loss)
+                total_loss = 0.0
+
+            # Evaluation
+            if step % eval_steps == 0:
+                model.eval()
+                eval_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=eval_samples, temperature=temperature)
+                if verbose:
+                    print(f"  [Eval] KD Loss: {eval_loss:.4f} (best: {best_loss:.4f})")
+                if eval_loss < best_loss:
+                    best_loss = eval_loss
+                    # Save best state in memory
+                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    if save_dir:
+                        os.makedirs(save_dir, exist_ok=True)
+                        torch.save(best_state, os.path.join(save_dir, "best_state_dict.pt"))
+                        if verbose:
+                            print(f"  [Saved best checkpoint: {best_loss:.4f}]")
+                model.train()
+
+    # Final evaluation
+    model.eval()
+    final_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=eval_samples, temperature=temperature)
+
+    # Update best if final is better
+    if final_loss < best_loss:
+        best_loss = final_loss
+        best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            torch.save(best_state, os.path.join(save_dir, "best_state_dict.pt"))
+            if verbose:
+                print(f"  [Saved best checkpoint: {best_loss:.4f}]")
+
+    elapsed = time.time() - t_start
+
+    if verbose:
+        print(f"\n=== Results ===")
+        print(f"Initial: {initial_loss:.4f}")
+        print(f"Final:   {final_loss:.4f}")
+        print(f"Best:    {best_loss:.4f}")
+        print(f"Improvement: {initial_loss - final_loss:.4f}")
+        print(f"Time: {elapsed:.1f}s")
+
+    return {
+        'initial_loss': initial_loss,
+        'final_loss': final_loss,
+        'best_loss': best_loss,
+        'best_state': best_state,
+        'steps': step,
+        'time_sec': elapsed,
+        'loss_history': loss_history,
+    }

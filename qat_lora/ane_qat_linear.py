@@ -451,6 +451,192 @@ class AnemllQATLinear(nn.Module):
             f"lut_size={self.config.lut_size}, lora_r={self.lora_r}"
         )
 
+    @torch.no_grad()
+    def compute_indices(self) -> torch.Tensor:
+        """Compute quantization indices for current weights.
+
+        Returns:
+            indices: [out_features, in_features] LUT indices (int8 or int16)
+        """
+        w = self.weight.float()
+
+        # Pad if needed
+        if self.pad > 0:
+            w = F.pad(w, (0, self.pad))
+
+        # Get per-weight scales
+        scales = self.get_scales()
+
+        # Normalize to [-1, 1]
+        normalized = w / scales
+
+        # Compute indices
+        lut_size = self.lut.size(0)
+        if not self.config.lut_include_zero or (lut_size % 2 == 1):
+            step = 2.0 / (lut_size - 1)
+            clamped = normalized.clamp(-1.0, 1.0)
+            indices = torch.round((clamped + 1.0) / step).long().clamp(0, lut_size - 1)
+        else:
+            indices = quantize_to_lut_indices(
+                normalized.clamp(-1.0, 1.0),
+                lut_size=lut_size,
+                include_zero=True,
+            )
+
+        # Remove padding
+        if self.pad > 0:
+            indices = indices[:, :self.in_features]
+
+        # Use smallest dtype that fits
+        if lut_size <= 256:
+            indices = indices.to(torch.uint8)
+        else:
+            indices = indices.to(torch.int16)
+
+        return indices
+
+    @torch.no_grad()
+    def snap_weights_to_quantized(self, store_lut_values: bool = True) -> torch.Tensor:
+        """Snap weights to their quantized values.
+
+        Two modes:
+        - store_lut_values=True: weight = LUT[idx] (normalized, in [-1,1])
+          At inference: output = input @ (weight * scale).T
+        - store_lut_values=False: weight = LUT[idx] * scale (full dequant)
+          At inference: output = input @ weight.T (scales already applied)
+
+        Args:
+            store_lut_values: If True, store LUT[idx] as weights (keeps scales separate).
+                              If False, store LUT[idx] * scale as weights.
+
+        Returns:
+            indices: [out_features, in_features] the indices used
+        """
+        w = self.weight.float()
+        orig_dtype = self.weight.dtype
+
+        # Pad if needed
+        if self.pad > 0:
+            w = F.pad(w, (0, self.pad))
+
+        # Get per-weight scales [out, padded_in]
+        scales = self.get_scales()
+
+        # Normalize to [-1, 1]
+        normalized = w / scales
+
+        # Compute indices
+        lut_size = self.lut.size(0)
+        if not self.config.lut_include_zero or (lut_size % 2 == 1):
+            step = 2.0 / (lut_size - 1)
+            clamped = normalized.clamp(-1.0, 1.0)
+            indices = torch.round((clamped + 1.0) / step).long().clamp(0, lut_size - 1)
+        else:
+            indices = quantize_to_lut_indices(
+                normalized.clamp(-1.0, 1.0),
+                lut_size=lut_size,
+                include_zero=True,
+            )
+
+        # Get LUT values
+        lut = self.lut.to(device=w.device, dtype=w.dtype)
+        lut_values = lut[indices]  # [out, padded_in] in [-1, 1]
+
+        if store_lut_values:
+            # Store LUT[idx] as weight (normalized values)
+            w_quantized = lut_values
+        else:
+            # Store LUT[idx] * scale as weight (full dequant)
+            w_quantized = lut_values * scales
+
+        # Remove padding
+        if self.pad > 0:
+            w_quantized = w_quantized[:, :self.in_features]
+            indices = indices[:, :self.in_features]
+
+        # Update weight parameter
+        self.weight.data.copy_(w_quantized.to(orig_dtype))
+
+        # Return indices (compact dtype)
+        if lut_size <= 256:
+            indices = indices.to(torch.uint8)
+        else:
+            indices = indices.to(torch.int16)
+
+        return indices
+
+    @torch.no_grad()
+    def get_quantized_representation(self) -> dict:
+        """Get the full quantized representation for export.
+
+        Returns dict with:
+            - indices: [out, in] uint8/int16 LUT indices
+            - quantized_weights: [out, in] LUT[idx] values (in [-1, 1])
+            - scales: [out, padded_in] full scales or {'scale_A', 'scale_B'} for low-rank
+            - lut: [lut_size] LUT values
+            - bias: [out] or None
+            - config info
+        """
+        w = self.weight.float()
+
+        # Pad if needed
+        if self.pad > 0:
+            w = F.pad(w, (0, self.pad))
+
+        # Get scales
+        scales = self.get_scales()
+
+        # Normalize and compute indices
+        normalized = w / scales
+        lut_size = self.lut.size(0)
+        if not self.config.lut_include_zero or (lut_size % 2 == 1):
+            step = 2.0 / (lut_size - 1)
+            clamped = normalized.clamp(-1.0, 1.0)
+            indices = torch.round((clamped + 1.0) / step).long().clamp(0, lut_size - 1)
+        else:
+            indices = quantize_to_lut_indices(
+                normalized.clamp(-1.0, 1.0),
+                lut_size=lut_size,
+                include_zero=True,
+            )
+
+        # Get quantized weights = LUT[idx]
+        lut = self.lut.to(device=w.device, dtype=w.dtype)
+        quantized_weights = lut[indices]
+
+        # Remove padding
+        if self.pad > 0:
+            indices = indices[:, :self.in_features]
+            quantized_weights = quantized_weights[:, :self.in_features]
+
+        # Compact index dtype
+        if lut_size <= 256:
+            indices = indices.to(torch.uint8)
+        else:
+            indices = indices.to(torch.int16)
+
+        # Scales for export
+        if self.use_low_rank:
+            scales_export = {
+                'scale_A': self.scale_A.data.clone(),
+                'scale_B': self.scale_B.data.clone(),
+            }
+        else:
+            scales_export = self.full_scales.data.clone()
+
+        return {
+            'indices': indices,
+            'quantized_weights': quantized_weights.to(self.weight.dtype),  # LUT[idx]
+            'scales': scales_export,
+            'lut': self.lut.clone(),
+            'bias': self.bias.data.clone() if self.bias is not None else None,
+            'in_features': self.in_features,
+            'out_features': self.out_features,
+            'group_size': self.group_size,
+            'scale_rank': self.scale_rank,
+            'lut_size': self.config.lut_size,
+        }
+
 
 # =============================================================================
 # MODEL REPLACEMENT UTILITY
@@ -588,3 +774,142 @@ def unfreeze_model_for_training(model: nn.Module, verbose: bool = False) -> int:
         print(f'\nUnfrozen {count} layers for training')
 
     return count
+
+
+@torch.no_grad()
+def compute_all_indices(model: nn.Module, verbose: bool = False) -> dict:
+    """Compute quantization indices for all AnemllQATLinear layers.
+
+    Args:
+        model: Model containing AnemllQATLinear layers
+        verbose: Print progress info
+
+    Returns:
+        Dict mapping layer names to indices tensors
+    """
+    indices_dict = {}
+    count = 0
+
+    for name, module in model.named_modules():
+        if type(module).__name__ == 'AnemllQATLinear':
+            indices = module.compute_indices()
+            indices_dict[name] = indices
+            count += 1
+            if verbose:
+                print(f'  [indices] {name}: {indices.shape}, dtype={indices.dtype}')
+
+    if verbose:
+        # Compute total size
+        total_bytes = sum(idx.numel() * idx.element_size() for idx in indices_dict.values())
+        print(f'\nComputed indices for {count} layers ({total_bytes / 1024 / 1024:.1f} MB)')
+
+    return indices_dict
+
+
+@torch.no_grad()
+def snap_all_weights(
+    model: nn.Module,
+    store_lut_values: bool = True,
+    verbose: bool = False,
+) -> dict:
+    """Snap all weights to their quantized values.
+
+    Two modes:
+    - store_lut_values=True: weight = LUT[idx] (normalized, in [-1,1])
+      At inference: output = input @ (weight * scale).T
+    - store_lut_values=False: weight = LUT[idx] * scale (full dequant)
+      At inference: output = input @ weight.T (scales already applied)
+
+    Args:
+        model: Model containing AnemllQATLinear layers
+        store_lut_values: If True, store LUT[idx] as weights (keeps scales separate)
+        verbose: Print progress info
+
+    Returns:
+        Dict mapping layer names to indices tensors
+    """
+    indices_dict = {}
+    count = 0
+    total_error = 0.0
+
+    for name, module in model.named_modules():
+        if type(module).__name__ == 'AnemllQATLinear':
+            # Compute error before snap
+            w_before = module.weight.data.clone()
+            indices = module.snap_weights_to_quantized(store_lut_values=store_lut_values)
+            w_after = module.weight.data
+
+            # Compute relative error
+            error = (w_before - w_after).abs().mean() / w_before.abs().mean()
+            total_error += error.item()
+
+            indices_dict[name] = indices
+            count += 1
+            if verbose:
+                w_range = f"[{w_after.min().item():.3f}, {w_after.max().item():.3f}]"
+                print(f'  [snapped] {name}: rel_error={error.item():.6f}, range={w_range}')
+
+    if verbose and count > 0:
+        avg_error = total_error / count
+        total_bytes = sum(idx.numel() * idx.element_size() for idx in indices_dict.values())
+        mode = "LUT[idx]" if store_lut_values else "LUT[idx]*scale"
+        print(f'\nSnapped {count} layers to {mode} (avg rel_error={avg_error:.6f}, indices={total_bytes / 1024 / 1024:.1f} MB)')
+
+    return indices_dict
+
+
+@torch.no_grad()
+def export_quantized_model(model: nn.Module, verbose: bool = False) -> dict:
+    """Export full quantized representation for all layers.
+
+    Each layer dict contains:
+    - indices: [out, in] uint8/int16 LUT indices
+    - quantized_weights: [out, in] LUT[idx] values (in [-1, 1])
+    - scales: full scales or {'scale_A', 'scale_B'} for low-rank
+    - lut: [lut_size] LUT values
+    - bias, in_features, out_features, group_size, scale_rank, lut_size
+
+    This is useful for external tools like ANEMLL model converters.
+
+    Args:
+        model: Model containing AnemllQATLinear layers
+        verbose: Print progress info
+
+    Returns:
+        Dict mapping layer names to quantized representation dicts
+    """
+    export_dict = {}
+    count = 0
+    total_idx_bytes = 0
+    total_qw_bytes = 0
+    total_scale_bytes = 0
+
+    for name, module in model.named_modules():
+        if type(module).__name__ == 'AnemllQATLinear':
+            rep = module.get_quantized_representation()
+            export_dict[name] = rep
+            count += 1
+
+            idx_size = rep['indices'].numel() * rep['indices'].element_size()
+            qw_size = rep['quantized_weights'].numel() * rep['quantized_weights'].element_size()
+            if isinstance(rep['scales'], dict):
+                scale_size = (rep['scales']['scale_A'].numel() * rep['scales']['scale_A'].element_size() +
+                              rep['scales']['scale_B'].numel() * rep['scales']['scale_B'].element_size())
+            else:
+                scale_size = rep['scales'].numel() * rep['scales'].element_size()
+
+            total_idx_bytes += idx_size
+            total_qw_bytes += qw_size
+            total_scale_bytes += scale_size
+
+            if verbose:
+                qw_range = f"[{rep['quantized_weights'].min().item():.3f}, {rep['quantized_weights'].max().item():.3f}]"
+                print(f'  [export] {name}: idx={idx_size/1024:.1f}KB, qw={qw_size/1024:.1f}KB {qw_range}, scales={scale_size/1024:.1f}KB')
+
+    if verbose:
+        print(f'\nExported {count} layers:')
+        print(f'  indices:           {total_idx_bytes / 1024 / 1024:.2f} MB')
+        print(f'  quantized_weights: {total_qw_bytes / 1024 / 1024:.2f} MB (LUT[idx])')
+        print(f'  scales:            {total_scale_bytes / 1024 / 1024:.2f} MB')
+
+    return export_dict
