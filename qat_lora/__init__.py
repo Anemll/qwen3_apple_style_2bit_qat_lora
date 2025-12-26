@@ -8,6 +8,8 @@ from .layer_qat import (
     train_all_layers,
     KDCacheDataset,
     collate_fn,
+    LocalLayerReconstructionLoss,
+    create_frozen_fp_layer,
 )
 
 __all__ = [
@@ -20,4 +22,6 @@ __all__ = [
     'train_all_layers',
     'KDCacheDataset',
     'collate_fn',
+    'LocalLayerReconstructionLoss',
+    'create_frozen_fp_layer',
 ]
