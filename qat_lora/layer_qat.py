@@ -271,11 +271,15 @@ def compute_kd_loss_batch(
     w = model.lm_head.weight[idx]  # [N, K, H]
     student_topk = torch.einsum('nh,nkh->nk', h, w).view(B, seq_len, K)
 
-    # KL divergence with temperature
+    # KL divergence with temperature (per-token, matching progressive training)
     t_logits = topk_logits[:, :seq_len, :]
     teacher_probs = F.softmax(t_logits / temperature, dim=-1)
+    teacher_log_probs = F.log_softmax(t_logits / temperature, dim=-1)
     student_log_probs = F.log_softmax(student_topk / temperature, dim=-1)
-    kl = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (temperature ** 2)
+
+    # KL = sum over K dimension, then mean over B*S tokens
+    kl_per_token = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)  # [B, S]
+    kl = kl_per_token.mean() * (temperature ** 2)
 
     return kl
 
