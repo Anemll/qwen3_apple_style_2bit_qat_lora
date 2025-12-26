@@ -297,7 +297,8 @@ def train_layer(
     temperature: float = 2.0,
     train_scales: bool = False,
     verbose: bool = True,
-) -> float:
+    eval_before: bool = True,
+) -> dict:
     """Train a single layer with KD loss.
 
     Args:
@@ -312,21 +313,34 @@ def train_layer(
         temperature: Distillation temperature
         train_scales: If True, also train scale_A/scale_B
         verbose: Print progress
+        eval_before: Evaluate global loss before training (slower but informative)
 
     Returns:
-        Final evaluation loss for this layer
+        Dict with 'layer', 'before', 'after', 'improvement', 'time_sec'
     """
+    import time
+    t_start = time.time()
+
     trainable = freeze_all_except_layer(model, layer_idx, train_scales=train_scales)
     if verbose:
         print(f'\n=== Layer {layer_idx} === ({trainable:,} trainable params)')
 
-    # Get trainable params
+    # --- Evaluate BEFORE training this layer ---
+    loss_before = None
+    if eval_before:
+        model.eval()
+        loss_before = evaluate_kd_loss(model, cache_dir, device, num_samples=20, temperature=temperature)
+        if verbose:
+            print(f'  [Global KD Loss BEFORE]: {loss_before:.4f}')
+
+    # --- Training ---
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(params, lr=lr)
 
     model.train()
     total_loss = 0.0
     steps = 0
+    t_train_start = time.time()
 
     for epoch in range(epochs):
         # Create fresh dataloader each epoch for proper shuffling
@@ -346,15 +360,33 @@ def train_layer(
 
                 if verbose and steps % 10 == 0:
                     avg = total_loss / steps
-                    print(f'  Step {steps}, Loss: {avg:.4f}')
+                    elapsed = time.time() - t_train_start
+                    print(f'  Step {steps}, Train Loss: {avg:.4f} ({elapsed:.1f}s)')
 
-    # Final eval
+    # --- Evaluate AFTER training this layer ---
     model.eval()
-    eval_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=20, temperature=temperature)
-    if verbose:
-        print(f'  Layer {layer_idx} done. Eval Loss: {eval_loss:.4f}')
+    loss_after = evaluate_kd_loss(model, cache_dir, device, num_samples=20, temperature=temperature)
 
-    return eval_loss
+    # --- Timing ---
+    t_end = time.time()
+    layer_time = t_end - t_start
+
+    # --- Report ---
+    if verbose:
+        print(f'  [Global KD Loss AFTER]:  {loss_after:.4f}')
+        if loss_before is not None:
+            improvement = loss_before - loss_after
+            pct = 100 * improvement / loss_before if loss_before > 0 else 0
+            print(f'  [Layer {layer_idx} Improvement]: {improvement:.4f} ({pct:.1f}%)')
+        print(f'  [Layer {layer_idx} Time]: {layer_time:.1f}s')
+
+    return {
+        'layer': layer_idx,
+        'before': loss_before,
+        'after': loss_after,
+        'improvement': (loss_before - loss_after) if loss_before else None,
+        'time_sec': layer_time,
+    }
 
 
 def train_all_layers(
@@ -368,7 +400,8 @@ def train_all_layers(
     temperature: float = 2.0,
     train_scales: bool = False,
     verbose: bool = True,
-) -> List[float]:
+    eval_before: bool = True,
+) -> List[dict]:
     """Train all layers sequentially.
 
     Args:
@@ -382,11 +415,22 @@ def train_all_layers(
         temperature: Distillation temperature
         train_scales: If True, also train scale_A/scale_B
         verbose: Print progress
+        eval_before: Evaluate global loss before each layer
 
     Returns:
-        List of eval losses for each layer
+        List of dicts with 'layer', 'before', 'after', 'improvement', 'time_sec'
     """
     import time
+
+    def format_time(seconds: float) -> str:
+        """Format seconds as HH:MM:SS or MM:SS."""
+        if seconds < 3600:
+            return f'{int(seconds // 60)}:{int(seconds % 60):02d}'
+        else:
+            h = int(seconds // 3600)
+            m = int((seconds % 3600) // 60)
+            s = int(seconds % 60)
+            return f'{h}:{m:02d}:{s:02d}'
 
     num_layers = len(model.model.layers)
     if verbose:
@@ -395,11 +439,25 @@ def train_all_layers(
         print(f'Batch size: {batch_size}, Grad accum: {grad_accum}')
         print(f'LR: {lr}, Epochs per layer: {epochs_per_layer}')
 
-    layer_losses = []
+    # Get initial global loss
+    initial_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=40, temperature=temperature)
+    if verbose:
+        print(f'\n[Initial Global KD Loss]: {initial_loss:.4f}')
+
+    layer_results = []
     t0 = time.time()
+    layer_times = []
 
     for layer_idx in range(num_layers):
-        loss = train_layer(
+        # Show ETA
+        if verbose and layer_idx > 0 and len(layer_times) > 0:
+            avg_layer_time = sum(layer_times) / len(layer_times)
+            remaining_layers = num_layers - layer_idx
+            eta_seconds = avg_layer_time * remaining_layers
+            elapsed = time.time() - t0
+            print(f'\n[Progress: {layer_idx}/{num_layers}] Elapsed: {format_time(elapsed)}, ETA: {format_time(eta_seconds)}')
+
+        result = train_layer(
             model, layer_idx, cache_dir, device,
             batch_size=batch_size,
             lr=lr,
@@ -408,11 +466,36 @@ def train_all_layers(
             temperature=temperature,
             train_scales=train_scales,
             verbose=verbose,
+            eval_before=eval_before,
         )
-        layer_losses.append(loss)
+        layer_results.append(result)
+        layer_times.append(result['time_sec'])
+
+    # Final global loss
+    final_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=40, temperature=temperature)
 
     if verbose:
-        print(f'\nLayer-by-layer training complete in {time.time() - t0:.1f}s')
-        print(f'Final losses: {[f"{l:.4f}" for l in layer_losses]}')
+        elapsed = time.time() - t0
+        avg_time = sum(layer_times) / len(layer_times) if layer_times else 0
+        total_improvement = initial_loss - final_loss
+        pct_improvement = 100 * total_improvement / initial_loss if initial_loss > 0 else 0
 
-    return layer_losses
+        print(f'\n{"="*60}')
+        print(f'LAYER-BY-LAYER TRAINING COMPLETE')
+        print(f'{"="*60}')
+        print(f'Total time:    {format_time(elapsed)} ({elapsed:.1f}s)')
+        print(f'Avg per layer: {avg_time:.1f}s')
+        print()
+        print(f'[Initial Global KD Loss]: {initial_loss:.4f}')
+        print(f'[Final Global KD Loss]:   {final_loss:.4f}')
+        print(f'[Total Improvement]:      {total_improvement:.4f} ({pct_improvement:.1f}%)')
+        print()
+        print('Per-layer summary:')
+        print(f'{"Layer":>6} {"Before":>10} {"After":>10} {"Δ":>10} {"Time":>8}')
+        print('-' * 48)
+        for r in layer_results:
+            imp = r['improvement'] if r['improvement'] is not None else 0
+            before = r['before'] if r['before'] is not None else 0
+            print(f"{r['layer']:>6} {before:>10.4f} {r['after']:>10.4f} {imp:>+10.4f} {r['time_sec']:>7.1f}s")
+
+    return layer_results
