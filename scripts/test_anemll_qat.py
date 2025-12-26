@@ -457,6 +457,12 @@ def main():
     parser.add_argument("--skip-inference", action="store_true", help="Skip inference test")
     parser.add_argument("--run-baseline", action="store_true", help="Run baseline inference before quantization")
 
+    # Scale optimization args
+    parser.add_argument("--optimize-scales", action="store_true", help="Run layer-by-layer scale optimization (requires --kd-cache-dir)")
+    parser.add_argument("--scale-lr", type=float, default=1e-3, help="Learning rate for scale optimization")
+    parser.add_argument("--scale-epochs", type=int, default=2, help="Epochs per layer for scale optimization")
+    parser.add_argument("--scale-batch-size", type=int, default=32, help="Batch size for scale optimization")
+
     # Output args
     parser.add_argument("--save-quantized-dir", default="", help="Save quantized model to this directory")
     parser.add_argument("--gmm-stats", action="store_true", help="Print GMM storage stats")
@@ -589,6 +595,43 @@ def main():
                 total_scale_b_params += module.scale_B.numel()
     if total_scale_a_params > 0 or total_scale_b_params > 0:
         print(f"Scale params: A={total_scale_a_params:,} B={total_scale_b_params:,} total={total_scale_a_params + total_scale_b_params:,}")
+
+    # Scale optimization
+    if args.optimize_scales:
+        if not args.kd_cache_dir:
+            print("\nERROR: --optimize-scales requires --kd-cache-dir")
+        else:
+            print(f"\n--- Scale Optimization ---")
+            print(f"LR: {args.scale_lr}, Epochs/layer: {args.scale_epochs}, Batch: {args.scale_batch_size}")
+
+            from qat_lora import train_all_layers, evaluate_kd_loss as eval_kd
+
+            # Evaluate before
+            pre_loss = eval_kd(model, args.kd_cache_dir, device, num_samples=min(40, args.eval_samples))
+            print(f"KD Loss before: {pre_loss:.4f}")
+
+            # Run scale optimization
+            t_opt = time.time()
+            scale_losses = train_all_layers(
+                model=model,
+                cache_dir=args.kd_cache_dir,
+                device=device,
+                batch_size=args.scale_batch_size,
+                lr=args.scale_lr,
+                epochs_per_layer=args.scale_epochs,
+                grad_accum=1,
+                temperature=2.0,
+                train_weights=False,  # Freeze weights
+                train_scales=True,    # Train scales only
+                verbose=True,
+            )
+            opt_time = time.time() - t_opt
+
+            # Evaluate after
+            post_loss = eval_kd(model, args.kd_cache_dir, device, num_samples=min(40, args.eval_samples))
+            print(f"\nKD Loss after: {post_loss:.4f}")
+            print(f"Improvement: {pre_loss - post_loss:.4f}")
+            print(f"Time: {opt_time:.1f}s")
 
     # GMM stats
     if args.gmm_stats:

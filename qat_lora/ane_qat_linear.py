@@ -325,9 +325,15 @@ class AnemllQATLinear(nn.Module):
             dequant = dequant[:, :self.in_features]
 
         # --- Step 7: Apply STE for gradient flow ---
-        # w_q = w + (dequant - w).detach() => forward=dequant, backward=d/dw=1
-        w_float = self.weight.float()
-        w_q = w_float + (dequant - w_float).detach()
+        # When training weights: use STE so gradients flow to weights
+        # When training scales only: let gradients flow through dequant to scales
+        if self.weight.requires_grad:
+            # STE: forward=dequant, backward=d/dw=1
+            w_float = self.weight.float()
+            w_q = w_float + (dequant - w_float).detach()
+        else:
+            # Scales training: gradients flow through dequant -> scales
+            w_q = dequant
 
         return w_q.to(self.weight.dtype)
 
