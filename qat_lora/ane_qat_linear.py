@@ -1,22 +1,24 @@
 """
-Anemll-style QATLinear with learnable groupwise scales (A @ B) and LUT.
+Anemll-style QATLinear with learnable per-weight scales (A @ B) and LUT.
 
 Quantization formula:
-    W_q[o, i] = LUT[idx[o, i]] * scales[o, g]    where g = i // group_size
+    W_q[o, i] = LUT[idx[o, i]] * scales[o, i]
 
-Key differences from standard QATLinear:
-- Scales are per (output, group), not per-tensor
-- scales[o, g] = (A @ B)[o, g]  with low-rank A:[out, rank], B:[rank, groups]
+Key features:
+- Scales are per-weight [out_features, in_features] for direct inference
+- scales[o, i] = (A @ B)[o, i]  with low-rank A:[out, rank], B:[rank, in]
+- Initialization: compute per-group, expand to per-weight, then SVD
 - LUT is explicit and optionally learnable
 
 Scale dimensions:
-- Full scales: [out_features, num_groups] - one scale per output per group
-- Low-rank:    A[out_features, rank] @ B[rank, num_groups] - compressed
+- Full scales: [out_features, in_features] - one scale per weight
+- Low-rank:    A[out_features, rank] @ B[rank, in_features] - compressed
 
-Example (out=512, in=1024, group_size=32, rank=4):
-- num_groups = 1024 / 32 = 32
-- Full scales: 512 × 32 = 16,384 params
-- Low-rank:    512 × 4 + 4 × 32 = 2,176 params (7x compression)
+Example (out=512, in=1024, rank=4):
+- Full scales: 512 × 1024 = 524,288 params
+- Low-rank:    512 × 4 + 4 × 1024 = 6,144 params (85x compression)
+
+During inference: direct element-wise scale * weight multiplication.
 """
 
 from __future__ import annotations
@@ -139,7 +141,8 @@ class AnemllQATLinear(nn.Module):
         self.num_groups = self.padded_in // self.group_size
 
         # Scale rank (0 means full scales, no low-rank)
-        self.max_rank = min(out_features, self.num_groups)
+        # For per-weight scales: A:[out, rank] @ B:[rank, padded_in]
+        self.max_rank = min(out_features, self.padded_in)
         self.scale_rank = min(self.config.scale_rank, self.max_rank) if self.config.scale_rank > 0 else 0
         self.use_low_rank = self.scale_rank > 0 and self.scale_rank < self.max_rank
 
@@ -147,17 +150,17 @@ class AnemllQATLinear(nn.Module):
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
 
-        # Scale parameters
+        # Scale parameters - per-weight: [out_features, padded_in_features]
         if self.use_low_rank:
-            # Low-rank: scales = A @ B
+            # Low-rank: scales = A @ B = [out, rank] @ [rank, padded_in]
             self.scale_A = nn.Parameter(torch.empty(out_features, self.scale_rank))
-            self.scale_B = nn.Parameter(torch.empty(self.scale_rank, self.num_groups))
+            self.scale_B = nn.Parameter(torch.empty(self.scale_rank, self.padded_in))
             self.register_buffer("_full_scales", None)  # Not used
         else:
-            # Full scales
+            # Full per-weight scales
             self.register_parameter("scale_A", None)
             self.register_parameter("scale_B", None)
-            self.full_scales = nn.Parameter(torch.empty(out_features, self.num_groups))
+            self.full_scales = nn.Parameter(torch.empty(out_features, self.padded_in))
 
         # LUT
         lut = make_lut(
@@ -208,28 +211,39 @@ class AnemllQATLinear(nn.Module):
 
     @torch.no_grad()
     def _init_scales_from_weight(self):
-        """Initialize scale parameters from weight statistics."""
+        """Initialize scale parameters from weight statistics.
+
+        Process:
+        1. Compute per-group max-abs scales: [out, num_groups]
+        2. Expand to per-weight: [out, padded_in] by repeating group_size times
+        3. Apply SVD on full per-weight scale matrix
+        """
         w = self.weight.float()
 
         # Pad if needed
         if self.pad > 0:
             w = F.pad(w, (0, self.pad))
 
-        # Compute per-group max-abs scales
+        # Step 1: Compute per-group max-abs scales [out, num_groups]
         grouped = w.view(self.out_features, self.num_groups, self.group_size)
-        scales_full = grouped.abs().amax(dim=2).clamp(min=1e-8)
+        scales_per_group = grouped.abs().amax(dim=2).clamp(min=1e-8)
+
+        # Step 2: Expand to per-weight [out, padded_in]
+        # Each group scale is repeated group_size times
+        scales_per_weight = scales_per_group.repeat_interleave(self.group_size, dim=1)
+        # scales_per_weight is now [out_features, padded_in]
 
         if self.use_low_rank:
-            # SVD initialization for A, B
-            u, s, vh = torch.linalg.svd(scales_full, full_matrices=False)
+            # Step 3: SVD on full per-weight scales
+            u, s, vh = torch.linalg.svd(scales_per_weight, full_matrices=False)
             r = self.scale_rank
             self.scale_A.data = (u[:, :r] * s[:r]).to(self.weight.dtype)
             self.scale_B.data = vh[:r, :].to(self.weight.dtype)
         else:
-            self.full_scales.data = scales_full.to(self.weight.dtype)
+            self.full_scales.data = scales_per_weight.to(self.weight.dtype)
 
     def get_scales(self) -> torch.Tensor:
-        """Get the scale matrix [out_features, num_groups]."""
+        """Get the per-weight scale matrix [out_features, padded_in]."""
         if self.use_low_rank:
             return (self.scale_A @ self.scale_B).clamp(min=1e-8)
         else:
@@ -241,15 +255,16 @@ class AnemllQATLinear(nn.Module):
         scales_rows: torch.Tensor,
         lut: torch.Tensor,
     ) -> torch.Tensor:
-        """Quantize a chunk of rows. Helper for fake_quant_weight."""
-        # --- Step A: Reshape to groups ---
-        num_rows = w_rows.size(0)
-        grouped = w_rows.view(num_rows, self.num_groups, self.group_size)
+        """Quantize a chunk of rows. Helper for fake_quant_weight.
 
-        # --- Step B: Normalize to [-1, 1] ---
-        normalized = grouped / scales_rows.unsqueeze(-1)
+        With per-weight scales, this is now element-wise:
+        - w_rows: [num_rows, padded_in]
+        - scales_rows: [num_rows, padded_in]
+        """
+        # --- Step A: Normalize to [-1, 1] using per-weight scales ---
+        normalized = w_rows / scales_rows
 
-        # --- Step C: Compute LUT indices ---
+        # --- Step B: Compute LUT indices ---
         lut_size = lut.size(0)
         if not self.config.lut_include_zero or (lut_size % 2 == 1):
             # Uniform LUT - memory-efficient index computation
@@ -265,9 +280,10 @@ class AnemllQATLinear(nn.Module):
                 include_zero=True,
             )
 
-        # --- Step D: Dequantize via LUT lookup ---
-        dequant = lut[indices] * scales_rows.unsqueeze(-1)
-        return dequant.view(num_rows, self.padded_in)
+        # --- Step C: Dequantize via LUT lookup ---
+        # Direct element-wise: lut_value * scale
+        dequant = lut[indices] * scales_rows
+        return dequant
 
     def fake_quant_weight(self) -> torch.Tensor:
         """Apply fake quantization to weights with STE for gradient flow.
@@ -283,7 +299,7 @@ class AnemllQATLinear(nn.Module):
         if self.pad > 0:
             w = F.pad(w, (0, self.pad))
 
-        # --- Step 3: Get scales [out, groups] ---
+        # --- Step 3: Get per-weight scales [out, padded_in] ---
         scales = self.get_scales()
 
         # --- Step 4: Move LUT to same device/dtype ---
@@ -317,7 +333,10 @@ class AnemllQATLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # --- Step 1: Get quantized weights ---
-        if self.enable_fake_quant:
+        # Use cached weights if available (inference mode)
+        if hasattr(self, '_cached_weight_q') and self._cached_weight_q is not None:
+            w_q = self._cached_weight_q
+        elif self.enable_fake_quant:
             w_q = self.fake_quant_weight()
         else:
             w_q = self.weight
@@ -337,6 +356,37 @@ class AnemllQATLinear(nn.Module):
             y = y + (x_d @ lora_A.t() @ lora_B.t()) * self.scaling
 
         return y
+
+    @torch.no_grad()
+    def freeze_for_inference(self):
+        """Precompute and cache quantized weights for fast inference.
+
+        This precomputes: quantized_weight = LUT[indices] * (scale_A @ scale_B)
+        and caches it to avoid recomputation on every forward pass.
+
+        Call this before inference to speed up per-token generation.
+        """
+        if not self.enable_fake_quant:
+            self._cached_weight_q = None
+            return
+
+        # Compute quantized weights once
+        w_q = self.fake_quant_weight()
+
+        # Store as buffer (not parameter) - no gradients needed
+        self.register_buffer('_cached_weight_q', w_q.detach().clone())
+
+        # Optionally delete original weight to save memory (commented for safety)
+        # del self.weight
+
+    def unfreeze_for_training(self):
+        """Clear cached weights and re-enable training mode.
+
+        Call this before resuming training after inference.
+        """
+        if hasattr(self, '_cached_weight_q'):
+            del self._cached_weight_q
+        self._cached_weight_q = None
 
     def enable_lora(self, r: int, alpha: float, dropout: float = 0.0):
         """Enable LoRA for this layer."""
@@ -478,3 +528,57 @@ def replace_linear_with_anemll(
         print(f'\nReplaced {len(replacements)} layers')
 
     return len(replacements)
+
+
+def freeze_model_for_inference(model: nn.Module, verbose: bool = False) -> int:
+    """Freeze all AnemllQATLinear layers for fast inference.
+
+    This precomputes quantized weights for all layers, caching them
+    to avoid recomputation on every forward pass.
+
+    Args:
+        model: Model containing AnemllQATLinear layers
+        verbose: Print progress info
+
+    Returns:
+        Number of layers frozen
+    """
+    count = 0
+    for name, module in model.named_modules():
+        if type(module).__name__ == 'AnemllQATLinear':
+            module.freeze_for_inference()
+            count += 1
+            if verbose:
+                print(f'  [frozen] {name}')
+
+    if verbose:
+        print(f'\nFrozen {count} layers for inference')
+
+    return count
+
+
+def unfreeze_model_for_training(model: nn.Module, verbose: bool = False) -> int:
+    """Unfreeze all AnemllQATLinear layers for training.
+
+    This clears cached quantized weights, re-enabling dynamic
+    fake quantization during training.
+
+    Args:
+        model: Model containing AnemllQATLinear layers
+        verbose: Print progress info
+
+    Returns:
+        Number of layers unfrozen
+    """
+    count = 0
+    for name, module in model.named_modules():
+        if type(module).__name__ == 'AnemllQATLinear':
+            module.unfreeze_for_training()
+            count += 1
+            if verbose:
+                print(f'  [unfrozen] {name}')
+
+    if verbose:
+        print(f'\nUnfrozen {count} layers for training')
+
+    return count

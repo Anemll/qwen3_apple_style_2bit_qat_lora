@@ -1,6 +1,12 @@
 # QAT + LoRA utilities
 
-from .ane_qat_linear import AnemllQATLinear, AnemllQuantConfig, replace_linear_with_anemll
+from .ane_qat_linear import (
+    AnemllQATLinear,
+    AnemllQuantConfig,
+    replace_linear_with_anemll,
+    freeze_model_for_inference,
+    unfreeze_model_for_training,
+)
 from .layer_qat import (
     compute_kd_loss_batch,
     evaluate_kd_loss,
@@ -19,6 +25,8 @@ __all__ = [
     'AnemllQATLinear',
     'AnemllQuantConfig',
     'replace_linear_with_anemll',
+    'freeze_model_for_inference',
+    'unfreeze_model_for_training',
     'compute_kd_loss_batch',
     'evaluate_kd_loss',
     'train_layer',

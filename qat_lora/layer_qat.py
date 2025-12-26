@@ -367,14 +367,22 @@ def get_layer_modules(
 def freeze_all_except_layer(
     model: nn.Module,
     layer_idx: int,
+    train_weights: bool = True,
     train_scales: bool = False,
 ) -> int:
-    """Freeze all parameters except the specified layer's AnemllQATLinear weights.
+    """Freeze all parameters except specified layer's AnemllQATLinear params.
+
+    Training modes:
+    - train_weights=True, train_scales=False: Train weights only (default)
+    - train_weights=True, train_scales=True: Train both weights and scales
+    - train_weights=False, train_scales=True: Train scales only (scale optimization)
+    - train_weights=False, train_scales=False: Everything frozen (no training)
 
     Args:
         model: The model
         layer_idx: Layer index to unfreeze
-        train_scales: If True, also train scale_A/scale_B parameters
+        train_weights: If True, train weight parameters
+        train_scales: If True, train scale_A/scale_B parameters
 
     Returns:
         Number of trainable parameters
@@ -383,15 +391,18 @@ def freeze_all_except_layer(
     for p in model.parameters():
         p.requires_grad = False
 
-    # Unfreeze layer's quantized weights
+    # Unfreeze layer's quantized modules
     layer_modules = get_layer_modules(model, layer_idx)
     trainable = 0
     for name, m in layer_modules:
-        # Train the main weight
-        m.weight.requires_grad = True
-        trainable += m.weight.numel()
+        # Train weights
+        if train_weights:
+            m.weight.requires_grad = True
+            trainable += m.weight.numel()
+        else:
+            m.weight.requires_grad = False
 
-        # Optionally train scales
+        # Train scales
         if train_scales:
             if m.scale_A is not None:
                 m.scale_A.requires_grad = True
@@ -489,6 +500,7 @@ def train_layer(
     epochs: int = 1,
     grad_accum: int = 4,
     temperature: float = 2.0,
+    train_weights: bool = True,
     train_scales: bool = False,
     verbose: bool = True,
     eval_before: bool = True,
@@ -499,6 +511,11 @@ def train_layer(
     """Train a single layer with local MLP reconstruction + global KD loss.
 
     Loss = local_weight * LocalMLPLoss + global_weight * GlobalKDLoss
+
+    Training modes:
+    - train_weights=True, train_scales=False: Train weights only (default QAT)
+    - train_weights=True, train_scales=True: Train both weights and scales
+    - train_weights=False, train_scales=True: Scale optimization only (weights frozen)
 
     Local loss: Compares quantized MLP output to frozen FP MLP output.
     Global loss: Compares final model output to cached teacher top-k logits.
@@ -513,7 +530,8 @@ def train_layer(
         epochs: Number of epochs
         grad_accum: Gradient accumulation steps
         temperature: Distillation temperature
-        train_scales: If True, also train scale_A/scale_B
+        train_weights: If True, train weight parameters
+        train_scales: If True, train scale_A/scale_B parameters
         verbose: Print progress
         eval_before: Evaluate global loss before training (slower but informative)
         local_weight: Weight for local MLP reconstruction loss
@@ -526,9 +544,19 @@ def train_layer(
     import time
     t_start = time.time()
 
-    trainable = freeze_all_except_layer(model, layer_idx, train_scales=train_scales)
+    trainable = freeze_all_except_layer(model, layer_idx, train_weights=train_weights, train_scales=train_scales)
+
+    # Describe training mode
+    if train_weights and train_scales:
+        mode = "weights+scales"
+    elif train_weights:
+        mode = "weights"
+    elif train_scales:
+        mode = "scales only"
+    else:
+        mode = "frozen (no training)"
     if verbose:
-        print(f'\n=== Layer {layer_idx} === ({trainable:,} trainable params)')
+        print(f'\n=== Layer {layer_idx} === ({trainable:,} trainable params, mode={mode})')
 
     # Get model dtype
     model_dtype = next(model.parameters()).dtype
@@ -687,6 +715,7 @@ def train_all_layers(
     epochs_per_layer: int = 1,
     grad_accum: int = 4,
     temperature: float = 2.0,
+    train_weights: bool = True,
     train_scales: bool = False,
     verbose: bool = True,
     eval_before: bool = True,
@@ -695,6 +724,11 @@ def train_all_layers(
     local_tokens: int = 128,
 ) -> List[dict]:
     """Train all layers sequentially with local + global loss.
+
+    Training modes:
+    - train_weights=True, train_scales=False: Train weights only (default QAT)
+    - train_weights=True, train_scales=True: Train both weights and scales
+    - train_weights=False, train_scales=True: Scale optimization only (weights frozen)
 
     Args:
         model: The model to train
@@ -705,7 +739,8 @@ def train_all_layers(
         epochs_per_layer: Epochs per layer
         grad_accum: Gradient accumulation steps
         temperature: Distillation temperature
-        train_scales: If True, also train scale_A/scale_B
+        train_weights: If True, train weight parameters
+        train_scales: If True, train scale_A/scale_B parameters
         verbose: Print progress
         eval_before: Evaluate global loss before each layer
         local_weight: Weight for local reconstruction loss
@@ -728,8 +763,19 @@ def train_all_layers(
             return f'{h}:{m:02d}:{s:02d}'
 
     num_layers = len(model.model.layers)
+
+    # Describe training mode
+    if train_weights and train_scales:
+        mode = "weights+scales"
+    elif train_weights:
+        mode = "weights"
+    elif train_scales:
+        mode = "scales only"
+    else:
+        mode = "frozen (no training)"
+
     if verbose:
-        print(f'Training {num_layers} layers...')
+        print(f'Training {num_layers} layers (mode={mode})...')
         print(f'Cache: {cache_dir}')
         print(f'Batch size: {batch_size}, Grad accum: {grad_accum}')
         print(f'LR: {lr}, Epochs per layer: {epochs_per_layer}')
@@ -759,6 +805,7 @@ def train_all_layers(
             epochs=epochs_per_layer,
             grad_accum=grad_accum,
             temperature=temperature,
+            train_weights=train_weights,
             train_scales=train_scales,
             verbose=verbose,
             eval_before=eval_before,

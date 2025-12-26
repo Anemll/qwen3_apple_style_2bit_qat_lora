@@ -579,6 +579,17 @@ def main():
     print(f"\nOverall: mae={error_stats['mae']:.6g} rmse={error_stats['rmse']:.6g} rel_l2={error_stats['rel_l2']:.6g}")
     print(f"Total quantized params: {error_stats.get('total_params', 0):,}")
 
+    # Count scale parameters (always shown)
+    total_scale_a_params = 0
+    total_scale_b_params = 0
+    for name, module in model.named_modules():
+        if type(module).__name__ == 'AnemllQATLinear':
+            if module.use_low_rank:
+                total_scale_a_params += module.scale_A.numel()
+                total_scale_b_params += module.scale_B.numel()
+    if total_scale_a_params > 0 or total_scale_b_params > 0:
+        print(f"Scale params: A={total_scale_a_params:,} B={total_scale_b_params:,} total={total_scale_a_params + total_scale_b_params:,}")
+
     # GMM stats
     if args.gmm_stats:
         print("\n--- GMM Storage Stats ---")
