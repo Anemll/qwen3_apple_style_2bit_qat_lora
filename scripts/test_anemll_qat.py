@@ -455,12 +455,14 @@ def main():
     parser.add_argument("--eval-samples", type=int, default=100, help="Number of samples for KD eval")
     parser.add_argument("--eval-cpu", action="store_true", help="Run KD evaluation on CPU (avoids MPS memory issues)")
     parser.add_argument("--skip-inference", action="store_true", help="Skip inference test")
+    parser.add_argument("--skip-kd-eval", action="store_true", help="Skip KD cache evaluation (still usable for --optimize-scales)")
     parser.add_argument("--run-baseline", action="store_true", help="Run baseline inference before quantization")
 
     # Scale optimization args
     parser.add_argument("--optimize-scales", action="store_true", help="Run layer-by-layer scale optimization (requires --kd-cache-dir)")
     parser.add_argument("--scale-lr", type=float, default=1e-3, help="Learning rate for scale optimization")
-    parser.add_argument("--scale-epochs", type=int, default=2, help="Epochs per layer for scale optimization")
+    parser.add_argument("--scale-epochs", type=int, default=2, help="Epochs per layer for scale optimization (ignored if --scale-steps > 0)")
+    parser.add_argument("--scale-steps", type=int, default=0, help="Steps per layer for scale optimization (0 = use epochs)")
     parser.add_argument("--scale-batch-size", type=int, default=32, help="Batch size for scale optimization")
 
     # Output args
@@ -602,7 +604,10 @@ def main():
             print("\nERROR: --optimize-scales requires --kd-cache-dir")
         else:
             print(f"\n--- Scale Optimization ---")
-            print(f"LR: {args.scale_lr}, Epochs/layer: {args.scale_epochs}, Batch: {args.scale_batch_size}")
+            if args.scale_steps > 0:
+                print(f"LR: {args.scale_lr}, Steps/layer: {args.scale_steps}, Batch: {args.scale_batch_size}")
+            else:
+                print(f"LR: {args.scale_lr}, Epochs/layer: {args.scale_epochs}, Batch: {args.scale_batch_size}")
 
             from qat_lora import train_all_layers, evaluate_kd_loss as eval_kd
 
@@ -619,6 +624,7 @@ def main():
                 batch_size=args.scale_batch_size,
                 lr=args.scale_lr,
                 epochs_per_layer=args.scale_epochs,
+                steps_per_layer=args.scale_steps,
                 grad_accum=1,
                 temperature=2.0,
                 train_weights=False,  # Freeze weights
@@ -651,7 +657,7 @@ def main():
         print(f"Total: A@B params={total_ab_params:,}, full_scales params={total_full_scales:,}")
 
     # KD cache evaluation
-    if args.kd_cache_dir:
+    if args.kd_cache_dir and not args.skip_kd_eval:
         print(f"\n--- KD Cache Evaluation ---")
         cache_info = load_kd_cache(args.kd_cache_dir, limit=args.eval_samples)
         if cache_info:

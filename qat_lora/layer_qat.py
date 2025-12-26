@@ -498,6 +498,7 @@ def train_layer(
     batch_size: int = 4,
     lr: float = 2e-5,
     epochs: int = 1,
+    max_steps: int = 0,
     grad_accum: int = 4,
     temperature: float = 2.0,
     train_weights: bool = True,
@@ -527,7 +528,8 @@ def train_layer(
         device: Device to run on
         batch_size: Batch size
         lr: Learning rate
-        epochs: Number of epochs
+        epochs: Number of epochs (ignored if max_steps > 0)
+        max_steps: Max optimizer steps (0 = use epochs instead)
         grad_accum: Gradient accumulation steps
         temperature: Distillation temperature
         train_weights: If True, train weight parameters
@@ -607,7 +609,14 @@ def train_layer(
     last_local = None
     last_global = None
 
-    for epoch in range(epochs):
+    # Use many epochs if max_steps specified (will break early)
+    num_epochs = 1000 if max_steps > 0 else epochs
+    done = False
+
+    for epoch in range(num_epochs):
+        if done:
+            break
+
         # Create fresh dataloader each epoch for proper shuffling
         dataset = KDCacheDataset(cache_dir, shuffle=True)
         dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
@@ -659,6 +668,11 @@ def train_layer(
                     else:
                         print(f'  step {steps}: global={step_global:.4f} ({elapsed:.1f}s)')
 
+                # Check if we've reached max_steps
+                if max_steps > 0 and steps >= max_steps:
+                    done = True
+                    break
+
     # --- Cleanup ---
     if hook is not None:
         hook.remove()
@@ -682,9 +696,12 @@ def train_layer(
     # --- Report ---
     if verbose:
         print(f'  ---')
-        if use_local:
+        if use_local and first_local is not None:
             print(f'  [Local Loss]:   {first_local:.4f} -> {last_local:.4f} (Δ={local_improvement:.4f})')
-        print(f'  [Global Loss]:  {first_global:.4f} -> {last_global:.4f} (Δ={global_improvement:.4f})')
+        if first_global is not None:
+            print(f'  [Global Loss]:  {first_global:.4f} -> {last_global:.4f} (Δ={global_improvement:.4f})')
+        elif steps == 0:
+            print(f'  [Warning]: No training steps completed (check batch_size vs data)')
         if loss_before is not None:
             improvement = loss_before - loss_after
             pct = 100 * improvement / loss_before if loss_before > 0 else 0
@@ -713,6 +730,7 @@ def train_all_layers(
     batch_size: int = 4,
     lr: float = 2e-5,
     epochs_per_layer: int = 1,
+    steps_per_layer: int = 0,
     grad_accum: int = 4,
     temperature: float = 2.0,
     train_weights: bool = True,
@@ -736,7 +754,8 @@ def train_all_layers(
         device: Device to run on
         batch_size: Batch size
         lr: Learning rate
-        epochs_per_layer: Epochs per layer
+        epochs_per_layer: Epochs per layer (ignored if steps_per_layer > 0)
+        steps_per_layer: Max steps per layer (0 = use epochs instead)
         grad_accum: Gradient accumulation steps
         temperature: Distillation temperature
         train_weights: If True, train weight parameters
@@ -778,7 +797,10 @@ def train_all_layers(
         print(f'Training {num_layers} layers (mode={mode})...')
         print(f'Cache: {cache_dir}')
         print(f'Batch size: {batch_size}, Grad accum: {grad_accum}')
-        print(f'LR: {lr}, Epochs per layer: {epochs_per_layer}')
+        if steps_per_layer > 0:
+            print(f'LR: {lr}, Steps per layer: {steps_per_layer}')
+        else:
+            print(f'LR: {lr}, Epochs per layer: {epochs_per_layer}')
 
     # Get initial global loss
     initial_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=40, temperature=temperature)
@@ -803,6 +825,7 @@ def train_all_layers(
             batch_size=batch_size,
             lr=lr,
             epochs=epochs_per_layer,
+            max_steps=steps_per_layer,
             grad_accum=grad_accum,
             temperature=temperature,
             train_weights=train_weights,
