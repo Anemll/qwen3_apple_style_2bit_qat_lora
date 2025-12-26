@@ -1,14 +1,22 @@
 """
 Anemll-style QATLinear with learnable groupwise scales (A @ B) and LUT.
 
-Key differences from standard QATLinear:
-- Scales are per-group, not per-tensor: S[o, g] = (A @ B)[o, g]
-- LUT is explicit and optionally learnable
-- A: [out_features, rank], B: [rank, num_groups]
+Quantization formula:
+    W_q[o, i] = LUT[idx[o, i]] * scales[o, g]    where g = i // group_size
 
-Forward:
-    W_q = LUT[indices] * scales[o, group(i)]
-    y = x @ W_q.T + bias
+Key differences from standard QATLinear:
+- Scales are per (output, group), not per-tensor
+- scales[o, g] = (A @ B)[o, g]  with low-rank A:[out, rank], B:[rank, groups]
+- LUT is explicit and optionally learnable
+
+Scale dimensions:
+- Full scales: [out_features, num_groups] - one scale per output per group
+- Low-rank:    A[out_features, rank] @ B[rank, num_groups] - compressed
+
+Example (out=512, in=1024, group_size=32, rank=4):
+- num_groups = 1024 / 32 = 32
+- Full scales: 512 × 32 = 16,384 params
+- Low-rank:    512 × 4 + 4 × 32 = 2,176 params (7x compression)
 """
 
 from __future__ import annotations
@@ -21,6 +29,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 
 @dataclass
 class AnemllQuantConfig:
@@ -36,6 +48,10 @@ class AnemllQuantConfig:
     def lut_bits(self) -> int:
         return int(math.ceil(math.log2(self.lut_size)))
 
+
+# =============================================================================
+# LUT UTILITIES
+# =============================================================================
 
 def make_lut(
     lut_size: int,
@@ -83,6 +99,10 @@ def _round_ste(x: torch.Tensor) -> torch.Tensor:
     """Straight-through estimator for rounding."""
     return x + (torch.round(x) - x).detach()
 
+
+# =============================================================================
+# ANEMLL QAT LINEAR LAYER
+# =============================================================================
 
 class AnemllQATLinear(nn.Module):
     """
@@ -222,28 +242,30 @@ class AnemllQATLinear(nn.Module):
         lut: torch.Tensor,
     ) -> torch.Tensor:
         """Quantize a chunk of rows. Helper for fake_quant_weight."""
+        # --- Step A: Reshape to groups ---
         num_rows = w_rows.size(0)
         grouped = w_rows.view(num_rows, self.num_groups, self.group_size)
 
-        # Normalize to [-1, 1]
+        # --- Step B: Normalize to [-1, 1] ---
         normalized = grouped / scales_rows.unsqueeze(-1)
 
+        # --- Step C: Compute LUT indices ---
         lut_size = lut.size(0)
-
-        # Memory-efficient index computation for uniform LUT
         if not self.config.lut_include_zero or (lut_size % 2 == 1):
+            # Uniform LUT - memory-efficient index computation
             step = 2.0 / (lut_size - 1)
             clamped = normalized.clamp(-1.0, 1.0)
             indices_float = (clamped + 1.0) / step
             indices = _round_ste(indices_float).long().clamp(0, lut_size - 1)
         else:
+            # Non-uniform LUT with zero
             indices = quantize_to_lut_indices(
                 normalized.clamp(-1.0, 1.0),
                 lut_size=lut_size,
                 include_zero=True,
             )
 
-        # Dequantize
+        # --- Step D: Dequantize via LUT lookup ---
         dequant = lut[indices] * scales_rows.unsqueeze(-1)
         return dequant.view(num_rows, self.padded_in)
 
@@ -254,25 +276,21 @@ class AnemllQATLinear(nn.Module):
         - Forward: returns quantized-dequantized weights
         - Backward: gradients flow directly to original weights
         """
-        # Keep reference to original weight for STE gradient path
-        w_orig = self.weight
-        w = w_orig.float()
+        # --- Step 1: Prepare weights ---
+        w = self.weight.float()
 
-        # Pad if needed
+        # --- Step 2: Pad if needed ---
         if self.pad > 0:
             w = F.pad(w, (0, self.pad))
-            w_orig_padded = F.pad(w_orig.float(), (0, self.pad))
-        else:
-            w_orig_padded = w_orig.float()
 
-        # Get scales
-        scales = self.get_scales()  # [out, groups]
+        # --- Step 3: Get scales [out, groups] ---
+        scales = self.get_scales()
 
-        # Move LUT to same device and dtype as weights
+        # --- Step 4: Move LUT to same device/dtype ---
         lut = self.lut.to(device=w.device, dtype=w.dtype)
 
+        # --- Step 5: Quantize-Dequantize ---
         # Process in chunks for large tensors (e.g., lm_head with 150k+ rows)
-        # Threshold: if tensor > 50M elements, process row-by-row
         chunk_size = 1024  # rows per chunk
         if w.numel() > 50_000_000:
             # Chunked processing for large tensors
@@ -286,31 +304,32 @@ class AnemllQATLinear(nn.Module):
             # Process whole tensor at once for smaller tensors
             dequant = self._quant_rows(w, scales, lut)
 
-        # Remove padding
+        # --- Step 6: Remove padding ---
         if self.pad > 0:
             dequant = dequant[:, :self.in_features]
-            w_orig_padded = w_orig_padded[:, :self.in_features]
 
-        # STE: forward uses quantized values, backward flows through original weights
-        # w_q = w_orig + (dequant - w_orig).detach()
-        # This makes d(w_q)/d(w_orig) = 1, so gradients flow to original weights
-        w_q = w_orig_padded + (dequant - w_orig_padded).detach()
+        # --- Step 7: Apply STE for gradient flow ---
+        # w_q = w + (dequant - w).detach() => forward=dequant, backward=d/dw=1
+        w_float = self.weight.float()
+        w_q = w_float + (dequant - w_float).detach()
 
         return w_q.to(self.weight.dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # --- Step 1: Get quantized weights ---
         if self.enable_fake_quant:
             w_q = self.fake_quant_weight()
         else:
             w_q = self.weight
 
-        # Cast to input dtype
+        # --- Step 2: Cast to input dtype ---
         w_q = w_q.to(x.dtype)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
 
+        # --- Step 3: Linear transform ---
         y = F.linear(x, w_q, bias)
 
-        # LoRA residual
+        # --- Step 4: Add LoRA residual (if enabled) ---
         if self.lora_r > 0:
             x_d = self.lora_drop(x) if self.lora_drop is not None else x
             lora_A = self.lora_A.to(x.dtype)
@@ -377,6 +396,10 @@ class AnemllQATLinear(nn.Module):
         )
 
 
+# =============================================================================
+# MODEL REPLACEMENT UTILITY
+# =============================================================================
+
 def replace_linear_with_anemll(
     model: nn.Module,
     mlp_config: AnemllQuantConfig,
@@ -400,6 +423,7 @@ def replace_linear_with_anemll(
     """
     import re
 
+    # --- Step 1: Define patterns ---
     mlp_pattern = re.compile(r'\.mlp\.(gate_proj|up_proj|down_proj)$')
     attn_pattern = re.compile(r'\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$')
     lm_head_pattern = re.compile(r'^lm_head$')
@@ -407,6 +431,7 @@ def replace_linear_with_anemll(
     if attn_config is None:
         attn_config = mlp_config
 
+    # --- Step 2: Find layers to replace ---
     replacements = []
 
     for name, module in model.named_modules():
@@ -429,10 +454,10 @@ def replace_linear_with_anemll(
         else:
             continue
 
-        # Create replacement
+        # --- Step 3: Create replacement module ---
         new_module = AnemllQATLinear.from_linear(module, config=cfg)
 
-        # Find parent
+        # --- Step 4: Find parent module ---
         parts = name.rsplit('.', 1)
         if len(parts) == 2:
             parent_name, attr = parts
@@ -443,7 +468,7 @@ def replace_linear_with_anemll(
 
         replacements.append((parent, attr, new_module, name))
 
-    # Apply
+    # --- Step 5: Apply replacements ---
     for parent, attr, new_module, name in replacements:
         setattr(parent, attr, new_module)
         if verbose:
