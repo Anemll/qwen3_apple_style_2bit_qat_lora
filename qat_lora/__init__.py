@@ -10,6 +10,7 @@ from .layer_qat import (
     collate_fn,
     LocalLayerReconstructionLoss,
     create_frozen_fp_layer,
+    is_qat_linear,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     'collate_fn',
     'LocalLayerReconstructionLoss',
     'create_frozen_fp_layer',
+    'is_qat_linear',
 ]

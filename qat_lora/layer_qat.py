@@ -189,7 +189,7 @@ def create_frozen_fp_layer(
     # Convert each AnemllQATLinear to nn.Linear
     def convert_to_linear(module: nn.Module, name: str = ''):
         for child_name, child in list(module.named_children()):
-            if isinstance(child, AnemllQATLinear):
+            if is_qat_linear(child):
                 # Create equivalent nn.Linear
                 linear = nn.Linear(
                     child.in_features,
@@ -354,15 +354,21 @@ def collate_fn(batch: List[dict]) -> dict:
     }
 
 
+def is_qat_linear(module: nn.Module) -> bool:
+    """Check if module is AnemllQATLinear (robust against module reloading)."""
+    # Use class name check to handle module caching issues
+    return type(module).__name__ == 'AnemllQATLinear'
+
+
 def get_layer_modules(
     model: nn.Module,
     layer_idx: int,
-) -> List[Tuple[str, AnemllQATLinear]]:
+) -> List[Tuple[str, nn.Module]]:
     """Get all AnemllQATLinear modules in a specific layer."""
     layer = model.model.layers[layer_idx]
     modules = []
     for name, m in layer.named_modules():
-        if isinstance(m, AnemllQATLinear):
+        if is_qat_linear(m):
             modules.append((f'layers.{layer_idx}.{name}', m))
     return modules
 
