@@ -227,8 +227,11 @@ def evaluate_kd_loss(
 ) -> Dict[str, float]:
     """Evaluate model using KD cache logits.
 
+    Uses memory-efficient approach: only computes logits for cached top-k indices,
+    not full vocab (same as train_qat.py).
+
     Args:
-        use_cpu: If True, run evaluation on CPU to avoid MPS memory issues.
+        use_cpu: If True, run evaluation on CPU.
     """
     files = cache_info["files"]
     limit = cache_info.get("limit", 0) or num_samples
@@ -236,17 +239,30 @@ def evaluate_kd_loss(
     total_kd_loss = 0.0
     total_samples = 0
 
-    # Use CPU for evaluation if requested (avoids MPS large tensor issues)
+    # Use CPU for evaluation if requested
     eval_device = torch.device("cpu") if use_cpu else device
 
     if use_cpu and device.type != "cpu":
-        print("  (Using CPU for KD evaluation to avoid MPS memory limits)")
+        print("  (Using CPU for KD evaluation)")
         model_was_on = device
         model.to(eval_device)
     else:
         model_was_on = None
 
     model.eval()
+
+    # Get lm_head for efficient logit computation
+    if not hasattr(model, "lm_head"):
+        print("  Warning: Model has no lm_head, cannot compute KD loss")
+        return {"kd_loss": float("nan"), "samples": 0}
+
+    lm_head = model.lm_head
+    # Get the base model (without lm_head) for hidden states
+    if hasattr(model, "model"):
+        base_model = model.model
+    else:
+        print("  Warning: Cannot find base model for hidden states")
+        return {"kd_loss": float("nan"), "samples": 0}
 
     for i, cache_file in enumerate(files[:limit]):
         print(f"\r  [{i+1}/{min(limit, len(files))}] Processing {cache_file.name}...", end="", flush=True)
@@ -258,51 +274,73 @@ def evaluate_kd_loss(
                 continue
 
             input_ids = data["input_ids"]
+            attention_mask = data.get("attention_mask")
+
             if input_ids.dim() == 1:
                 input_ids = input_ids.unsqueeze(0)
+            if attention_mask is not None and attention_mask.dim() == 1:
+                attention_mask = attention_mask.unsqueeze(0)
+
             input_ids = input_ids.to(eval_device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(eval_device)
 
             # Get teacher logits - check both naming conventions
             teacher_logits = data.get("topk_logits", data.get("teacher_logits"))
             teacher_indices = data.get("topk_idx", data.get("teacher_indices", data.get("topk_indices")))
 
             if teacher_logits is None or teacher_indices is None:
-                print(f"  Warning: {cache_file.name} missing teacher logits/indices")
                 continue
 
+            # Move teacher data to eval device
+            teacher_logits = teacher_logits.to(eval_device).float()
+            teacher_indices = teacher_indices.to(eval_device).long()
+
+            # Handle shape: should be [B, L-1, K] or [L-1, K]
+            if teacher_indices.dim() == 2:
+                teacher_indices = teacher_indices.unsqueeze(0)
+                teacher_logits = teacher_logits.unsqueeze(0)
+
             with torch.no_grad():
-                outputs = model(input_ids)
-                student_logits = outputs.logits
-
-                # Move teacher data to eval device
-                teacher_logits = teacher_logits.to(eval_device)
-                teacher_indices = teacher_indices.to(eval_device)
-
-                # Handle shape differences
-                if teacher_indices.dim() == 2:
-                    teacher_indices = teacher_indices.unsqueeze(0)
-                if teacher_logits.dim() == 2:
-                    teacher_logits = teacher_logits.unsqueeze(0)
-
-                # Gather student logits at teacher top-k positions
-                seq_len = min(student_logits.size(1) - 1, teacher_indices.size(1) - 1)
-
-                student_topk = torch.gather(
-                    student_logits[:, :seq_len],
-                    dim=-1,
-                    index=teacher_indices[:, 1:seq_len+1].long()
+                # Get hidden states only (NOT full logits) - memory efficient!
+                out = base_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    return_dict=True,
                 )
+                hidden = out.last_hidden_state[:, :-1, :]  # [B, S=L-1, H]
+                B, S, H = hidden.shape
+
+                # Only compute logits for top-k candidate indices
+                K = teacher_indices.size(-1)
+                seq_len = min(S, teacher_indices.size(1))
+
+                # Flatten for efficient gather
+                h = hidden[:, :seq_len, :].reshape(B * seq_len, H)  # [N, H]
+                idx = teacher_indices[:, :seq_len, :].reshape(B * seq_len, K)  # [N, K]
+
+                # Gather lm_head weights for candidate tokens only
+                # lm_head.weight: [vocab, H] -> gather [N, K, H]
+                w = lm_head.weight[idx]  # [N, K, H]
+
+                # Compute student logits for candidates only: [N, K]
+                student_topk = torch.einsum("nh,nkh->nk", h, w)
+                student_topk = student_topk.view(B, seq_len, K)
+
+                # Teacher logits for same positions
+                t_logits = teacher_logits[:, :seq_len, :]
 
                 # KL divergence
-                teacher_probs = F.softmax(teacher_logits[:, 1:seq_len+1].float(), dim=-1)
-                student_log_probs = F.log_softmax(student_topk.float(), dim=-1)
+                teacher_probs = F.softmax(t_logits, dim=-1)
+                student_log_probs = F.log_softmax(student_topk, dim=-1)
                 kl = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
 
                 total_kd_loss += kl.item()
                 total_samples += 1
 
         except Exception as e:
-            print(f"  Warning: Failed to process {cache_file.name}: {e}")
+            print(f"\n  Warning: Failed to process {cache_file.name}: {e}")
             continue
 
         if total_samples >= num_samples:
