@@ -359,3 +359,81 @@ class AnemllQATLinear(nn.Module):
             f"groups={self.num_groups}, rank={self.scale_rank}, "
             f"lut_size={self.config.lut_size}, lora_r={self.lora_r}"
         )
+
+
+def replace_linear_with_anemll(
+    model: nn.Module,
+    mlp_config: AnemllQuantConfig,
+    attn_config: Optional[AnemllQuantConfig] = None,
+    quantize_attn: bool = True,
+    quantize_lm_head: bool = False,
+    verbose: bool = True,
+) -> int:
+    """Replace MLP and optionally attention linears with AnemllQATLinear.
+
+    Args:
+        model: The model to modify (in-place)
+        mlp_config: Config for MLP layers (gate_proj, up_proj, down_proj)
+        attn_config: Config for attention layers (q/k/v/o_proj). If None, uses mlp_config
+        quantize_attn: Whether to quantize attention layers
+        quantize_lm_head: Whether to quantize lm_head (usually False)
+        verbose: Print replacement info
+
+    Returns:
+        Number of layers replaced
+    """
+    import re
+
+    mlp_pattern = re.compile(r'\.mlp\.(gate_proj|up_proj|down_proj)$')
+    attn_pattern = re.compile(r'\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$')
+    lm_head_pattern = re.compile(r'^lm_head$')
+
+    if attn_config is None:
+        attn_config = mlp_config
+
+    replacements = []
+
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        if isinstance(module, AnemllQATLinear):
+            continue
+
+        # Check pattern
+        is_mlp = mlp_pattern.search(name)
+        is_attn = attn_pattern.search(name)
+        is_lm_head = lm_head_pattern.search(name)
+
+        if is_mlp:
+            cfg = mlp_config
+        elif is_attn and quantize_attn:
+            cfg = attn_config
+        elif is_lm_head and quantize_lm_head:
+            cfg = mlp_config
+        else:
+            continue
+
+        # Create replacement
+        new_module = AnemllQATLinear.from_linear(module, config=cfg)
+
+        # Find parent
+        parts = name.rsplit('.', 1)
+        if len(parts) == 2:
+            parent_name, attr = parts
+            parent = dict(model.named_modules())[parent_name]
+        else:
+            parent = model
+            attr = name
+
+        replacements.append((parent, attr, new_module, name))
+
+    # Apply
+    for parent, attr, new_module, name in replacements:
+        setattr(parent, attr, new_module)
+        if verbose:
+            print(f'  [replaced] {name}')
+
+    if verbose:
+        print(f'\nReplaced {len(replacements)} layers')
+
+    return len(replacements)
