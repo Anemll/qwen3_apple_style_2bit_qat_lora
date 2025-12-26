@@ -8,7 +8,9 @@ from .layer_qat import (
     train_all_layers,
     KDCacheDataset,
     collate_fn,
-    LocalLayerReconstructionLoss,
+    LocalMLPLoss,
+    LocalLayerReconstructionLoss,  # Alias for backward compat
+    get_mlp_frozen_weights,
     create_frozen_fp_layer,
     is_qat_linear,
 )
@@ -23,7 +25,9 @@ __all__ = [
     'train_all_layers',
     'KDCacheDataset',
     'collate_fn',
+    'LocalMLPLoss',
     'LocalLayerReconstructionLoss',
+    'get_mlp_frozen_weights',
     'create_frozen_fp_layer',
     'is_qat_linear',
 ]

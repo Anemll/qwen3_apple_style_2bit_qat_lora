@@ -27,16 +27,16 @@ from .ane_qat_linear import AnemllQATLinear
 
 
 # ==============================================================================
-# LOCAL RECONSTRUCTION LOSS
+# LOCAL MLP RECONSTRUCTION LOSS
 # ==============================================================================
 
 
-class LocalLayerReconstructionLoss(nn.Module):
+class LocalMLPLoss(nn.Module):
     """
-    Computes local reconstruction loss for a full transformer layer.
+    Computes local reconstruction loss for the MLP of a transformer layer.
 
-    Compares the output of the quantized layer to what a frozen FP layer would produce.
-    This measures how well the quantized layer preserves the original layer's behavior.
+    Compares the quantized MLP output to what frozen FP weights would produce.
+    Uses the same approach as train_qat_progressive.py.
 
     The loss is:
         L = α * MSE(RMSNorm(y_q), RMSNorm(y_fp)) + (1-α) * relative_MSE(y_q, y_fp)
@@ -46,7 +46,7 @@ class LocalLayerReconstructionLoss(nn.Module):
 
     def __init__(
         self,
-        frozen_layer: nn.Module,
+        frozen_weights: Dict[str, torch.Tensor],
         rms_norm_eps: float = 1e-6,
         norm_weight: float = 0.8,
         max_loss: float = 10.0,
@@ -54,22 +54,21 @@ class LocalLayerReconstructionLoss(nn.Module):
     ):
         """
         Args:
-            frozen_layer: Deep copy of the original layer (no grad, fp weights)
+            frozen_weights: Dict with 'gate', 'up', 'down' weight tensors
             rms_norm_eps: Epsilon for RMSNorm computation
             norm_weight: Weight α for normalized loss component (default 0.8)
             max_loss: Maximum loss value for clamping
             num_tokens: Number of tokens to sample for loss computation
         """
         super().__init__()
-        self.frozen_layer = frozen_layer
+        # Store frozen FP weights as buffers
+        self.register_buffer('gate_w', frozen_weights['gate'].clone())
+        self.register_buffer('up_w', frozen_weights['up'].clone())
+        self.register_buffer('down_w', frozen_weights['down'].clone())
         self.rms_norm_eps = rms_norm_eps
         self.norm_weight = norm_weight
         self.max_loss = max_loss
         self.num_tokens = num_tokens
-
-        # Ensure frozen layer has no gradients
-        for p in self.frozen_layer.parameters():
-            p.requires_grad = False
 
     def _rms_norm(self, x: torch.Tensor) -> torch.Tensor:
         """Apply RMSNorm for directional loss (without learnable scale)."""
@@ -97,47 +96,45 @@ class LocalLayerReconstructionLoss(nn.Module):
 
     def forward(
         self,
-        layer_input: torch.Tensor,
-        layer_output_q: torch.Tensor,
+        mlp_input: torch.Tensor,
+        mlp_output_q: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute local reconstruction loss.
+        Compute local MLP reconstruction loss.
 
         Args:
-            layer_input: Input hidden states to layer [B, T, H]
-            layer_output_q: Quantized layer output [B, T, H]
+            mlp_input: Input to MLP [B, T, H]
+            mlp_output_q: Quantized MLP output [B, T, H]
             attention_mask: Valid token mask [B, T]
-            position_ids: Position IDs for layer forward
 
         Returns:
             Scalar loss tensor
         """
-        B, T, H = layer_input.shape
-        device = layer_input.device
+        B, T, H = mlp_input.shape
+        device = mlp_input.device
 
         # Sample tokens for efficiency
         sample_idx = self._sample_tokens(attention_mask, B * T, device)
 
         # Flatten and gather sampled tokens
-        layer_output_q_flat = layer_output_q.reshape(B * T, H)
-        y_q_sub = layer_output_q_flat[sample_idx].float()
+        mlp_input_flat = mlp_input.reshape(B * T, H)
+        mlp_output_q_flat = mlp_output_q.reshape(B * T, H)
 
-        # Compute FP target on sampled tokens (need to run full layer then sample)
+        mlp_input_sub = mlp_input_flat[sample_idx].float()
+        y_q_sub = mlp_output_q_flat[sample_idx].float()
+
+        # Compute FP MLP output using frozen weights
         with torch.no_grad():
-            # Run frozen layer
-            if position_ids is not None:
-                fp_out = self.frozen_layer(layer_input, position_ids=position_ids)
-            else:
-                fp_out = self.frozen_layer(layer_input)
+            # Qwen MLP: down(silu(gate(x)) * up(x))
+            gate_w = self.gate_w.float()
+            up_w = self.up_w.float()
+            down_w = self.down_w.float()
 
-            # Handle tuple output (hidden_states, ...) from transformer layers
-            if isinstance(fp_out, tuple):
-                fp_out = fp_out[0]
-
-            fp_out_flat = fp_out.reshape(B * T, H)
-            y_fp_sub = fp_out_flat[sample_idx].float()
+            gate_out = F.linear(mlp_input_sub, gate_w)
+            up_out = F.linear(mlp_input_sub, up_w)
+            hidden = F.silu(gate_out) * up_out
+            y_fp_sub = F.linear(hidden, down_w)
 
         # Check for NaN/inf
         if not torch.isfinite(y_q_sub).all():
@@ -161,61 +158,55 @@ class LocalLayerReconstructionLoss(nn.Module):
         return torch.clamp(loss, max=self.max_loss)
 
 
+def get_mlp_frozen_weights(
+    layer: nn.Module,
+    dtype: torch.dtype = torch.float32,
+) -> Dict[str, torch.Tensor]:
+    """
+    Extract frozen FP weights from a layer's MLP.
+
+    Works with both nn.Linear and AnemllQATLinear modules.
+
+    Args:
+        layer: Transformer layer with MLP
+        dtype: Data type for weights
+
+    Returns:
+        Dict with 'gate', 'up', 'down' weight tensors
+    """
+    mlp = layer.mlp
+    return {
+        'gate': mlp.gate_proj.weight.data.clone().to(dtype),
+        'up': mlp.up_proj.weight.data.clone().to(dtype),
+        'down': mlp.down_proj.weight.data.clone().to(dtype),
+    }
+
+
+# Keep old names for backward compatibility
+LocalLayerReconstructionLoss = LocalMLPLoss
+
+
 def create_frozen_fp_layer(
     layer: nn.Module,
     device: torch.device,
     dtype: torch.dtype,
-) -> nn.Module:
+) -> Dict[str, torch.Tensor]:
     """
-    Create a frozen FP copy of a transformer layer.
+    Create frozen FP weights for a layer's MLP.
 
-    Converts AnemllQATLinear modules back to nn.Linear with original weights.
-    This allows computing what the FP layer would produce for local loss.
+    This is the simplified version that just extracts MLP weights
+    instead of copying the entire layer.
 
     Args:
-        layer: Transformer layer with AnemllQATLinear modules
-        device: Device to place the copy
+        layer: Transformer layer
+        device: Device to place weights
         dtype: Data type for weights
 
     Returns:
-        Frozen layer copy with nn.Linear modules
+        Dict with 'gate', 'up', 'down' frozen weight tensors
     """
-    import copy
-
-    # Deep copy the layer
-    frozen = copy.deepcopy(layer)
-    frozen = frozen.to(device=device, dtype=dtype)
-
-    # Convert each AnemllQATLinear to nn.Linear
-    def convert_to_linear(module: nn.Module, name: str = ''):
-        for child_name, child in list(module.named_children()):
-            if is_qat_linear(child):
-                # Create equivalent nn.Linear
-                linear = nn.Linear(
-                    child.in_features,
-                    child.out_features,
-                    bias=child.bias is not None,
-                    device=device,
-                    dtype=dtype,
-                )
-                # Copy weight (the original, not quantized)
-                linear.weight.data.copy_(child.weight.data.to(dtype))
-                if child.bias is not None:
-                    linear.bias.data.copy_(child.bias.data.to(dtype))
-
-                # Replace in parent
-                setattr(module, child_name, linear)
-            else:
-                convert_to_linear(child, f'{name}.{child_name}' if name else child_name)
-
-    convert_to_linear(frozen)
-
-    # Freeze all parameters
-    for p in frozen.parameters():
-        p.requires_grad = False
-
-    frozen.eval()
-    return frozen
+    weights = get_mlp_frozen_weights(layer, dtype)
+    return {k: v.to(device) for k, v in weights.items()}
 
 
 # ==============================================================================
@@ -505,11 +496,11 @@ def train_layer(
     global_weight: float = 0.5,
     local_tokens: int = 128,
 ) -> dict:
-    """Train a single layer with local reconstruction + global KD loss.
+    """Train a single layer with local MLP reconstruction + global KD loss.
 
-    Loss = local_weight * LocalReconstructionLoss + global_weight * GlobalKDLoss
+    Loss = local_weight * LocalMLPLoss + global_weight * GlobalKDLoss
 
-    Local loss: Compares quantized layer output to frozen FP layer output.
+    Local loss: Compares quantized MLP output to frozen FP MLP output.
     Global loss: Compares final model output to cached teacher top-k logits.
 
     Args:
@@ -525,7 +516,7 @@ def train_layer(
         train_scales: If True, also train scale_A/scale_B
         verbose: Print progress
         eval_before: Evaluate global loss before training (slower but informative)
-        local_weight: Weight for local reconstruction loss
+        local_weight: Weight for local MLP reconstruction loss
         global_weight: Weight for global KD loss
         local_tokens: Number of tokens to sample for local loss
 
@@ -541,30 +532,30 @@ def train_layer(
 
     # Get model dtype
     model_dtype = next(model.parameters()).dtype
-
-    # --- Create frozen FP copy of this layer for local loss ---
     current_layer = model.model.layers[layer_idx]
-    frozen_layer = create_frozen_fp_layer(current_layer, device, model_dtype)
 
-    # Create local loss module
-    local_loss_fn = LocalLayerReconstructionLoss(
-        frozen_layer=frozen_layer,
-        num_tokens=local_tokens,
-    )
+    # --- Create local MLP loss (if enabled) ---
+    use_local = local_weight > 0
+    local_loss_fn = None
+    mlp_io = {'input': None, 'output': None}
+    hook = None
 
-    # --- Register hook to capture layer input/output ---
-    layer_io = {'input': None, 'output': None}
+    if use_local:
+        # Get frozen MLP weights
+        frozen_weights = get_mlp_frozen_weights(current_layer, model_dtype)
+        frozen_weights = {k: v.to(device) for k, v in frozen_weights.items()}
 
-    def capture_layer_io(module, inp, out):
-        # inp is a tuple, first element is hidden states
-        layer_io['input'] = inp[0].detach()
-        # out may be tuple (hidden_states, ...) for transformer layers
-        if isinstance(out, tuple):
-            layer_io['output'] = out[0]  # Keep grad for loss
-        else:
-            layer_io['output'] = out
+        local_loss_fn = LocalMLPLoss(
+            frozen_weights=frozen_weights,
+            num_tokens=local_tokens,
+        ).to(device)
 
-    hook = current_layer.register_forward_hook(capture_layer_io)
+        # Hook the MLP module (not full layer)
+        def capture_mlp_io(module, inp, out):
+            mlp_io['input'] = inp[0]  # Keep for local loss
+            mlp_io['output'] = out
+
+        hook = current_layer.mlp.register_forward_hook(capture_mlp_io)
 
     # --- Evaluate BEFORE training this layer ---
     loss_before = None
@@ -594,19 +585,22 @@ def train_layer(
         dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
 
         for i, batch in enumerate(dataloader):
-            # Global KD loss
+            # Global KD loss (forward pass also captures MLP I/O via hook)
             global_loss = compute_kd_loss_batch(model, batch, device, temperature, no_grad=False)
 
-            # Local reconstruction loss (using captured layer I/O)
-            attn_mask = batch.get('attention_mask')
-            if attn_mask is not None:
-                attn_mask = attn_mask[:, :-1].to(device)  # Align with forward pass
+            # Local MLP reconstruction loss
+            if use_local:
+                attn_mask = batch.get('attention_mask')
+                if attn_mask is not None:
+                    attn_mask = attn_mask[:, :-1].to(device)
 
-            local_loss = local_loss_fn(
-                layer_io['input'][:, :-1, :],  # Slice to match prediction positions
-                layer_io['output'][:, :-1, :],
-                attention_mask=attn_mask,
-            )
+                local_loss = local_loss_fn(
+                    mlp_io['input'][:, :-1, :],
+                    mlp_io['output'][:, :-1, :],
+                    attention_mask=attn_mask,
+                )
+            else:
+                local_loss = torch.tensor(0.0, device=device)
 
             # Combined loss
             loss = local_weight * local_loss + global_weight * global_loss
@@ -618,13 +612,13 @@ def train_layer(
                 optimizer.zero_grad()
                 steps += 1
 
-                step_local = local_loss.item()
+                step_local = local_loss.item() if use_local else 0.0
                 step_global = global_loss.item()
                 total_local_loss += step_local
                 total_global_loss += step_global
 
                 # Track first and last losses
-                if first_local is None:
+                if first_global is None:
                     first_local = step_local
                     first_global = step_global
                 last_local = step_local
@@ -632,11 +626,16 @@ def train_layer(
 
                 if verbose and steps % 10 == 0:
                     elapsed = time.time() - t_train_start
-                    print(f'  step {steps}: local={step_local:.4f} global={step_global:.4f} ({elapsed:.1f}s)')
+                    if use_local:
+                        print(f'  step {steps}: local={step_local:.4f} global={step_global:.4f} ({elapsed:.1f}s)')
+                    else:
+                        print(f'  step {steps}: global={step_global:.4f} ({elapsed:.1f}s)')
 
-    # --- Cleanup hook ---
-    hook.remove()
-    del frozen_layer, local_loss_fn
+    # --- Cleanup ---
+    if hook is not None:
+        hook.remove()
+    if local_loss_fn is not None:
+        del local_loss_fn
 
     # --- Training summary ---
     avg_local = total_local_loss / steps if steps > 0 else 0
@@ -655,7 +654,8 @@ def train_layer(
     # --- Report ---
     if verbose:
         print(f'  ---')
-        print(f'  [Local Loss]:   {first_local:.4f} -> {last_local:.4f} (Δ={local_improvement:.4f})')
+        if use_local:
+            print(f'  [Local Loss]:   {first_local:.4f} -> {last_local:.4f} (Δ={local_improvement:.4f})')
         print(f'  [Global Loss]:  {first_global:.4f} -> {last_global:.4f} (Δ={global_improvement:.4f})')
         if loss_before is not None:
             improvement = loss_before - loss_after
