@@ -753,6 +753,15 @@ def train_layer(
             print(f'  [Eval KD]:      {loss_before:.4f} -> {loss_after:.4f} (Δ={improvement:.4f}, {pct:.1f}%)')
         print(f'  [Time]:         {layer_time:.1f}s')
 
+    # Cleanup to free GPU memory
+    del optimizer
+    del params
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return {
         'layer': layer_idx,
         'before': loss_before,
@@ -1038,6 +1047,9 @@ def train_e2e(
     eval_samples: int = 40,
     save_dir: str = None,
     verbose: bool = True,
+    use_cosine_schedule: bool = False,
+    warmup_steps: int = 0,
+    min_lr_ratio: float = 0.1,
 ) -> dict:
     """End-to-end KD-QAT training (all layers unfrozen).
 
@@ -1047,7 +1059,7 @@ def train_e2e(
         device: Device to run on
         max_steps: Maximum training steps
         batch_size: Batch size
-        lr: Learning rate
+        lr: Learning rate (peak LR if using schedule)
         temperature: Distillation temperature
         train_weights: If True, train weight parameters
         train_scales: If True, train scale_A/scale_B parameters
@@ -1058,6 +1070,9 @@ def train_e2e(
         eval_samples: Samples for evaluation
         save_dir: Directory to save best checkpoint (optional)
         verbose: Print progress
+        use_cosine_schedule: Use cosine annealing LR schedule
+        warmup_steps: Linear warmup steps (0 to disable)
+        min_lr_ratio: Minimum LR as ratio of peak LR (default 0.1 = 10% of lr)
 
     Returns:
         Dict with 'initial_loss', 'final_loss', 'best_loss', 'steps', 'time_sec'
@@ -1107,6 +1122,34 @@ def train_e2e(
         raise ValueError("No trainable parameters! Check train_weights/train_scales flags.")
     optimizer = AdamW(params, lr=lr)
 
+    # LR Scheduler (cosine with warmup)
+    scheduler = None
+    if use_cosine_schedule or warmup_steps > 0:
+        import math
+        min_lr = lr * min_lr_ratio
+
+        def lr_lambda(current_step):
+            # Warmup phase
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+            # Cosine decay phase
+            if use_cosine_schedule:
+                progress = float(current_step - warmup_steps) / float(max(1, max_steps - warmup_steps))
+                cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+            return 1.0
+
+        from torch.optim.lr_scheduler import LambdaLR
+        scheduler = LambdaLR(optimizer, lr_lambda)
+
+        if verbose:
+            sched_info = []
+            if warmup_steps > 0:
+                sched_info.append(f"warmup={warmup_steps}")
+            if use_cosine_schedule:
+                sched_info.append(f"cosine→{min_lr:.2e}")
+            print(f"LR Schedule: {', '.join(sched_info)}")
+
     # Initial evaluation
     model.eval()
     initial_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=eval_samples, temperature=temperature)
@@ -1137,6 +1180,8 @@ def train_e2e(
             )
             loss.backward()
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             optimizer.zero_grad()
 
             total_loss += loss.item()
@@ -1147,7 +1192,12 @@ def train_e2e(
                 avg_loss = total_loss / logging_steps
                 elapsed = time.time() - t_start
                 eta = elapsed / step * (max_steps - step) if step > 0 else 0
-                print(f"[{step}/{max_steps}] loss={avg_loss:.4f} ({elapsed:.0f}s, ETA {eta:.0f}s)")
+                # Show current LR if using schedule
+                if scheduler is not None:
+                    current_lr = scheduler.get_last_lr()[0]
+                    print(f"[{step}/{max_steps}] loss={avg_loss:.4f} lr={current_lr:.2e} ({elapsed:.0f}s, ETA {eta:.0f}s)")
+                else:
+                    print(f"[{step}/{max_steps}] loss={avg_loss:.4f} ({elapsed:.0f}s, ETA {eta:.0f}s)")
                 loss_history.append(avg_loss)
                 total_loss = 0.0
 
@@ -1191,6 +1241,19 @@ def train_e2e(
         print(f"Best:    {best_loss:.4f}")
         print(f"Improvement: {initial_loss - final_loss:.4f}")
         print(f"Time: {elapsed:.1f}s")
+
+    # Cleanup to free GPU memory
+    del optimizer
+    if scheduler is not None:
+        del scheduler
+    del params
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    import gc
+    gc.collect()
 
     return {
         'initial_loss': initial_loss,

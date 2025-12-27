@@ -373,14 +373,23 @@ class AnemllQATLinear(nn.Module):
         Call this before inference to speed up per-token generation.
         """
         if not self.enable_fake_quant:
-            self._cached_weight_q = None
+            # Clear any existing cache
+            if '_cached_weight_q' in self._buffers:
+                del self._buffers['_cached_weight_q']
             return
 
         # Compute quantized weights once
         w_q = self.fake_quant_weight()
 
         # Store as buffer (not parameter) - no gradients needed
-        self.register_buffer('_cached_weight_q', w_q.detach().clone())
+        # Check if already exists (from previous freeze or unfreeze)
+        if '_cached_weight_q' in self._buffers:
+            self._buffers['_cached_weight_q'] = w_q.detach().clone()
+        elif hasattr(self, '_cached_weight_q'):
+            delattr(self, '_cached_weight_q')
+            self.register_buffer('_cached_weight_q', w_q.detach().clone())
+        else:
+            self.register_buffer('_cached_weight_q', w_q.detach().clone())
 
         # Optionally delete original weight to save memory (commented for safety)
         # del self.weight
@@ -390,9 +399,12 @@ class AnemllQATLinear(nn.Module):
 
         Call this before resuming training after inference.
         """
+        # Remove from buffers if registered there
+        if '_cached_weight_q' in self._buffers:
+            del self._buffers['_cached_weight_q']
+        # Also remove as regular attribute if it exists
         if hasattr(self, '_cached_weight_q'):
-            del self._cached_weight_q
-        self._cached_weight_q = None
+            delattr(self, '_cached_weight_q')
 
     def enable_lora(self, r: int, alpha: float, dropout: float = 0.0):
         """Enable LoRA for this layer."""
