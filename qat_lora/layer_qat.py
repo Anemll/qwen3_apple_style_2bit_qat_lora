@@ -1040,6 +1040,7 @@ def train_e2e(
     temperature: float = 2.0,
     train_weights: bool = True,
     train_scales: bool = False,
+    train_mlp_only: bool = False,
     hard_top1_weight: float = 0.0,
     hard_full_weight: float = 0.0005,
     logging_steps: int = 50,
@@ -1063,6 +1064,8 @@ def train_e2e(
         temperature: Distillation temperature
         train_weights: If True, train weight parameters
         train_scales: If True, train scale_A/scale_B parameters
+        train_mlp_only: If True, freeze attention layers (q/k/v/o_proj) and only train MLP
+                        (gate/up/down_proj). Useful for mixed-bit configs (e.g., 4-bit attn, 2-bit MLP)
         hard_top1_weight: Weight for hard label top-1 loss (0 to disable)
         hard_full_weight: Weight for hard label full vocab loss (default 0.0005, helps stability)
         logging_steps: Log every N steps
@@ -1086,11 +1089,25 @@ def train_e2e(
 
     # Set trainable parameters
     trainable = 0
+    attn_frozen = 0
     for p in model.parameters():
         p.requires_grad = False
 
+    # Attention projection names to freeze when train_mlp_only=True
+    attn_proj_names = ('q_proj', 'k_proj', 'v_proj', 'o_proj')
+
     for name, module in model.named_modules():
         if type(module).__name__ == 'AnemllQATLinear':
+            # Check if this is an attention projection
+            is_attn_proj = any(proj in name for proj in attn_proj_names)
+
+            # Skip attention layers if train_mlp_only
+            if train_mlp_only and is_attn_proj:
+                attn_frozen += module.weight.numel()
+                if hasattr(module, 'scale_A') and module.scale_A is not None:
+                    attn_frozen += module.scale_A.numel() + module.scale_B.numel()
+                continue  # Keep frozen
+
             if train_weights:
                 module.weight.requires_grad = True
                 trainable += module.weight.numel()
@@ -1107,11 +1124,15 @@ def train_e2e(
     if train_scales:
         mode_parts.append("scales")
     mode = "+".join(mode_parts) if mode_parts else "none"
+    if train_mlp_only:
+        mode += " (MLP only)"
 
     if verbose:
         print(f"=== End-to-End KD-QAT ===")
         print(f"Mode: {mode}")
         print(f"Trainable params: {trainable:,}")
+        if train_mlp_only:
+            print(f"Frozen attention params: {attn_frozen:,}")
         print(f"Steps: {max_steps}, LR: {lr}, Batch: {batch_size}")
         if hard_top1_weight > 0 or hard_full_weight > 0:
             print(f"Hard label: top1={hard_top1_weight}, full={hard_full_weight}")
