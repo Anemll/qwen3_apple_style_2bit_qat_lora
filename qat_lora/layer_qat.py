@@ -1213,12 +1213,17 @@ def train_e2e(
                 avg_loss = total_loss / logging_steps
                 elapsed = time.time() - t_start
                 eta = elapsed / step * (max_steps - step) if step > 0 else 0
+                # Format time as M:SS or H:MM:SS
+                def fmt_time(s):
+                    if s < 3600:
+                        return f"{int(s)//60}:{int(s)%60:02d}"
+                    return f"{int(s)//3600}:{(int(s)%3600)//60:02d}:{int(s)%60:02d}"
                 # Show current LR if using schedule
                 if scheduler is not None:
                     current_lr = scheduler.get_last_lr()[0]
-                    print(f"[{step}/{max_steps}] loss={avg_loss:.4f} lr={current_lr:.2e} ({elapsed:.0f}s, ETA {eta:.0f}s)")
+                    print(f"[{step}/{max_steps}] loss={avg_loss:.4f} lr={current_lr:.2e} ({fmt_time(elapsed)}, ETA {fmt_time(eta)})")
                 else:
-                    print(f"[{step}/{max_steps}] loss={avg_loss:.4f} ({elapsed:.0f}s, ETA {eta:.0f}s)")
+                    print(f"[{step}/{max_steps}] loss={avg_loss:.4f} ({fmt_time(elapsed)}, ETA {fmt_time(eta)})")
                 loss_history.append(avg_loss)
                 total_loss = 0.0
 
