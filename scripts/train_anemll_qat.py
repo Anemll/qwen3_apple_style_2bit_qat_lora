@@ -81,6 +81,7 @@ def main():
     parser.add_argument("--eval-steps", type=int, default=200, help="Evaluate every N steps")
     parser.add_argument("--eval-samples", type=int, default=40, help="Samples for evaluation")
     parser.add_argument("--snap-weights", action="store_true", help="Snap weights to quantized values before saving")
+    parser.add_argument("--snap-bake-scales", action="store_true", help="Bake scales into snapped weights (LUT[idx]*scale instead of LUT[idx])")
     parser.add_argument("--skip-training", action="store_true", help="Skip training, just load and optionally snap/export")
 
     args = parser.parse_args()
@@ -185,8 +186,12 @@ def main():
     # Snap weights if requested
     if args.snap_weights:
         from qat_lora import snap_all_weights
-        print("\nSnapping weights to quantized values (LUT[idx] * scale)...")
-        snap_all_weights(model, store_lut_values=False, verbose=True)
+        store_lut = not args.snap_bake_scales
+        if store_lut:
+            print("\nSnapping weights to LUT[idx] (scales kept separate)...")
+        else:
+            print("\nSnapping weights to LUT[idx] * scale (baked)...")
+        snap_all_weights(model, store_lut_values=store_lut, verbose=True)
 
     # Save final checkpoint
     config = {
@@ -203,6 +208,7 @@ def main():
         'max_steps': args.max_steps,
         'lr': args.lr,
         'snapped': args.snap_weights,
+        'snap_bake_scales': args.snap_bake_scales if args.snap_weights else None,
         'result': result,
     }
 

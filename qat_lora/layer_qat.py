@@ -401,6 +401,7 @@ def freeze_all_except_layer(
     layer_idx: int,
     train_weights: bool = True,
     train_scales: bool = False,
+    train_mlp_only: bool = False,
 ) -> int:
     """Freeze all parameters except specified layer's AnemllQATLinear params.
 
@@ -415,6 +416,7 @@ def freeze_all_except_layer(
         layer_idx: Layer index to unfreeze
         train_weights: If True, train weight parameters
         train_scales: If True, train scale_A/scale_B parameters
+        train_mlp_only: If True, skip attention projections (q/k/v/o_proj)
 
     Returns:
         Number of trainable parameters
@@ -423,10 +425,17 @@ def freeze_all_except_layer(
     for p in model.parameters():
         p.requires_grad = False
 
+    # Attention projection names to skip when train_mlp_only=True
+    attn_proj_names = ('q_proj', 'k_proj', 'v_proj', 'o_proj')
+
     # Unfreeze layer's quantized modules
     layer_modules = get_layer_modules(model, layer_idx)
     trainable = 0
     for name, m in layer_modules:
+        # Skip attention projections if train_mlp_only
+        if train_mlp_only and any(proj in name for proj in attn_proj_names):
+            continue
+
         # Train weights
         if train_weights:
             m.weight.requires_grad = True
@@ -535,6 +544,7 @@ def train_layer(
     temperature: float = 2.0,
     train_weights: bool = True,
     train_scales: bool = False,
+    train_mlp_only: bool = False,
     verbose: bool = True,
     eval_before: bool = True,
     local_weight: float = 0.5,
@@ -570,6 +580,7 @@ def train_layer(
         temperature: Distillation temperature
         train_weights: If True, train weight parameters
         train_scales: If True, train scale_A/scale_B parameters
+        train_mlp_only: If True, skip attention projections (q/k/v/o_proj)
         verbose: Print progress
         eval_before: Evaluate global loss before training (slower but informative)
         local_weight: Weight for local MLP reconstruction loss
@@ -584,7 +595,7 @@ def train_layer(
     import time
     t_start = time.time()
 
-    trainable = freeze_all_except_layer(model, layer_idx, train_weights=train_weights, train_scales=train_scales)
+    trainable = freeze_all_except_layer(model, layer_idx, train_weights=train_weights, train_scales=train_scales, train_mlp_only=train_mlp_only)
 
     # Describe training mode
     if train_weights and train_scales:
@@ -789,6 +800,7 @@ def train_all_layers(
     temperature: float = 2.0,
     train_weights: bool = True,
     train_scales: bool = False,
+    train_mlp_only: bool = False,
     verbose: bool = True,
     eval_before: bool = True,
     local_weight: float = 0.5,
@@ -816,6 +828,7 @@ def train_all_layers(
         temperature: Distillation temperature
         train_weights: If True, train weight parameters
         train_scales: If True, train scale_A/scale_B parameters
+        train_mlp_only: If True, skip attention projections (q/k/v/o_proj)
         verbose: Print progress
         eval_before: Evaluate global loss before each layer
         local_weight: Weight for local reconstruction loss
@@ -850,6 +863,8 @@ def train_all_layers(
         mode = "scales only"
     else:
         mode = "frozen (no training)"
+    if train_mlp_only:
+        mode += " (MLP only)"
 
     if verbose:
         print(f'Training {num_layers} layers (mode={mode})...')
@@ -890,6 +905,7 @@ def train_all_layers(
             temperature=temperature,
             train_weights=train_weights,
             train_scales=train_scales,
+            train_mlp_only=train_mlp_only,
             verbose=verbose,
             eval_before=eval_before,
             local_weight=local_weight,
@@ -962,6 +978,14 @@ def save_checkpoint(
 
     os.makedirs(save_dir, exist_ok=True)
 
+    # Detect snapped_mode from model (all layers should have same mode)
+    snapped_mode = None
+    for m in model.modules():
+        if type(m).__name__ == 'AnemllQATLinear':
+            snapped_mode = getattr(m, 'snapped_mode', None)
+            if snapped_mode is not None:
+                break
+
     # Save state dict
     state_path = os.path.join(save_dir, name)
     torch.save(model.state_dict(), state_path)
@@ -981,13 +1005,19 @@ def save_checkpoint(
             if verbose:
                 print(f"  - indices.pt ({len(indices_dict)} layers, {total_bytes / 1024 / 1024:.1f} MB)")
 
-    # Save config if provided
-    if config is not None:
+    # Save config if provided (or create one with snapped_mode)
+    if config is None:
+        config = {}
+    if snapped_mode is not None:
+        config['snapped_mode'] = snapped_mode
+    if config:
         config_path = os.path.join(save_dir, "config.json")
         with open(config_path, "w") as f:
             json.dump(config, f, indent=2, default=str)
         if verbose:
             print(f"  - config.json")
+            if snapped_mode:
+                print(f"    snapped_mode: {snapped_mode}")
 
     return state_path
 
@@ -1007,8 +1037,11 @@ def load_checkpoint(
         verbose: Print load info
 
     Returns:
-        Dict with 'missing_keys' and 'unexpected_keys'
+        Dict with 'missing_keys', 'unexpected_keys', and optionally 'config'
     """
+    import os
+    import json
+
     if device is None:
         device = next(model.parameters()).device
 
@@ -1024,9 +1057,60 @@ def load_checkpoint(
         if not result.missing_keys and not result.unexpected_keys:
             print(f"  All keys matched")
 
+    # Try to load config.json from same directory
+    config = None
+    checkpoint_dir = os.path.dirname(checkpoint_path)
+    config_path = os.path.join(checkpoint_dir, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
+        # Restore snapped_mode to all layers
+        # Handle both new format (snapped_mode) and old format (snapped + snap_bake_scales)
+        snapped_mode = config.get('snapped_mode')
+        if snapped_mode is None and config.get('snapped'):
+            # Old format: infer from snapped + snap_bake_scales
+            snapped_mode = 'baked' if config.get('snap_bake_scales') else 'lut'
+
+        # Restore per-layer attributes from loaded state
+        import math
+        attn_proj_names = ('q_proj', 'k_proj', 'v_proj', 'o_proj')
+
+        # Fallback lut_bits from config (used if LUT not in state)
+        mlp_lut_bits_default = int(math.log2(config.get('lut_size', 16)))
+        attn_lut_bits_default = int(math.log2(config.get('attn_lut_size', config.get('lut_size', 16))))
+
+        count = 0
+        lut_bits_summary = {}  # Track unique lut_bits values
+        for name, m in model.named_modules():
+            if type(m).__name__ == 'AnemllQATLinear':
+                # Set snapped_mode
+                if snapped_mode:
+                    m.snapped_mode = snapped_mode
+
+                # Derive lut_bits from actual loaded LUT size (future: per-layer)
+                if hasattr(m, 'lut') and m.lut is not None:
+                    m.lut_bits = int(math.log2(m.lut.size(0)))
+                else:
+                    # Fallback to config-based assignment
+                    is_attn = any(proj in name for proj in attn_proj_names)
+                    m.lut_bits = attn_lut_bits_default if is_attn else mlp_lut_bits_default
+
+                # Track for summary
+                lut_bits_summary[m.lut_bits] = lut_bits_summary.get(m.lut_bits, 0) + 1
+                count += 1
+
+        if verbose:
+            if snapped_mode:
+                print(f"  Restored snapped_mode='{snapped_mode}' to {count} layers")
+            # Show lut_bits distribution
+            bits_str = ", ".join(f"{bits}-bit: {cnt}" for bits, cnt in sorted(lut_bits_summary.items()))
+            print(f"  lut_bits: {bits_str}")
+
     return {
         'missing_keys': result.missing_keys,
         'unexpected_keys': result.unexpected_keys,
+        'config': config,
     }
 
 

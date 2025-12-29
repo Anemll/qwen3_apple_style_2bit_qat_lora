@@ -219,6 +219,8 @@ python scripts/train_anemll_qat.py \
 
 ### 3.5 Just Snap (No Training)
 
+Snap weights to discrete LUT values (default: `LUT[idx]`, scales kept separate):
+
 ```bash
 python scripts/train_anemll_qat.py \
     --model-id Qwen/Qwen3-0.6B \
@@ -230,6 +232,27 @@ python scripts/train_anemll_qat.py \
     --lut-size 16 --group-size 32 --scale-rank 4 \
     --quantize-attn
 ```
+
+Or bake scales into weights (`LUT[idx] * scale`):
+
+```bash
+python scripts/train_anemll_qat.py \
+    --model-id Qwen/Qwen3-0.6B \
+    --init-state runs/anemll_weights_v1 \
+    --kd-cache-dir caches/alpaca_chat_think_both_L128_K32_R256 \
+    --output-dir runs/anemll_final_baked \
+    --skip-training \
+    --snap-weights --snap-bake-scales \
+    --lut-size 16 --group-size 32 --scale-rank 4 \
+    --quantize-attn
+```
+
+**Snap Modes:**
+
+| Mode | Weight stored | Use case |
+|------|--------------|----------|
+| `--snap-weights` | `LUT[idx]` ∈ [-1,1] | Export with separate scales |
+| `--snap-weights --snap-bake-scales` | `LUT[idx] * scale` | Simpler inference |
 
 ---
 
@@ -370,7 +393,8 @@ python scripts/train_anemll_qat.py \
 | `--hard-full-weight` | 0.0005 | Hard label full vocab loss weight |
 | `--logging-steps` | 50 | Log every N steps |
 | `--eval-steps` | 200 | Evaluate every N steps |
-| `--snap-weights` | False | Snap weights before saving |
+| `--snap-weights` | False | Snap weights to LUT[idx] before saving |
+| `--snap-bake-scales` | False | Bake scales into snapped weights (LUT[idx]*scale) |
 | `--skip-training` | False | Skip training, just load/snap |
 
 ### train_anemll_lbl.py

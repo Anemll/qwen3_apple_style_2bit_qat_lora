@@ -10,6 +10,16 @@ from .ane_qat_linear import (
     snap_all_weights,
     export_quantized_model,
 )
+
+# V2: ANE-friendly rank-by-rank forward
+from .ane_qat_linear_v2 import (
+    AnemllQATLinearV2,
+    AnemllQuantConfigV2,
+    replace_linear_with_anemll_v2,
+    freeze_Q_all,
+    freeze_model_for_inference_v2,
+    unfreeze_model_for_training_v2,
+)
 from .layer_qat import (
     compute_kd_loss_batch,
     evaluate_kd_loss,
@@ -28,6 +38,7 @@ from .layer_qat import (
 )
 
 __all__ = [
+    # V1 (original)
     'AnemllQATLinear',
     'AnemllQuantConfig',
     'replace_linear_with_anemll',
@@ -36,6 +47,14 @@ __all__ = [
     'compute_all_indices',
     'snap_all_weights',
     'export_quantized_model',
+    # V2 (ANE-friendly rank-by-rank)
+    'AnemllQATLinearV2',
+    'AnemllQuantConfigV2',
+    'replace_linear_with_anemll_v2',
+    'freeze_Q_all',
+    'freeze_model_for_inference_v2',
+    'unfreeze_model_for_training_v2',
+    # Training utilities
     'compute_kd_loss_batch',
     'evaluate_kd_loss',
     'train_layer',

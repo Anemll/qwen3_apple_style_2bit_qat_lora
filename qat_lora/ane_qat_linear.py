@@ -177,6 +177,12 @@ class AnemllQATLinear(nn.Module):
         # Enable/disable fake quantization
         self.enable_fake_quant = True
 
+        # Track snapped state: None=not snapped, 'lut'=LUT[idx], 'baked'=LUT[idx]*scale
+        self.snapped_mode = None
+
+        # Store lut_bits for conversion pipeline (derived from lut_size)
+        self.lut_bits = self.config.lut_bits
+
         # LoRA
         self.lora_r = int(lora_r)
         self.lora_alpha = float(lora_alpha)
@@ -342,6 +348,18 @@ class AnemllQATLinear(nn.Module):
         # Use cached weights if available (inference mode)
         if hasattr(self, '_cached_weight_q') and self._cached_weight_q is not None:
             w_q = self._cached_weight_q
+        elif getattr(self, 'snapped_mode', None) == 'lut':
+            # Snapped to LUT[idx] mode: multiply by scale to get final weights
+            scales = self.get_scales()
+            if self.pad > 0:
+                # Pad weight to match scale dimensions, multiply, then unpad
+                w_padded = F.pad(self.weight, (0, self.pad))
+                w_q = (w_padded * scales)[:, :self.in_features]
+            else:
+                w_q = self.weight * scales[:, :self.in_features]
+        elif getattr(self, 'snapped_mode', None) == 'baked':
+            # Snapped to LUT[idx]*scale mode: weights are already final
+            w_q = self.weight
         elif self.enable_fake_quant:
             w_q = self.fake_quant_weight()
         else:
@@ -372,14 +390,27 @@ class AnemllQATLinear(nn.Module):
 
         Call this before inference to speed up per-token generation.
         """
-        if not self.enable_fake_quant:
+        # Handle snapped weights
+        snapped_mode = getattr(self, 'snapped_mode', None)
+        if snapped_mode == 'lut':
+            # LUT[idx] mode: compute weight * scale
+            scales = self.get_scales()
+            if self.pad > 0:
+                w_padded = F.pad(self.weight, (0, self.pad))
+                w_q = (w_padded * scales)[:, :self.in_features]
+            else:
+                w_q = self.weight * scales[:, :self.in_features]
+        elif snapped_mode == 'baked':
+            # Baked mode: weights are already final
+            w_q = self.weight
+        elif not self.enable_fake_quant:
             # Clear any existing cache
             if '_cached_weight_q' in self._buffers:
                 del self._buffers['_cached_weight_q']
             return
-
-        # Compute quantized weights once
-        w_q = self.fake_quant_weight()
+        else:
+            # Standard fake quant
+            w_q = self.fake_quant_weight()
 
         # Store as buffer (not parameter) - no gradients needed
         # Check if already exists (from previous freeze or unfreeze)
@@ -568,6 +599,9 @@ class AnemllQATLinear(nn.Module):
 
         # Update weight parameter
         self.weight.data.copy_(w_quantized.to(orig_dtype))
+
+        # Set snapped mode flag for correct forward behavior
+        self.snapped_mode = 'lut' if store_lut_values else 'baked'
 
         # Return indices (compact dtype)
         if lut_size <= 256:
