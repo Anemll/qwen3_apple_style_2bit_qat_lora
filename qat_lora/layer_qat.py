@@ -378,9 +378,9 @@ def collate_fn(batch: List[dict]) -> dict:
 
 
 def is_qat_linear(module: nn.Module) -> bool:
-    """Check if module is AnemllQATLinear (robust against module reloading)."""
+    """Check if module is AnemllQATLinear or V2 (robust against module reloading)."""
     # Use class name check to handle module caching issues
-    return type(module).__name__ == 'AnemllQATLinear'
+    return type(module).__name__ in ('AnemllQATLinear', 'AnemllQATLinearV2')
 
 
 def get_layer_modules(
@@ -451,11 +451,18 @@ def freeze_all_except_layer(
             if m.scale_B is not None:
                 m.scale_B.requires_grad = True
                 trainable += m.scale_B.numel()
+            # V2 has rank_magnitude
+            if hasattr(m, 'rank_magnitude') and m.rank_magnitude is not None:
+                m.rank_magnitude.requires_grad = True
+                trainable += m.rank_magnitude.numel()
         else:
             if m.scale_A is not None:
                 m.scale_A.requires_grad = False
             if m.scale_B is not None:
                 m.scale_B.requires_grad = False
+            # V2 has rank_magnitude
+            if hasattr(m, 'rank_magnitude') and m.rank_magnitude is not None:
+                m.rank_magnitude.requires_grad = False
 
     return trainable
 
@@ -981,7 +988,7 @@ def save_checkpoint(
     # Detect snapped_mode from model (all layers should have same mode)
     snapped_mode = None
     for m in model.modules():
-        if type(m).__name__ == 'AnemllQATLinear':
+        if type(m).__name__ in ('AnemllQATLinear', 'AnemllQATLinearV2'):
             snapped_mode = getattr(m, 'snapped_mode', None)
             if snapped_mode is not None:
                 break
@@ -1083,7 +1090,7 @@ def load_checkpoint(
         count = 0
         lut_bits_summary = {}  # Track unique lut_bits values
         for name, m in model.named_modules():
-            if type(m).__name__ == 'AnemllQATLinear':
+            if type(m).__name__ in ('AnemllQATLinear', 'AnemllQATLinearV2'):
                 # Set snapped_mode
                 if snapped_mode:
                     m.snapped_mode = snapped_mode
@@ -1181,7 +1188,7 @@ def train_e2e(
     attn_proj_names = ('q_proj', 'k_proj', 'v_proj', 'o_proj')
 
     for name, module in model.named_modules():
-        if type(module).__name__ == 'AnemllQATLinear':
+        if type(module).__name__ in ('AnemllQATLinear', 'AnemllQATLinearV2'):
             # Check if this is an attention projection
             is_attn_proj = any(proj in name for proj in attn_proj_names)
 
@@ -1190,6 +1197,9 @@ def train_e2e(
                 attn_frozen += module.weight.numel()
                 if hasattr(module, 'scale_A') and module.scale_A is not None:
                     attn_frozen += module.scale_A.numel() + module.scale_B.numel()
+                # V2 has rank_magnitude
+                if hasattr(module, 'rank_magnitude') and module.rank_magnitude is not None:
+                    attn_frozen += module.rank_magnitude.numel()
                 continue  # Keep frozen
 
             if train_weights:
@@ -1200,6 +1210,10 @@ def train_e2e(
                     module.scale_A.requires_grad = True
                     module.scale_B.requires_grad = True
                     trainable += module.scale_A.numel() + module.scale_B.numel()
+                # V2 has rank_magnitude
+                if hasattr(module, 'rank_magnitude') and module.rank_magnitude is not None:
+                    module.rank_magnitude.requires_grad = True
+                    trainable += module.rank_magnitude.numel()
 
     # Describe mode
     mode_parts = []
