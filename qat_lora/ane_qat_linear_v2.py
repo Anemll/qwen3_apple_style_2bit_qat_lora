@@ -267,19 +267,25 @@ class AnemllQATLinearV2(nn.Module):
         This freezes the quantization indices and Q values.
         After calling this, only scale_A, scale_B, rank_magnitude are trained.
         """
+        device = self.weight.device
+
         # Full scales needed ONLY here, at init/snap time
         scales = self._compute_full_scales()  # [out, in]
         normalized = self.weight / scales
 
-        # Quantize to LUT indices
-        self._indices = quantize_to_lut_indices(
-            normalized,
+        # Quantize to LUT indices (on CPU for compatibility, then move)
+        indices_cpu = quantize_to_lut_indices(
+            normalized.cpu(),
             lut_size=self.lut.size(0),
             include_zero=self.config.lut_include_zero,
         )
 
+        # Store indices on the same device as weights
+        self._indices = indices_cpu.to(device)
+
         # Store Q = lut[indices] in [-1, 1]
-        self._Q = self.lut[self._indices]
+        # Index on CPU then move (more compatible with MPS)
+        self._Q = self.lut.cpu()[indices_cpu].to(device)
 
         # Freeze weight (we're training scales only)
         self.weight.requires_grad = False
