@@ -226,7 +226,8 @@ class AnemllQATLinearV2(nn.Module):
             self.lora_drop = None
 
         # Use batched forward (for CoreML) or loop (for PyTorch training)
-        self.use_batched_forward = False
+        # Auto-enable batched for high rank to reduce STE calls (4*rank -> 4)
+        self.use_batched_forward = scale_rank >= 16
 
         # V2 defaults to factored inference (rank-by-rank) for ANE compatibility
         # Set to False for faster PyTorch inference (single matmul)
@@ -350,12 +351,10 @@ class AnemllQATLinearV2(nn.Module):
         S = (A_scaled @ B_dir)  # [out, in]
 
         # When force_positive_scales=True, A, B, g are all >= 0 by construction
-        # so S is guaranteed >= 0. No clamp needed.
-        if getattr(self.config, "force_positive_scales", False):
-            return S
-        # Fallback clamp only when scales can go negative (use FP16-safe eps)
-        eps = getattr(self.config, 'norm_eps', 1e-6)
-        return S.clamp(min=eps)
+        # so S is guaranteed >= 0.
+        # When force_positive_scales=False (V1 compatibility), scales can be negative
+        # and we should NOT clamp them.
+        return S
 
     @torch.no_grad()
     def freeze_Q(self):
@@ -883,6 +882,57 @@ def get_inference_mode_v2(model: nn.Module) -> dict:
         'has_cached_weights': has_cached,
         'has_frozen_Q': has_Q,
     }
+
+
+def set_batched_forward_v2(
+    model: nn.Module,
+    enabled: bool = True,
+    auto: bool = False,
+    threshold: int = 16,
+    verbose: bool = True,
+) -> int:
+    """Set batched forward mode for all V2 layers.
+
+    Batched forward is more memory-efficient for high-rank configs because
+    it makes 4 STE calls per layer (vs 4*rank for loop-based).
+
+    Args:
+        model: The model containing V2 layers
+        enabled: If True, use batched forward. If False, use loop-based.
+        auto: If True, auto-detect based on scale_rank >= threshold
+        threshold: Rank threshold for auto mode (default 16)
+        verbose: Print diagnostic information
+
+    Returns:
+        Number of layers updated
+    """
+    count = 0
+    batched_count = 0
+
+    for module in model.modules():
+        if isinstance(module, AnemllQATLinearV2):
+            if auto:
+                use_batched = module.scale_rank >= threshold
+            else:
+                use_batched = enabled
+
+            module.use_batched_forward = use_batched
+            count += 1
+            if use_batched:
+                batched_count += 1
+
+    if verbose:
+        if auto:
+            print(f"[V2 Forward Mode] AUTO (rank >= {threshold})")
+        else:
+            mode = "BATCHED" if enabled else "LOOP"
+            print(f"[V2 Forward Mode] {mode}")
+        print(f"  Total layers: {count}")
+        print(f"  Batched: {batched_count}, Loop: {count - batched_count}")
+        if batched_count > 0:
+            print(f"  STE calls per layer: 4 (vs 4*rank for loop)")
+
+    return count
 
 
 def snap_model_for_ane_v2(

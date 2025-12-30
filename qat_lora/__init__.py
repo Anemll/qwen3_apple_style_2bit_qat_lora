@@ -21,6 +21,7 @@ from .ane_qat_linear_v2 import (
     unfreeze_model_for_training_v2,
     set_factored_inference_v2,
     get_inference_mode_v2,
+    set_batched_forward_v2,
     snap_model_for_ane_v2,
     convert_model_to_fp16_v2,
     load_v2_checkpoint,  # Proper loading with _Q and _indices
@@ -62,6 +63,7 @@ __all__ = [
     'unfreeze_model_for_training_v2',
     'set_factored_inference_v2',
     'get_inference_mode_v2',
+    'set_batched_forward_v2',
     'snap_model_for_ane_v2',
     'convert_model_to_fp16_v2',
     'load_v2_checkpoint',
