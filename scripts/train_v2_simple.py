@@ -68,10 +68,11 @@ def main():
     MLP_RANK = 32
     ATTN_LUT_SIZE = 16
     ATTN_RANK = 8
+    GROUP_SIZE = 32  # For scale initialization (smaller = finer granularity)
 
     print(f"\nQ2_A4 Config:")
-    print(f"  MLP: lut={MLP_LUT_SIZE}, rank={MLP_RANK}")
-    print(f"  Attn: lut={ATTN_LUT_SIZE}, rank={ATTN_RANK}")
+    print(f"  MLP: lut={MLP_LUT_SIZE}, rank={MLP_RANK}, group={GROUP_SIZE}")
+    print(f"  Attn: lut={ATTN_LUT_SIZE}, rank={ATTN_RANK}, group={GROUP_SIZE}")
 
     # Import after path setup
     from qat_lora import (
@@ -110,6 +111,7 @@ def main():
         v2_mlp_config = AnemllQuantConfigV2(
             lut_size=MLP_LUT_SIZE,
             scale_rank=MLP_RANK,
+            group_size=GROUP_SIZE,
             force_positive_scales=False,
             magnitude_activation='identity',
             use_ste_fp16=True,
@@ -117,6 +119,7 @@ def main():
         v2_attn_config = AnemllQuantConfigV2(
             lut_size=ATTN_LUT_SIZE,
             scale_rank=ATTN_RANK,
+            group_size=GROUP_SIZE,
             force_positive_scales=False,
             magnitude_activation='identity',
             use_ste_fp16=True,
@@ -160,6 +163,7 @@ def main():
         v2_mlp_config = AnemllQuantConfigV2(
             lut_size=MLP_LUT_SIZE,
             scale_rank=MLP_RANK,
+            group_size=GROUP_SIZE,
             force_positive_scales=False,
             magnitude_activation='identity',
             use_ste_fp16=True,
@@ -167,6 +171,7 @@ def main():
         v2_attn_config = AnemllQuantConfigV2(
             lut_size=ATTN_LUT_SIZE,
             scale_rank=ATTN_RANK,
+            group_size=GROUP_SIZE,
             force_positive_scales=False,
             magnitude_activation='identity',
             use_ste_fp16=True,
@@ -229,6 +234,7 @@ def main():
         v2_mlp_config = AnemllQuantConfigV2(
             lut_size=MLP_LUT_SIZE,
             scale_rank=MLP_RANK,
+            group_size=GROUP_SIZE,
             force_positive_scales=False,
             magnitude_activation='identity',
             use_ste_fp16=True,
@@ -236,6 +242,7 @@ def main():
         v2_attn_config = AnemllQuantConfigV2(
             lut_size=ATTN_LUT_SIZE,
             scale_rank=ATTN_RANK,
+            group_size=GROUP_SIZE,
             force_positive_scales=False,
             magnitude_activation='identity',
             use_ste_fp16=True,
