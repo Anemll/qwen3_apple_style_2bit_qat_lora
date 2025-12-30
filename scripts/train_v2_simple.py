@@ -34,6 +34,8 @@ def main():
     parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--max-steps', type=int, default=1000)
     parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--hard-top1', type=float, default=0.2, help='Hard label top-1 weight')
+    parser.add_argument('--hard-full', type=float, default=0.00005, help='Hard label full vocab weight')
     args = parser.parse_args()
 
     # Validate inputs
@@ -179,6 +181,8 @@ def main():
         temperature=2.0,
         train_weights=False,
         train_scales=True,
+        hard_top1_weight=args.hard_top1,
+        hard_full_weight=args.hard_full,
         logging_steps=20,
         eval_steps=100,
         verbose=True,
