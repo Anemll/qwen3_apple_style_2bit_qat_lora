@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import json
 import torch
 import sys
 from pathlib import Path
@@ -30,10 +31,14 @@ def main():
                         help='Path to V2 checkpoint (model_state_dict.pt)')
     parser.add_argument('--model-id', type=str, default='Qwen/Qwen3-0.6B',
                         help='HuggingFace model ID')
-    parser.add_argument('--lut-bits', type=int, default=4,
-                        help='LUT bits (default: 4)')
-    parser.add_argument('--scale-rank', type=int, default=4,
-                        help='Scale rank (default: 4)')
+    parser.add_argument('--lut-bits', type=int, default=2,
+                        help='LUT bits for MLP (default: 2)')
+    parser.add_argument('--attn-lut-bits', type=int, default=4,
+                        help='LUT bits for attention (default: 4)')
+    parser.add_argument('--scale-rank', type=int, default=32,
+                        help='Scale rank for MLP (default: 32)')
+    parser.add_argument('--attn-scale-rank', type=int, default=8,
+                        help='Scale rank for attention (default: 8)')
     parser.add_argument('--device', type=str, default=None,
                         help='Device (default: auto-detect)')
     parser.add_argument('--output', type=str, default=None,
@@ -43,6 +48,12 @@ def main():
     parser.add_argument('--fp16', '--ane', action='store_true',
                         help='Snap for ANE export (FP16 precision, recompute indices)')
     args = parser.parse_args()
+
+    # Set attn defaults to MLP values if not specified
+    if args.attn_lut_bits is None:
+        args.attn_lut_bits = args.lut_bits
+    if args.attn_scale_rank is None:
+        args.attn_scale_rank = args.scale_rank
 
     # Auto-detect device
     if args.device:
@@ -70,16 +81,27 @@ def main():
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
 
-    # Replace with V2 layers
+    # Replace with V2 layers (matching training config)
     print("Replacing with V2 layers...")
-    config = AnemllQuantConfigV2(
+    print(f"  MLP: lut_bits={args.lut_bits}, rank={args.scale_rank}")
+    print(f"  Attn: lut_bits={args.attn_lut_bits}, rank={args.attn_scale_rank}")
+
+    mlp_config = AnemllQuantConfigV2(
         lut_size=2**args.lut_bits,
         scale_rank=args.scale_rank,
+        force_positive_scales=False,  # Match training config
+        magnitude_activation='identity',
+    )
+    attn_config = AnemllQuantConfigV2(
+        lut_size=2**args.attn_lut_bits,
+        scale_rank=args.attn_scale_rank,
+        force_positive_scales=False,  # Match training config
+        magnitude_activation='identity',
     )
     count = replace_linear_with_anemll_v2(
         model,
-        mlp_config=config,
-        attn_config=config,
+        mlp_config=mlp_config,
+        attn_config=attn_config,
         quantize_attn=True,
         quantize_lm_head=False,
         verbose=False,
@@ -143,6 +165,17 @@ def main():
         print("  First 10 unexpected:")
         for k in unexpected[:10]:
             print(f"    - {k}")
+
+    # Manually load _Q buffers if they weren't loaded (None buffers issue)
+    q_manual_loaded = 0
+    for name, m in model.named_modules():
+        if type(m).__name__ == 'AnemllQATLinearV2':
+            q_key = f"{name}._Q"
+            if q_key in state_dict and m._Q is None:
+                m.register_buffer("_Q", state_dict[q_key])
+                q_manual_loaded += 1
+    if q_manual_loaded > 0:
+        print(f"  Manually loaded {q_manual_loaded} _Q buffers")
 
     model.to(device)
 
@@ -218,6 +251,24 @@ def main():
         output_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), args.output)
         print(f"  Saved!")
+
+        # Save config.json for ANE tests
+        config_path = output_path.parent / 'config.json'
+        config_data = {
+            'version': 'v2',
+            'model_id': args.model_id,
+            'lut_bits': args.lut_bits,
+            'attn_lut_bits': args.attn_lut_bits,
+            'scale_rank': args.scale_rank,
+            'attn_scale_rank': args.attn_scale_rank,
+            'force_positive_scales': False,
+            'magnitude_activation': 'identity',
+            'checkpoint': output_path.name,
+            'fp16': args.fp16,
+        }
+        with open(config_path, 'w') as f:
+            json.dump(config_data, f, indent=2)
+        print(f"  Config saved to {config_path}")
 
     # Test inference
     print("\n=== Testing Inference ===\n")

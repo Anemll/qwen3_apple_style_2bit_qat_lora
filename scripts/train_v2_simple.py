@@ -138,7 +138,18 @@ def main():
         print(f"  Loading checkpoint ({args.v2_checkpoint})...", end=" ", flush=True)
         state_dict = torch.load(args.v2_checkpoint, map_location='cpu')
         v2_model.load_state_dict(state_dict, strict=False)
+
+        # Manually load _Q buffers (None buffers don't load automatically)
+        q_loaded = 0
+        for name, m in v2_model.named_modules():
+            if isinstance(m, AnemllQATLinearV2):
+                q_key = f"{name}._Q"
+                if q_key in state_dict and m._Q is None:
+                    m.register_buffer("_Q", state_dict[q_key])
+                    q_loaded += 1
         print(f"done ({time.time()-t0:.1f}s)")
+        if q_loaded > 0:
+            print(f"  Manually loaded {q_loaded} _Q buffers")
 
         t0 = time.time()
         print("  Moving to GPU...", end=" ", flush=True)

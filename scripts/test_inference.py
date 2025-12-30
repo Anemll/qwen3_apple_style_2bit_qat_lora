@@ -129,12 +129,14 @@ def load_model(args):
         mlp_config = AnemllQuantConfigV2(
             lut_size=2**lut_bits,
             scale_rank=scale_rank,
-            force_positive_scales=True,
+            force_positive_scales=False,  # Match training config
+            magnitude_activation='identity',
         )
         attn_config = AnemllQuantConfigV2(
             lut_size=2**attn_lut_bits,
             scale_rank=attn_scale_rank,
-            force_positive_scales=True,
+            force_positive_scales=False,  # Match training config
+            magnitude_activation='identity',
         )
 
         replace_linear_with_anemll_v2(
@@ -185,6 +187,19 @@ def load_model(args):
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f"  Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+
+    # V2: Manually load _Q buffers if they weren't loaded (None buffers issue)
+    if version == 'v2':
+        q_loaded = 0
+        for name, m in model.named_modules():
+            if type(m).__name__ == 'AnemllQATLinearV2':
+                q_key = f"{name}._Q"
+                if q_key in state_dict and m._Q is None:
+                    # Re-register as buffer so it moves with model.to(device)
+                    m.register_buffer("_Q", state_dict[q_key])
+                    q_loaded += 1
+        if q_loaded > 0:
+            print(f"  Manually loaded {q_loaded} _Q buffers")
 
     # Move to device
     model.to(device)
