@@ -74,6 +74,7 @@ def main():
         AnemllQuantConfigV2,
         replace_linear_with_anemll,
         replace_linear_with_anemll_v2,
+        freeze_Q_all,
         train_e2e,
     )
     from qat_lora.ane_qat_linear import AnemllQATLinear
@@ -194,75 +195,34 @@ def main():
             quantize_lm_head=False,
         )
 
-        # Convert V1 -> V2 (proper conversion preserving Q and scales)
+        # Convert V1 -> V2 (simple norm-based conversion)
         print("  Converting V1 -> V2...")
 
-        def is_lut_snapped(w, lut, tol=1e-3):
-            """Check if weight is already snapped to LUT values."""
-            # Ensure same device
-            lut = lut.to(w.device)
-            diff = (w.unsqueeze(-1) - lut.view(1, 1, -1)).abs().min(dim=-1).values
-            return (diff.max().item() < tol) and (w.abs().max().item() <= 1.2)
-
-        # Name-based layer mapping (safer than zip)
-        v1_layers = {n: m for n, m in v1_model.named_modules() if isinstance(m, AnemllQATLinear)}
-        v2_layers = {n: m for n, m in v2_model.named_modules() if isinstance(m, AnemllQATLinearV2)}
-
         converted = 0
-        snapped_count = 0
-        for name, m1 in v1_layers.items():
-            m2 = v2_layers.get(name)
-            if m2 is None:
-                print(f"    WARNING: No V2 layer for {name}")
-                continue
+        for (name_v1, m_v1), (name_v2, m_v2) in zip(
+            v1_model.named_modules(), v2_model.named_modules()
+        ):
+            if isinstance(m_v1, AnemllQATLinear) and isinstance(m_v2, AnemllQATLinearV2):
+                m_v2.lut.data.copy_(m_v1.lut.data.float())
+                m_v2.weight.data.copy_(m_v1.weight.data.float())
 
-            # --- LUT ---
-            m2.lut.data.copy_(m1.lut.data.float())
+                # Preserve V1 factorization (norm-based)
+                A = m_v1.scale_A.float()  # [out, rank]
+                B = m_v1.scale_B[:, :m_v1.in_features].float()  # [rank, in]
 
-            # --- Scales: preserve V1 factorization (norm-based, not SVD) ---
-            # SVD re-factors and loses information; norm-based preserves V1 structure
-            A = m1.scale_A.float()  # [out, rank]
-            B = m1.scale_B[:, :m2.in_features].float()  # [rank, in]
+                A_norms = A.norm(dim=0, keepdim=True).clamp(min=1e-6)
+                B_norms = B.norm(dim=1, keepdim=True).clamp(min=1e-6)
 
-            A_norms = A.norm(dim=0, keepdim=True).clamp(min=1e-6)  # [1, rank]
-            B_norms = B.norm(dim=1, keepdim=True).clamp(min=1e-6)  # [rank, 1]
+                A_dir = A / A_norms
+                B_dir = B / B_norms
+                magnitude = (A_norms.squeeze() * B_norms.squeeze())
 
-            A_dir = A / A_norms  # unit-norm columns
-            B_dir = B / B_norms  # unit-norm rows
-            magnitude = (A_norms.squeeze() * B_norms.squeeze())  # [rank]
+                m_v2.scale_A.data.copy_(A_dir)
+                m_v2.scale_B.data.copy_(B_dir)
+                m_v2.rank_magnitude.data.copy_(magnitude)
+                converted += 1
 
-            m2.scale_A.data.copy_(A_dir)
-            m2.scale_B.data.copy_(B_dir)
-            m2.rank_magnitude.data.copy_(magnitude)
-
-            # Get clamped scales for Q computation
-            S = m1.get_scales().float()[:, :m2.in_features]  # [out, in] with clamp
-
-            # --- Q: check if V1 weight is already snapped ---
-            w1 = m1.weight.data.float()[:, :m2.in_features]
-            lut = m2.lut.data.float().to(w1.device)  # Ensure same device
-
-            if is_lut_snapped(w1, lut):
-                # V1 weight IS the Q (already LUT values)
-                Q = w1.clone()
-                # Derive indices by nearest LUT entry
-                indices = (Q.unsqueeze(-1) - lut.view(1, 1, -1)).abs().argmin(dim=-1)
-                snapped_count += 1
-            else:
-                # V1 weight is FP; compute indices using V1 scales
-                normalized = (w1 / S).clamp(-1.0, 1.0)
-                # Map to nearest LUT index
-                indices = (normalized.unsqueeze(-1) - lut.view(1, 1, -1)).abs().argmin(dim=-1)
-                Q = lut[indices]
-
-            # Store Q and indices directly (skip freeze_Q)
-            m2.register_buffer('_Q', Q)
-            m2.register_buffer('_indices', indices)
-            m2.weight.requires_grad = False
-
-            converted += 1
-
-        print(f"  Converted {converted} layers ({snapped_count} were snapped)")
+        print(f"  Converted {converted} layers")
 
         # Free V1
         del v1_model
@@ -281,11 +241,7 @@ def main():
     # =========================================================================
     print("\n[2/3] Training with STE-FP16..." if args.v2_checkpoint else "\n[3/4] Training with STE-FP16...")
 
-    # Only call freeze_Q if _Q not already set (for V2 checkpoint loading)
-    for name, module in v2_model.named_modules():
-        if isinstance(module, AnemllQATLinearV2):
-            if not hasattr(module, '_Q') or module._Q is None:
-                module.freeze_Q()
+    freeze_Q_all(v2_model)
     # train_e2e handles requires_grad based on train_scales, train_g_only, train_mlp_only
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
