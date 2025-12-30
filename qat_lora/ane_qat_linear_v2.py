@@ -41,6 +41,14 @@ class AnemllQuantConfigV2:
     lut_include_zero: bool = False  # Whether LUT includes 0
     learnable_lut: bool = False  # Whether LUT values are trainable
 
+    # Scale constraints (to avoid clamp(A@B) materialization in forward)
+    # NOTE: When Q (LUT indices) is frozen, letting scales go negative can flip effective weight signs.
+    # For the 'freeze Q + train scales' pipeline, keeping scales nonnegative is the safest choice.
+    force_positive_scales: bool = True  # enforce S >= 0 by construction
+    positive_scale_method: str = "abs"  # "abs" or "softplus"
+    magnitude_activation: str = "softplus"  # "identity" | "abs" | "softplus"
+    magnitude_eps: float = 1e-6
+
     @property
     def lut_bits(self) -> int:
         return int(math.ceil(math.log2(self.lut_size)))
@@ -228,28 +236,62 @@ class AnemllQATLinearV2(nn.Module):
         self.rank_magnitude.data = s[:r].to(self.weight.dtype)
 
     def _get_normalized_scales(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return unit-normalized A, B and magnitude (no self-canceling).
+        """Return normalized scale directions + per-rank magnitude.
+
+        This is where we encode the effect of the old:
+            (A @ B).clamp(min=eps)
+        without ever materializing A@B in the forward pass.
+
+        If `config.force_positive_scales` is enabled (recommended when Q is frozen):
+        - force the *factors* to be nonnegative (abs/softplus) so S = (A*g)@B stays >= 0
+        - force g >= 0 (softplus/abs) so rank magnitudes can't flip sign
 
         Returns:
             A_dir: [out, rank] unit-norm columns
             B_dir: [rank, in] unit-norm rows
-            g: [rank] magnitude (the ONLY magnitude)
+            g: [rank] nonnegative magnitudes (if configured)
         """
         eps = 1e-8
 
-        # Normalize columns of A
-        A_norms = self.scale_A.norm(dim=0, keepdim=True).clamp(min=eps)
-        A_dir = self.scale_A / A_norms
+        # Start from raw params
+        A = self.scale_A
+        B = self.scale_B
 
-        # Normalize rows of B
-        B_norms = self.scale_B.norm(dim=1, keepdim=True).clamp(min=eps)
-        B_dir = self.scale_B / B_norms
+        # Optional: force nonnegative factors so the implied scale matrix stays >= 0.
+        if getattr(self.config, "force_positive_scales", False):
+            method = getattr(self.config, "positive_scale_method", "abs")
+            if method == "softplus":
+                A = F.softplus(A)
+                B = F.softplus(B)
+            elif method == "abs":
+                A = A.abs()
+                B = B.abs()
+            else:
+                raise ValueError(f"Unknown positive_scale_method: {method}")
 
-        # THE ONLY magnitude (not multiplied by norms!)
+        # Normalize columns of A (directions)
+        A_norms = A.norm(dim=0, keepdim=True).clamp(min=eps)
+        A_dir = A / A_norms
+
+        # Normalize rows of B (directions)
+        B_norms = B.norm(dim=1, keepdim=True).clamp(min=eps)
+        B_dir = B / B_norms
+
+        # Per-rank magnitude (optionally forced nonnegative)
         g = self.rank_magnitude
+        act = getattr(self.config, "magnitude_activation", "identity")
+        g_eps = float(getattr(self.config, "magnitude_eps", 0.0))
+        if act == "softplus":
+            g = F.softplus(g) + g_eps
+        elif act == "abs":
+            g = g.abs() + g_eps
+        elif act == "identity":
+            if g_eps:
+                g = g + g_eps
+        else:
+            raise ValueError(f"Unknown magnitude_activation: {act}")
 
         return A_dir, B_dir, g
-
     def _compute_full_scales(self) -> torch.Tensor:
         """Reconstruct full scales matrix [out, in].
 
@@ -258,7 +300,12 @@ class AnemllQATLinearV2(nn.Module):
         A_dir, B_dir, g = self._get_normalized_scales()
         # S = A_dir @ diag(g) @ B_dir = (A_dir * g) @ B_dir
         A_scaled = A_dir * g  # [out, rank]
-        return (A_scaled @ B_dir).clamp(min=1e-8)  # [out, in]
+        S = (A_scaled @ B_dir)  # [out, in]
+        # If factors/magnitudes are constrained to be nonnegative, S should already be >= 0.
+        # Add a tiny floor for stability when computing normalized weights (offline / snap time).
+        if getattr(self.config, "force_positive_scales", False):
+            return S + 1e-8
+        return S.clamp(min=1e-8)
 
     @torch.no_grad()
     def freeze_Q(self):
