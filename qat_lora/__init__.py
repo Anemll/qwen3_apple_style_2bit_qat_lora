@@ -19,6 +19,10 @@ from .ane_qat_linear_v2 import (
     freeze_Q_all,
     freeze_model_for_inference_v2,
     unfreeze_model_for_training_v2,
+    set_factored_inference_v2,
+    get_inference_mode_v2,
+    snap_model_for_ane_v2,
+    convert_model_to_fp16_v2,
 )
 from .layer_qat import (
     compute_kd_loss_batch,
@@ -54,6 +58,10 @@ __all__ = [
     'freeze_Q_all',
     'freeze_model_for_inference_v2',
     'unfreeze_model_for_training_v2',
+    'set_factored_inference_v2',
+    'get_inference_mode_v2',
+    'snap_model_for_ane_v2',
+    'convert_model_to_fp16_v2',
     # Training utilities
     'compute_kd_loss_batch',
     'evaluate_kd_loss',

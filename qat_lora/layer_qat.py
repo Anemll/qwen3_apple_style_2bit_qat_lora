@@ -1142,6 +1142,7 @@ def train_e2e(
     use_cosine_schedule: bool = False,
     warmup_steps: int = 0,
     min_lr_ratio: float = 0.1,
+    use_fp16: bool = False,
 ) -> dict:
     """End-to-end KD-QAT training (all layers unfrozen).
 
@@ -1167,6 +1168,7 @@ def train_e2e(
         use_cosine_schedule: Use cosine annealing LR schedule
         warmup_steps: Linear warmup steps (0 to disable)
         min_lr_ratio: Minimum LR as ratio of peak LR (default 0.1 = 10% of lr)
+        use_fp16: Enable FP16 training with GradScaler (CUDA only)
 
     Returns:
         Dict with 'initial_loss', 'final_loss', 'best_loss', 'steps', 'time_sec'
@@ -1177,6 +1179,17 @@ def train_e2e(
     from torch.utils.data import DataLoader
 
     t_start = time.time()
+
+    # Setup GradScaler for FP16 training (CUDA only)
+    scaler = None
+    if use_fp16:
+        if device.type == 'cuda':
+            scaler = torch.cuda.amp.GradScaler()
+            if verbose:
+                print("[FP16] Using GradScaler for CUDA FP16 training")
+        else:
+            if verbose:
+                print(f"[FP16] Warning: GradScaler not supported on {device.type}, using FP16 without scaling")
 
     # Set trainable parameters
     trainable = 0
@@ -1291,14 +1304,32 @@ def train_e2e(
             if step >= max_steps:
                 break
 
-            loss = compute_kd_loss_batch(
-                model, batch, device, temperature,
-                no_grad=False,
-                hard_top1_weight=hard_top1_weight,
-                hard_full_weight=hard_full_weight,
-            )
-            loss.backward()
-            optimizer.step()
+            # Forward pass with optional autocast for FP16
+            if use_fp16:
+                with torch.amp.autocast(device_type=device.type, dtype=torch.float16):
+                    loss = compute_kd_loss_batch(
+                        model, batch, device, temperature,
+                        no_grad=False,
+                        hard_top1_weight=hard_top1_weight,
+                        hard_full_weight=hard_full_weight,
+                    )
+            else:
+                loss = compute_kd_loss_batch(
+                    model, batch, device, temperature,
+                    no_grad=False,
+                    hard_top1_weight=hard_top1_weight,
+                    hard_full_weight=hard_full_weight,
+                )
+
+            # Backward pass with optional scaler for FP16
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+
             if scheduler is not None:
                 scheduler.step()
             optimizer.zero_grad()

@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Test inference for QAT-trained Qwen3 model.
+Test inference for QAT-trained Qwen3 model (supports V1 and V2).
 
 Usage:
+    python scripts/test_inference.py checkpoint_dir/
     python scripts/test_inference.py checkpoint.pt
     python scripts/test_inference.py checkpoint.pt --prompt "What is 2+2?"
     python scripts/test_inference.py checkpoint.pt --interactive
 """
 
 import argparse
+import json
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from pathlib import Path
@@ -17,13 +19,10 @@ import sys
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from qat_lora.ane_qat_linear import replace_linear_with_anemll, AnemllQuantConfig
-from qat_lora import load_checkpoint
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Test QAT model inference')
-    parser.add_argument('checkpoint', type=str, help='Path to checkpoint .pt file')
+    parser.add_argument('checkpoint', type=str, help='Path to checkpoint .pt file or directory')
     parser.add_argument('--model-id', type=str, default='Qwen/Qwen3-0.6B',
                         help='Base model ID (default: Qwen/Qwen3-0.6B)')
     parser.add_argument('--prompt', type=str, default=None,
@@ -39,19 +38,38 @@ def parse_args():
     parser.add_argument('--no-thinking', action='store_true',
                         help='Disable thinking mode')
 
-    # Quantization config
-    parser.add_argument('--lut-bits', type=int, default=2,
-                        help='LUT bits for MLP (default: 2)')
-    parser.add_argument('--attn-lut-bits', type=int, default=4,
-                        help='LUT bits for attention (default: 4)')
-    parser.add_argument('--group-size', type=int, default=16,
-                        help='Group size (default: 16)')
-    parser.add_argument('--scale-rank', type=int, default=32,
-                        help='Scale rank for MLP (default: 32)')
-    parser.add_argument('--attn-scale-rank', type=int, default=8,
-                        help='Scale rank for attention (default: 8)')
+    # Quantization config (overrides config.json if specified)
+    parser.add_argument('--lut-bits', type=int, default=None,
+                        help='LUT bits for MLP (auto-detect from config.json)')
+    parser.add_argument('--attn-lut-bits', type=int, default=None,
+                        help='LUT bits for attention (auto-detect from config.json)')
+    parser.add_argument('--scale-rank', type=int, default=None,
+                        help='Scale rank for MLP (auto-detect from config.json)')
+    parser.add_argument('--attn-scale-rank', type=int, default=None,
+                        help='Scale rank for attention (auto-detect from config.json)')
+    parser.add_argument('--version', type=str, default=None, choices=['v1', 'v2'],
+                        help='Force V1 or V2 (auto-detect from config.json)')
 
     return parser.parse_args()
+
+
+def load_config(checkpoint_path):
+    """Load config.json from checkpoint directory."""
+    path = Path(checkpoint_path)
+
+    # Handle both file and directory paths
+    if path.is_file():
+        config_path = path.parent / 'config.json'
+    else:
+        config_path = path / 'config.json'
+
+    if config_path.exists():
+        with open(config_path) as f:
+            config = json.load(f)
+        print(f"Loaded config from {config_path}")
+        return config
+
+    return {}
 
 
 def load_model(args):
@@ -68,52 +86,132 @@ def load_model(args):
         dtype = torch.float32
 
     print(f"Device: {device}, dtype: {dtype}")
-    print(f"Loading base model: {args.model_id}")
+
+    # Load config.json to get params
+    config = load_config(args.checkpoint)
+
+    # Determine version (V1 or V2)
+    version = args.version or config.get('version', 'v1')
+    print(f"Model version: {version.upper()}")
+
+    # Get quantization params from config or args
+    lut_bits = args.lut_bits or config.get('lut_bits', 4)
+    attn_lut_bits = args.attn_lut_bits or config.get('attn_lut_bits', lut_bits)
+    scale_rank = args.scale_rank or config.get('scale_rank', 4)
+    attn_scale_rank = args.attn_scale_rank or config.get('attn_scale_rank', scale_rank)
+    model_id = config.get('model_id', args.model_id)
+
+    print(f"Config: lut_bits={lut_bits}, attn_lut_bits={attn_lut_bits}, "
+          f"scale_rank={scale_rank}, attn_scale_rank={attn_scale_rank}")
+
+    print(f"Loading base model: {model_id}")
 
     # Load base model
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
+        model_id,
         torch_dtype=dtype,
         trust_remote_code=True,
     )
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-    # Replace with QAT layers
-    print(f"Replacing linears (q{args.lut_bits}_a{args.attn_lut_bits})...")
+    # Replace with QAT layers based on version
+    print(f"Replacing linears (q{lut_bits}_a{attn_lut_bits}, {version})...")
 
-    # Create configs
-    mlp_config = AnemllQuantConfig(
-        lut_size=2**args.lut_bits,
-        group_size=args.group_size,
-        scale_rank=args.scale_rank,
-    )
-    attn_config = AnemllQuantConfig(
-        lut_size=2**args.attn_lut_bits,
-        group_size=args.group_size,
-        scale_rank=args.attn_scale_rank,
-    )
+    if version == 'v2':
+        # V2: ANE-friendly rank-by-rank
+        from qat_lora import (
+            AnemllQuantConfigV2,
+            replace_linear_with_anemll_v2,
+            freeze_Q_all,
+            get_inference_mode_v2,
+        )
 
-    replace_linear_with_anemll(
-        model,
-        mlp_config=mlp_config,
-        attn_config=attn_config,
-        quantize_attn=True,
-        verbose=False,
-    )
+        mlp_config = AnemllQuantConfigV2(
+            lut_size=2**lut_bits,
+            scale_rank=scale_rank,
+            force_positive_scales=True,
+        )
+        attn_config = AnemllQuantConfigV2(
+            lut_size=2**attn_lut_bits,
+            scale_rank=attn_scale_rank,
+            force_positive_scales=True,
+        )
 
-    # Load checkpoint (also restores snapped_mode from config.json if present)
-    print(f"Loading checkpoint: {args.checkpoint}")
-    load_checkpoint(model, args.checkpoint, device='cpu', verbose=True)
+        replace_linear_with_anemll_v2(
+            model,
+            mlp_config=mlp_config,
+            attn_config=attn_config,
+            quantize_attn=True,
+            verbose=False,
+        )
+    else:
+        # V1: Original implementation
+        from qat_lora import (
+            AnemllQuantConfig,
+            replace_linear_with_anemll,
+        )
+
+        mlp_config = AnemllQuantConfig(
+            lut_size=2**lut_bits,
+            scale_rank=scale_rank,
+        )
+        attn_config = AnemllQuantConfig(
+            lut_size=2**attn_lut_bits,
+            scale_rank=attn_scale_rank,
+        )
+
+        replace_linear_with_anemll(
+            model,
+            mlp_config=mlp_config,
+            attn_config=attn_config,
+            quantize_attn=True,
+            verbose=False,
+        )
+
+    # Resolve checkpoint path
+    checkpoint_path = Path(args.checkpoint)
+    if checkpoint_path.is_dir():
+        checkpoint_file = checkpoint_path / 'model_state_dict.pt'
+    else:
+        checkpoint_file = checkpoint_path
+
+    # Load checkpoint
+    print(f"Loading checkpoint: {checkpoint_file}")
+    state_dict = torch.load(checkpoint_file, map_location='cpu')
+
+    # Handle wrapped state dict
+    if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
+        state_dict = state_dict['model_state_dict']
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    print(f"  Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
 
     # Move to device
     model.to(device)
     model.eval()
 
-    # Freeze for inference (cache quantized weights)
+    # Freeze for inference
     print("Freezing for inference...")
-    for m in model.modules():
-        if type(m).__name__ == 'AnemllQATLinear':
-            m.freeze_for_inference()
+    if version == 'v2':
+        # V2: Freeze Q first if needed, then cache W_eff
+        for name, m in model.named_modules():
+            if type(m).__name__ == 'AnemllQATLinearV2':
+                if m._Q is None:
+                    m.freeze_Q()
+                # Cache W_eff for inference
+                with torch.no_grad():
+                    scales = m._compute_full_scales()
+                    m._cached_weight_q = (m._Q * scales).to(m.weight.dtype)
+
+        # Print inference mode
+        mode_info = get_inference_mode_v2(model)
+        print(f"  V2 Inference: {mode_info['total']} layers, "
+              f"{mode_info['has_frozen_Q']} with frozen Q")
+    else:
+        # V1: Standard freeze
+        for m in model.modules():
+            if type(m).__name__ == 'AnemllQATLinear':
+                m.freeze_for_inference()
 
     print("Model ready!\n")
     return model, tokenizer, device
@@ -199,7 +297,8 @@ def main():
     args = parse_args()
 
     # Check checkpoint exists
-    if not Path(args.checkpoint).exists():
+    checkpoint_path = Path(args.checkpoint)
+    if not checkpoint_path.exists():
         print(f"Error: Checkpoint not found: {args.checkpoint}")
         sys.exit(1)
 

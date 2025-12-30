@@ -195,6 +195,14 @@ class AnemllQATLinearV2(nn.Module):
         # Use batched forward (for CoreML) or loop (for PyTorch training)
         self.use_batched_forward = False
 
+        # V2 defaults to factored inference (rank-by-rank) for ANE compatibility
+        # Set to False for faster PyTorch inference (single matmul)
+        self.use_factored_inference = True
+
+        # Flag: scales are already baked (magnitude in A, B is unit, g=1)
+        # When True, _get_normalized_scales() returns raw params without re-normalizing
+        self._scales_baked = False
+
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -247,10 +255,15 @@ class AnemllQATLinearV2(nn.Module):
         - force g >= 0 (softplus/abs) so rank magnitudes can't flip sign
 
         Returns:
-            A_dir: [out, rank] unit-norm columns
+            A_dir: [out, rank] unit-norm columns (or baked A if _scales_baked)
             B_dir: [rank, in] unit-norm rows
             g: [rank] nonnegative magnitudes (if configured)
         """
+        # Fast path: scales already baked (after snap_for_ane/snap_for_export)
+        # Return raw params without re-normalizing
+        if getattr(self, '_scales_baked', False):
+            return self.scale_A, self.scale_B, self.rank_magnitude
+
         eps = 1e-8
 
         # Start from raw params
@@ -301,10 +314,12 @@ class AnemllQATLinearV2(nn.Module):
         # S = A_dir @ diag(g) @ B_dir = (A_dir * g) @ B_dir
         A_scaled = A_dir * g  # [out, rank]
         S = (A_scaled @ B_dir)  # [out, in]
-        # If factors/magnitudes are constrained to be nonnegative, S should already be >= 0.
-        # Add a tiny floor for stability when computing normalized weights (offline / snap time).
+
+        # When force_positive_scales=True, A, B, g are all >= 0 by construction
+        # so S is guaranteed >= 0. No clamp needed.
         if getattr(self.config, "force_positive_scales", False):
-            return S + 1e-8
+            return S
+        # Fallback clamp only when scales can go negative
         return S.clamp(min=1e-8)
 
     @torch.no_grad()
@@ -342,8 +357,9 @@ class AnemllQATLinearV2(nn.Module):
 
         No A @ B materialization in this path.
         """
-        # Fast path for cached full weights (inference)
-        if self._cached_weight_q is not None:
+        # Fast path for cached full weights (single matmul inference)
+        # Skip if use_factored_inference=True (for ANE export testing)
+        if self._cached_weight_q is not None and not self.use_factored_inference:
             w_q = self._cached_weight_q.to(x.dtype)
             bias = self.bias.to(x.dtype) if self.bias is not None else None
             return F.linear(x, w_q, bias)
@@ -456,6 +472,7 @@ class AnemllQATLinearV2(nn.Module):
     def unfreeze_for_training(self):
         """Clear cached weights for training."""
         self._cached_weight_q = None
+        self._scales_baked = False  # Re-enable normalization
 
     @torch.no_grad()
     def snap_for_export(self):
@@ -466,6 +483,7 @@ class AnemllQATLinearV2(nn.Module):
         - scale_B contains B_dir (unit-norm)
         - rank_magnitude is all ones
         - _cached_weight_q contains full W_eff
+        - _scales_baked is True (skip normalization in forward)
         """
         A_dir, B_dir, g = self._get_normalized_scales()
 
@@ -474,8 +492,134 @@ class AnemllQATLinearV2(nn.Module):
         self.scale_B.data = B_dir.to(self.weight.dtype)
         self.rank_magnitude.data = torch.ones_like(g)
 
+        # Mark scales as baked (skip normalization in forward)
+        self._scales_baked = True
+
         # Cache full W_eff
         self.freeze_for_inference()
+
+    @torch.no_grad()
+    def snap_for_ane(self, recompute_indices: bool = True):
+        """Snap for ANE export in FP16 precision.
+
+        ANE runs in FP16, so we need to:
+        1. Recompute LUT in FP16
+        2. Recompute quantization indices in FP16 (optional)
+        3. Compute scales in FP16
+        4. Store Q = lut[indices] in FP16
+
+        Args:
+            recompute_indices: If True, recompute indices in FP16 precision.
+                              If False, keep existing indices but convert Q to FP16.
+        """
+        device = self.weight.device
+        fp16 = torch.float16
+
+        # 1. Recompute LUT in FP16
+        lut_fp16 = make_lut(
+            self.config.lut_size,
+            device=device,
+            dtype=fp16,
+            include_zero=self.config.lut_include_zero,
+        )
+
+        if recompute_indices:
+            # 2. Compute scales in FP16
+            A_dir, B_dir, g = self._get_normalized_scales()
+            A_dir = A_dir.to(fp16)
+            B_dir = B_dir.to(fp16)
+            g = g.to(fp16)
+
+            # Compute full scales in FP16
+            A_scaled = A_dir * g
+            scales_fp16 = (A_scaled @ B_dir)
+            if getattr(self.config, "force_positive_scales", False):
+                scales_fp16 = scales_fp16  # Already >= 0
+            else:
+                scales_fp16 = scales_fp16.clamp(min=1e-8)
+
+            # 3. Recompute indices in FP16
+            weight_fp16 = self.weight.to(fp16)
+            normalized = weight_fp16 / scales_fp16
+
+            indices_fp16 = quantize_to_lut_indices(
+                normalized,
+                lut_size=self.config.lut_size,
+                include_zero=self.config.lut_include_zero,
+            )
+
+            # Store indices
+            self._indices = indices_fp16
+
+            # Bake scales into scale_A, scale_B
+            self.scale_A.data = A_scaled.to(fp16)
+            self.scale_B.data = B_dir.to(fp16)
+            self.rank_magnitude.data = torch.ones_like(g).to(fp16)
+
+            # Mark scales as baked (skip normalization in forward)
+            self._scales_baked = True
+        else:
+            # Just convert existing indices
+            indices_fp16 = self._indices
+
+        # 4. Compute Q = lut[indices] in FP16
+        self._Q = lut_fp16[indices_fp16]
+
+        # Update LUT buffer
+        if hasattr(self, 'lut') and isinstance(self.lut, torch.Tensor):
+            if isinstance(self.lut, nn.Parameter):
+                self.lut.data = lut_fp16
+            else:
+                self.lut = lut_fp16
+
+        # Convert weight and bias to FP16
+        self.weight.data = self.weight.data.to(fp16)
+        if self.bias is not None:
+            self.bias.data = self.bias.data.to(fp16)
+
+        # Clear cached weight (force factored forward)
+        self._cached_weight_q = None
+
+    @torch.no_grad()
+    def convert_to_fp16(self):
+        """Convert all tensors to FP16 for FP16 training pipeline.
+
+        Use this BEFORE freeze_Q() to ensure indices are computed in FP16.
+        This ensures no precision mismatch between training and ANE inference.
+        """
+        fp16 = torch.float16
+        device = self.weight.device
+
+        # Convert weight and bias
+        self.weight.data = self.weight.data.to(fp16)
+        if self.bias is not None:
+            self.bias.data = self.bias.data.to(fp16)
+
+        # Convert scales
+        self.scale_A.data = self.scale_A.data.to(fp16)
+        self.scale_B.data = self.scale_B.data.to(fp16)
+        self.rank_magnitude.data = self.rank_magnitude.data.to(fp16)
+
+        # Recompute LUT in FP16
+        lut_fp16 = make_lut(
+            self.config.lut_size,
+            device=device,
+            dtype=fp16,
+            include_zero=self.config.lut_include_zero,
+        )
+
+        # Update LUT buffer
+        if isinstance(self.lut, nn.Parameter):
+            self.lut.data = lut_fp16
+        else:
+            self.lut = lut_fp16
+
+        # Recompute Q in FP16 (if already frozen)
+        if self._Q is not None:
+            self._Q = self.lut[self._indices]
+
+        # Clear cached weight
+        self._cached_weight_q = None
 
     @classmethod
     def from_linear(
@@ -608,4 +752,140 @@ def unfreeze_model_for_training_v2(model: nn.Module) -> int:
         if isinstance(module, AnemllQATLinearV2):
             module.unfreeze_for_training()
             count += 1
+    return count
+
+
+def set_factored_inference_v2(model: nn.Module, enabled: bool = True, verbose: bool = True) -> int:
+    """Set factored inference mode for all V2 layers.
+
+    Args:
+        model: The model containing V2 layers
+        enabled: If True, use rank-by-rank factored forward (ANE-friendly)
+                 If False, use single matmul with cached weights (faster PyTorch)
+        verbose: Print diagnostic information
+
+    Returns:
+        Number of layers updated
+    """
+    count = 0
+    for module in model.modules():
+        if isinstance(module, AnemllQATLinearV2):
+            module.use_factored_inference = enabled
+            count += 1
+
+    if verbose:
+        mode = "FACTORED (rank-by-rank)" if enabled else "SINGLE MATMUL (cached W_eff)"
+        print(f"[V2 Inference Mode] {mode}")
+        print(f"  Updated {count} layers")
+        if enabled:
+            print(f"  Forward: y = Σₖ gₖ · (aₖ ⊙ (Q @ (bₖ ⊙ x)))")
+            print(f"  No A @ B materialization in forward pass")
+        else:
+            print(f"  Forward: y = W_eff @ x  (W_eff = Q * scales, precomputed)")
+            print(f"  Faster but materializes full [out, in] weight")
+
+    return count
+
+
+def get_inference_mode_v2(model: nn.Module) -> dict:
+    """Get inference mode statistics for V2 layers.
+
+    Returns:
+        Dictionary with counts of layers in each mode
+    """
+    factored = 0
+    single_matmul = 0
+    has_cached = 0
+    has_Q = 0
+
+    for module in model.modules():
+        if isinstance(module, AnemllQATLinearV2):
+            if module.use_factored_inference:
+                factored += 1
+            else:
+                single_matmul += 1
+            if module._cached_weight_q is not None:
+                has_cached += 1
+            if module._Q is not None:
+                has_Q += 1
+
+    total = factored + single_matmul
+    return {
+        'total': total,
+        'factored': factored,
+        'single_matmul': single_matmul,
+        'has_cached_weights': has_cached,
+        'has_frozen_Q': has_Q,
+    }
+
+
+def snap_model_for_ane_v2(
+    model: nn.Module,
+    recompute_indices: bool = True,
+    verbose: bool = True,
+) -> int:
+    """Snap all V2 layers for ANE export in FP16 precision.
+
+    This converts the model to FP16 and recomputes quantization indices
+    to match ANE's FP16 precision, avoiding BF16/FP16 mismatch issues.
+
+    Args:
+        model: The model containing V2 layers
+        recompute_indices: If True, recompute indices in FP16 (recommended)
+        verbose: Print diagnostic information
+
+    Returns:
+        Number of layers snapped
+    """
+    count = 0
+    for name, module in model.named_modules():
+        if isinstance(module, AnemllQATLinearV2):
+            module.snap_for_ane(recompute_indices=recompute_indices)
+            count += 1
+            if verbose and count <= 3:
+                print(f"  [snap_ane] {name}")
+
+    if verbose:
+        print(f"\n[ANE FP16 Snap]")
+        print(f"  Snapped {count} V2 layers to FP16")
+        print(f"  Recomputed indices: {recompute_indices}")
+        print(f"  All weights, scales, LUT, Q now in FP16")
+
+    return count
+
+
+def convert_model_to_fp16_v2(model: nn.Module, verbose: bool = True) -> int:
+    """Convert all V2 layers to FP16 for FP16 training pipeline.
+
+    Use this BEFORE freeze_Q_all() to ensure indices are computed in FP16.
+    This is for training in FP16 from the start (not post-training conversion).
+
+    Pipeline:
+        1. Load model in FP16
+        2. replace_linear_with_anemll_v2()
+        3. convert_model_to_fp16_v2()  <-- ensures LUT is FP16
+        4. freeze_Q_all()               <-- indices computed in FP16
+        5. train_e2e(use_fp16=True)
+
+    Args:
+        model: The model containing V2 layers
+        verbose: Print diagnostic information
+
+    Returns:
+        Number of layers converted
+    """
+    count = 0
+    for name, module in model.named_modules():
+        if isinstance(module, AnemllQATLinearV2):
+            module.convert_to_fp16()
+            count += 1
+            if verbose and count <= 3:
+                print(f"  [fp16] {name}")
+
+    if verbose:
+        print(f"\n[FP16 Conversion]")
+        print(f"  Converted {count} V2 layers to FP16")
+        print(f"  LUT, weights, scales all in FP16")
+        print(f"  Ready for FP16 training pipeline")
+
     return count
