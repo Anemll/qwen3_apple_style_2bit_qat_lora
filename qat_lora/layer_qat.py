@@ -1180,16 +1180,24 @@ def train_e2e(
 
     t_start = time.time()
 
-    # Setup GradScaler for FP16 training (CUDA only)
+    # Setup for FP16 training
+    # GradScaler is only used for mixed precision (FP32 model + FP16 compute)
+    # When model is already FP16, we skip GradScaler (it can't unscale FP16 gradients)
     scaler = None
+    model_dtype = next(model.parameters()).dtype
     if use_fp16:
-        if device.type == 'cuda':
-            scaler = torch.cuda.amp.GradScaler()
+        if device.type == 'cuda' and model_dtype != torch.float16:
+            # Mixed precision: model in FP32/BF16, use GradScaler for stability
+            scaler = torch.amp.GradScaler('cuda')
             if verbose:
-                print("[FP16] Using GradScaler for CUDA FP16 training")
+                print(f"[FP16] Mixed precision: model={model_dtype}, using GradScaler")
+        elif device.type == 'cuda':
+            # Pure FP16: model already in FP16, GradScaler not needed
+            if verbose:
+                print(f"[FP16] Pure FP16 training: model already {model_dtype}, no GradScaler")
         else:
             if verbose:
-                print(f"[FP16] Warning: GradScaler not supported on {device.type}, using FP16 without scaling")
+                print(f"[FP16] Warning: FP16 training on {device.type} without GradScaler")
 
     # Set trainable parameters
     trainable = 0
