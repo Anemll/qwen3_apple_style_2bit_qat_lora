@@ -29,6 +29,7 @@ def main():
     parser = argparse.ArgumentParser(description='V2 STE-FP16 Training (Simple)')
     parser.add_argument('--v1-checkpoint', type=str, default=None, help='V1 checkpoint (for V1->V2 conversion)')
     parser.add_argument('--v2-checkpoint', type=str, default=None, help='V2 checkpoint (skip conversion, load directly)')
+    parser.add_argument('--from-scratch', action='store_true', help='Train V2 from scratch (no V1, random init)')
     parser.add_argument('--cache-dir', type=str, required=True)
     parser.add_argument('--output-dir', type=str, default='runs/v2_output')
     parser.add_argument('--model-id', type=str, default='Qwen/Qwen3-0.6B')
@@ -41,19 +42,23 @@ def main():
     parser.add_argument('--mlp-only', action='store_true', help='Train only MLP layers, freeze attention')
     args = parser.parse_args()
 
-    # Validate inputs - need either v1 or v2 checkpoint
+    # Validate inputs - need v1, v2 checkpoint, or from-scratch
     if args.v2_checkpoint:
         assert os.path.exists(args.v2_checkpoint), f"V2 checkpoint not found: {args.v2_checkpoint}"
     elif args.v1_checkpoint:
         assert os.path.exists(args.v1_checkpoint), f"V1 checkpoint not found: {args.v1_checkpoint}"
+    elif args.from_scratch:
+        pass  # No checkpoint needed
     else:
-        raise ValueError("Must specify either --v1-checkpoint or --v2-checkpoint")
+        raise ValueError("Must specify --v1-checkpoint, --v2-checkpoint, or --from-scratch")
     assert os.path.exists(args.cache_dir), f"Cache dir not found: {args.cache_dir}"
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     if args.v2_checkpoint:
         print(f"V2 checkpoint: {args.v2_checkpoint}")
+    elif args.from_scratch:
+        print("Mode: FROM SCRATCH (no V1)")
     else:
         print(f"V1 checkpoint: {args.v1_checkpoint}")
     print(f"Cache dir: {args.cache_dir}")
@@ -136,6 +141,55 @@ def main():
         print("  Moving to GPU...", end=" ", flush=True)
         v2_model.to(device)
         print(f"done ({time.time()-t0:.1f}s)")
+
+    elif args.from_scratch:
+        # Train V2 from scratch (no V1)
+        print("\n[1/2] Creating V2 model from scratch...")
+
+        t0 = time.time()
+        print("  Loading base model...", end=" ", flush=True)
+        v2_model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            torch_dtype=torch.float32,  # FP32 master weights
+            trust_remote_code=True,
+        )
+        print(f"done ({time.time()-t0:.1f}s)")
+
+        t0 = time.time()
+        print("  Replacing with V2 layers...", end=" ", flush=True)
+        v2_mlp_config = AnemllQuantConfigV2(
+            lut_size=MLP_LUT_SIZE,
+            scale_rank=MLP_RANK,
+            force_positive_scales=False,
+            magnitude_activation='identity',
+            use_ste_fp16=True,
+        )
+        v2_attn_config = AnemllQuantConfigV2(
+            lut_size=ATTN_LUT_SIZE,
+            scale_rank=ATTN_RANK,
+            force_positive_scales=False,
+            magnitude_activation='identity',
+            use_ste_fp16=True,
+        )
+
+        replace_linear_with_anemll_v2(
+            v2_model,
+            mlp_config=v2_mlp_config,
+            attn_config=v2_attn_config,
+            quantize_attn=True,
+            quantize_lm_head=False,
+        )
+        print(f"done ({time.time()-t0:.1f}s)")
+
+        t0 = time.time()
+        print("  Moving to GPU...", end=" ", flush=True)
+        v2_model.to(device)
+        print(f"done ({time.time()-t0:.1f}s)")
+
+        # Save initial state
+        initial_path = f"{args.output_dir}/v2_scratch_initial.pt"
+        torch.save(v2_model.state_dict(), initial_path)
+        print(f"  Saved initial V2 to {initial_path}")
 
     else:
         # V1 -> V2 conversion
