@@ -241,7 +241,18 @@ def main():
     # =========================================================================
     print("\n[2/3] Training with STE-FP16..." if args.v2_checkpoint else "\n[3/4] Training with STE-FP16...")
 
-    freeze_Q_all(v2_model)
+    # Skip freeze_Q if loading V2 checkpoint (Q already in saved state)
+    if args.v2_checkpoint:
+        # Check if _Q is already loaded from checkpoint
+        has_Q = any(hasattr(m, '_Q') and m._Q is not None
+                    for m in v2_model.modules() if hasattr(m, '_Q'))
+        if has_Q:
+            print("  (Using Q from checkpoint, skipping freeze_Q)")
+        else:
+            print("  (No Q in checkpoint, running freeze_Q)")
+            freeze_Q_all(v2_model)
+    else:
+        freeze_Q_all(v2_model)
     # train_e2e handles requires_grad based on train_scales, train_g_only, train_mlp_only
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
