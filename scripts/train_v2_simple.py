@@ -85,16 +85,23 @@ def main():
     # =========================================================================
     os.makedirs(args.output_dir, exist_ok=True)
 
+    import time
+
     if args.v2_checkpoint:
         # Direct V2 load (skip conversion)
         print("\n[1/3] Loading V2 checkpoint directly...")
 
+        t0 = time.time()
+        print("  Loading base model...", end=" ", flush=True)
         v2_model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
             torch_dtype=torch.float32,  # FP32 master weights
             trust_remote_code=True,
         )
+        print(f"done ({time.time()-t0:.1f}s)")
 
+        t0 = time.time()
+        print("  Replacing with V2 layers...", end=" ", flush=True)
         v2_mlp_config = AnemllQuantConfigV2(
             lut_size=MLP_LUT_SIZE,
             scale_rank=MLP_RANK,
@@ -117,11 +124,18 @@ def main():
             quantize_attn=True,
             quantize_lm_head=False,
         )
+        print(f"done ({time.time()-t0:.1f}s)")
 
+        t0 = time.time()
+        print(f"  Loading checkpoint ({args.v2_checkpoint})...", end=" ", flush=True)
         state_dict = torch.load(args.v2_checkpoint, map_location='cpu')
         v2_model.load_state_dict(state_dict, strict=False)
+        print(f"done ({time.time()-t0:.1f}s)")
+
+        t0 = time.time()
+        print("  Moving to GPU...", end=" ", flush=True)
         v2_model.to(device)
-        print(f"  Loaded V2 from {args.v2_checkpoint}")
+        print(f"done ({time.time()-t0:.1f}s)")
 
     else:
         # V1 -> V2 conversion
