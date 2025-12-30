@@ -27,7 +27,8 @@ from transformers import AutoModelForCausalLM
 
 def main():
     parser = argparse.ArgumentParser(description='V2 STE-FP16 Training (Simple)')
-    parser.add_argument('--v1-checkpoint', type=str, required=True)
+    parser.add_argument('--v1-checkpoint', type=str, default=None, help='V1 checkpoint (for V1->V2 conversion)')
+    parser.add_argument('--v2-checkpoint', type=str, default=None, help='V2 checkpoint (skip conversion, load directly)')
     parser.add_argument('--cache-dir', type=str, required=True)
     parser.add_argument('--output-dir', type=str, default='runs/v2_output')
     parser.add_argument('--model-id', type=str, default='Qwen/Qwen3-0.6B')
@@ -40,13 +41,21 @@ def main():
     parser.add_argument('--mlp-only', action='store_true', help='Train only MLP layers, freeze attention')
     args = parser.parse_args()
 
-    # Validate inputs
-    assert os.path.exists(args.v1_checkpoint), f"V1 checkpoint not found: {args.v1_checkpoint}"
+    # Validate inputs - need either v1 or v2 checkpoint
+    if args.v2_checkpoint:
+        assert os.path.exists(args.v2_checkpoint), f"V2 checkpoint not found: {args.v2_checkpoint}"
+    elif args.v1_checkpoint:
+        assert os.path.exists(args.v1_checkpoint), f"V1 checkpoint not found: {args.v1_checkpoint}"
+    else:
+        raise ValueError("Must specify either --v1-checkpoint or --v2-checkpoint")
     assert os.path.exists(args.cache_dir), f"Cache dir not found: {args.cache_dir}"
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
-    print(f"V1 checkpoint: {args.v1_checkpoint}")
+    if args.v2_checkpoint:
+        print(f"V2 checkpoint: {args.v2_checkpoint}")
+    else:
+        print(f"V1 checkpoint: {args.v1_checkpoint}")
     print(f"Cache dir: {args.cache_dir}")
 
     # Q2_A4 config (hardcoded for simplicity)
@@ -72,106 +81,145 @@ def main():
     from qat_lora.ane_qat_linear_v2 import AnemllQATLinearV2
 
     # =========================================================================
-    # STEP 1: Load V1 checkpoint
+    # Load model (V2 checkpoint OR V1->V2 conversion)
     # =========================================================================
-    print("\n[1/4] Loading V1 checkpoint...")
-
-    v1_model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        torch_dtype=torch.float16,
-        trust_remote_code=True,
-    )
-
-    v1_mlp_config = AnemllQuantConfig(lut_size=MLP_LUT_SIZE, scale_rank=MLP_RANK)
-    v1_attn_config = AnemllQuantConfig(lut_size=ATTN_LUT_SIZE, scale_rank=ATTN_RANK)
-
-    replace_linear_with_anemll(
-        v1_model,
-        mlp_config=v1_mlp_config,
-        attn_config=v1_attn_config,
-        quantize_attn=True,
-        quantize_lm_head=False,
-    )
-
-    state_dict = torch.load(args.v1_checkpoint, map_location='cpu')
-    v1_model.load_state_dict(state_dict, strict=False)
-    v1_model.to(device)
-    print("  V1 model loaded")
-
-    # =========================================================================
-    # STEP 2: Create V2 model and convert
-    # =========================================================================
-    print("\n[2/4] Creating V2 model...")
-
-    v2_model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        torch_dtype=torch.float32,  # FP32 master weights
-        trust_remote_code=True,
-    )
-
-    v2_mlp_config = AnemllQuantConfigV2(
-        lut_size=MLP_LUT_SIZE,
-        scale_rank=MLP_RANK,
-        force_positive_scales=False,
-        magnitude_activation='identity',
-        use_ste_fp16=True,
-    )
-    v2_attn_config = AnemllQuantConfigV2(
-        lut_size=ATTN_LUT_SIZE,
-        scale_rank=ATTN_RANK,
-        force_positive_scales=False,
-        magnitude_activation='identity',
-        use_ste_fp16=True,
-    )
-
-    replace_linear_with_anemll_v2(
-        v2_model,
-        mlp_config=v2_mlp_config,
-        attn_config=v2_attn_config,
-        quantize_attn=True,
-        quantize_lm_head=False,
-    )
-
-    # Convert V1 -> V2 (preserve V1 factorization via norms, not SVD)
-    print("  Converting V1 -> V2...")
-    converted = 0
-    for (name_v1, m_v1), (name_v2, m_v2) in zip(
-        v1_model.named_modules(), v2_model.named_modules()
-    ):
-        if isinstance(m_v1, AnemllQATLinear) and isinstance(m_v2, AnemllQATLinearV2):
-            m_v2.lut.data.copy_(m_v1.lut.data.float())
-            m_v2.weight.data.copy_(m_v1.weight.data.float())
-
-            # Preserve V1 factorization (norm-based, not SVD)
-            A = m_v1.scale_A.float()  # [out, rank]
-            B = m_v1.scale_B[:, :m_v1.in_features].float()  # [rank, in] - handle padding
-
-            A_norms = A.norm(dim=0, keepdim=True).clamp(min=1e-6)  # [1, rank]
-            B_norms = B.norm(dim=1, keepdim=True).clamp(min=1e-6)  # [rank, 1]
-
-            A_dir = A / A_norms  # unit-norm columns
-            B_dir = B / B_norms  # unit-norm rows
-            magnitude = (A_norms.squeeze() * B_norms.squeeze())  # [rank]
-
-            m_v2.scale_A.data.copy_(A_dir)
-            m_v2.scale_B.data.copy_(B_dir)
-            m_v2.rank_magnitude.data.copy_(magnitude)
-            converted += 1
-
-    print(f"  Converted {converted} layers")
-
-    # Free V1
-    del v1_model
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    v2_model.to(device)
-
-    # Save initial V2 state (before training)
-    initial_path = f"{args.output_dir}/v2_initial.pt"
     os.makedirs(args.output_dir, exist_ok=True)
-    torch.save(v2_model.state_dict(), initial_path)
-    print(f"  Saved initial V2 to {initial_path}")
+
+    if args.v2_checkpoint:
+        # Direct V2 load (skip conversion)
+        print("\n[1/3] Loading V2 checkpoint directly...")
+
+        v2_model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            torch_dtype=torch.float32,  # FP32 master weights
+            trust_remote_code=True,
+        )
+
+        v2_mlp_config = AnemllQuantConfigV2(
+            lut_size=MLP_LUT_SIZE,
+            scale_rank=MLP_RANK,
+            force_positive_scales=False,
+            magnitude_activation='identity',
+            use_ste_fp16=True,
+        )
+        v2_attn_config = AnemllQuantConfigV2(
+            lut_size=ATTN_LUT_SIZE,
+            scale_rank=ATTN_RANK,
+            force_positive_scales=False,
+            magnitude_activation='identity',
+            use_ste_fp16=True,
+        )
+
+        replace_linear_with_anemll_v2(
+            v2_model,
+            mlp_config=v2_mlp_config,
+            attn_config=v2_attn_config,
+            quantize_attn=True,
+            quantize_lm_head=False,
+        )
+
+        state_dict = torch.load(args.v2_checkpoint, map_location='cpu')
+        v2_model.load_state_dict(state_dict, strict=False)
+        v2_model.to(device)
+        print(f"  Loaded V2 from {args.v2_checkpoint}")
+
+    else:
+        # V1 -> V2 conversion
+        print("\n[1/4] Loading V1 checkpoint...")
+
+        v1_model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+        )
+
+        v1_mlp_config = AnemllQuantConfig(lut_size=MLP_LUT_SIZE, scale_rank=MLP_RANK)
+        v1_attn_config = AnemllQuantConfig(lut_size=ATTN_LUT_SIZE, scale_rank=ATTN_RANK)
+
+        replace_linear_with_anemll(
+            v1_model,
+            mlp_config=v1_mlp_config,
+            attn_config=v1_attn_config,
+            quantize_attn=True,
+            quantize_lm_head=False,
+        )
+
+        state_dict = torch.load(args.v1_checkpoint, map_location='cpu')
+        v1_model.load_state_dict(state_dict, strict=False)
+        v1_model.to(device)
+        print("  V1 model loaded")
+
+        # Create V2 model and convert
+        print("\n[2/4] Creating V2 model...")
+
+        v2_model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            torch_dtype=torch.float32,  # FP32 master weights
+            trust_remote_code=True,
+        )
+
+        v2_mlp_config = AnemllQuantConfigV2(
+            lut_size=MLP_LUT_SIZE,
+            scale_rank=MLP_RANK,
+            force_positive_scales=False,
+            magnitude_activation='identity',
+            use_ste_fp16=True,
+        )
+        v2_attn_config = AnemllQuantConfigV2(
+            lut_size=ATTN_LUT_SIZE,
+            scale_rank=ATTN_RANK,
+            force_positive_scales=False,
+            magnitude_activation='identity',
+            use_ste_fp16=True,
+        )
+
+        replace_linear_with_anemll_v2(
+            v2_model,
+            mlp_config=v2_mlp_config,
+            attn_config=v2_attn_config,
+            quantize_attn=True,
+            quantize_lm_head=False,
+        )
+
+        # Convert V1 -> V2 (preserve V1 factorization via norms, not SVD)
+        print("  Converting V1 -> V2...")
+        converted = 0
+        for (name_v1, m_v1), (name_v2, m_v2) in zip(
+            v1_model.named_modules(), v2_model.named_modules()
+        ):
+            if isinstance(m_v1, AnemllQATLinear) and isinstance(m_v2, AnemllQATLinearV2):
+                m_v2.lut.data.copy_(m_v1.lut.data.float())
+                m_v2.weight.data.copy_(m_v1.weight.data.float())
+
+                # Preserve V1 factorization (norm-based, not SVD)
+                A = m_v1.scale_A.float()  # [out, rank]
+                B = m_v1.scale_B[:, :m_v1.in_features].float()  # [rank, in] - handle padding
+
+                A_norms = A.norm(dim=0, keepdim=True).clamp(min=1e-6)  # [1, rank]
+                B_norms = B.norm(dim=1, keepdim=True).clamp(min=1e-6)  # [rank, 1]
+
+                A_dir = A / A_norms  # unit-norm columns
+                B_dir = B / B_norms  # unit-norm rows
+                magnitude = (A_norms.squeeze() * B_norms.squeeze())  # [rank]
+
+                m_v2.scale_A.data.copy_(A_dir)
+                m_v2.scale_B.data.copy_(B_dir)
+                m_v2.rank_magnitude.data.copy_(magnitude)
+                converted += 1
+
+        print(f"  Converted {converted} layers")
+
+        # Free V1
+        del v1_model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        v2_model.to(device)
+
+        # Save initial V2 state (before training)
+        initial_path = f"{args.output_dir}/v2_initial.pt"
+        torch.save(v2_model.state_dict(), initial_path)
+        print(f"  Saved initial V2 to {initial_path}")
 
     # =========================================================================
     # STEP 3: Freeze Q and train
