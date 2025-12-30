@@ -1131,6 +1131,7 @@ def train_e2e(
     temperature: float = 2.0,
     train_weights: bool = True,
     train_scales: bool = False,
+    train_g_only: bool = False,
     train_mlp_only: bool = False,
     hard_top1_weight: float = 0.0,
     hard_full_weight: float = 0.0005,
@@ -1155,7 +1156,8 @@ def train_e2e(
         lr: Learning rate (peak LR if using schedule)
         temperature: Distillation temperature
         train_weights: If True, train weight parameters
-        train_scales: If True, train scale_A/scale_B parameters
+        train_scales: If True, train scale_A/scale_B/rank_magnitude parameters
+        train_g_only: If True, train only rank_magnitude (G), freeze A and B (requires train_scales=True)
         train_mlp_only: If True, freeze attention layers (q/k/v/o_proj) and only train MLP
                         (gate/up/down_proj). Useful for mixed-bit configs (e.g., 4-bit attn, 2-bit MLP)
         hard_top1_weight: Weight for hard label top-1 loss (0 to disable)
@@ -1228,9 +1230,10 @@ def train_e2e(
                 trainable += module.weight.numel()
             if train_scales:
                 if hasattr(module, 'scale_A') and module.scale_A is not None:
-                    module.scale_A.requires_grad = True
-                    module.scale_B.requires_grad = True
-                    trainable += module.scale_A.numel() + module.scale_B.numel()
+                    if not train_g_only:  # Only train A/B if not G-only mode
+                        module.scale_A.requires_grad = True
+                        module.scale_B.requires_grad = True
+                        trainable += module.scale_A.numel() + module.scale_B.numel()
                 # V2 has rank_magnitude
                 if hasattr(module, 'rank_magnitude') and module.rank_magnitude is not None:
                     module.rank_magnitude.requires_grad = True
@@ -1241,7 +1244,10 @@ def train_e2e(
     if train_weights:
         mode_parts.append("weights")
     if train_scales:
-        mode_parts.append("scales")
+        if train_g_only:
+            mode_parts.append("G-only")
+        else:
+            mode_parts.append("scales")
     mode = "+".join(mode_parts) if mode_parts else "none"
     if train_mlp_only:
         mode += " (MLP only)"

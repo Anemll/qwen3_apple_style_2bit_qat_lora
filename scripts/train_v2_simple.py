@@ -179,42 +179,8 @@ def main():
     print("\n[3/4] Training with STE-FP16...")
 
     freeze_Q_all(v2_model)
+    # train_e2e handles requires_grad based on train_scales, train_g_only, train_mlp_only
 
-    # Configure which parameters to train
-    mode_str = ""
-    for name, module in v2_model.named_modules():
-        if type(module).__name__ == 'AnemllQATLinearV2':
-            is_mlp = '.mlp.' in name
-
-            # Apply --mlp-only filter
-            train_this = is_mlp if args.mlp_only else True
-
-            if args.g_only:
-                # G-only: freeze A and B, train only magnitude
-                module.scale_A.requires_grad = False
-                module.scale_B.requires_grad = False
-                module.rank_magnitude.requires_grad = train_this
-            else:
-                # Default: train all scales
-                module.scale_A.requires_grad = train_this
-                module.scale_B.requires_grad = train_this
-                module.rank_magnitude.requires_grad = train_this
-
-            module.weight.requires_grad = False
-
-    # Build mode string
-    if args.g_only:
-        mode_str = "G-only"
-    else:
-        mode_str = "All scales"
-    if args.mlp_only:
-        mode_str += " (MLP only)"
-
-    trainable = sum(p.numel() for p in v2_model.parameters() if p.requires_grad)
-    print(f"  Mode: {mode_str}")
-    print(f"  Trainable params: {trainable:,}")
-
-    os.makedirs(args.output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     result = train_e2e(
@@ -229,6 +195,8 @@ def main():
         temperature=2.0,
         train_weights=False,
         train_scales=True,
+        train_g_only=args.g_only,
+        train_mlp_only=args.mlp_only,
         hard_top1_weight=args.hard_top1,
         hard_full_weight=args.hard_full,
         logging_steps=20,
