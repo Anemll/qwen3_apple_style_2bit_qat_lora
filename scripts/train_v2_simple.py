@@ -33,7 +33,7 @@ def main():
     parser.add_argument('--model-id', type=str, default='Qwen/Qwen3-0.6B')
     parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--max-steps', type=int, default=1000)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--lr', type=float, default=5e-5)  # Lower LR for stability
     parser.add_argument('--hard-top1', type=float, default=0.2, help='Hard label top-1 weight')
     parser.add_argument('--hard-full', type=float, default=0.00005, help='Hard label full vocab weight')
     args = parser.parse_args()
@@ -130,7 +130,7 @@ def main():
         quantize_lm_head=False,
     )
 
-    # Convert V1 -> V2
+    # Convert V1 -> V2 (preserve V1 factorization via norms, not SVD)
     print("  Converting V1 -> V2...")
     converted = 0
     for (name_v1, m_v1), (name_v2, m_v2) in zip(
@@ -140,14 +140,20 @@ def main():
             m_v2.lut.data.copy_(m_v1.lut.data.float())
             m_v2.weight.data.copy_(m_v1.weight.data.float())
 
-            # Convert scales via SVD
-            S = (m_v1.scale_A @ m_v1.scale_B).float()
-            U, s, Vh = torch.linalg.svd(S, full_matrices=False)
-            rank = m_v2.scale_rank
+            # Preserve V1 factorization (norm-based, not SVD)
+            A = m_v1.scale_A.float()  # [out, rank]
+            B = m_v1.scale_B[:, :m_v1.in_features].float()  # [rank, in] - handle padding
 
-            m_v2.scale_A.data.copy_(U[:, :rank])
-            m_v2.scale_B.data.copy_(Vh[:rank, :])
-            m_v2.rank_magnitude.data.copy_(s[:rank])
+            A_norms = A.norm(dim=0, keepdim=True).clamp(min=1e-6)  # [1, rank]
+            B_norms = B.norm(dim=1, keepdim=True).clamp(min=1e-6)  # [rank, 1]
+
+            A_dir = A / A_norms  # unit-norm columns
+            B_dir = B / B_norms  # unit-norm rows
+            magnitude = (A_norms.squeeze() * B_norms.squeeze())  # [rank]
+
+            m_v2.scale_A.data.copy_(A_dir)
+            m_v2.scale_B.data.copy_(B_dir)
+            m_v2.rank_magnitude.data.copy_(magnitude)
             converted += 1
 
     print(f"  Converted {converted} layers")
