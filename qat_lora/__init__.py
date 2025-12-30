@@ -23,6 +23,7 @@ from .ane_qat_linear_v2 import (
     get_inference_mode_v2,
     snap_model_for_ane_v2,
     convert_model_to_fp16_v2,
+    load_v2_checkpoint,  # Proper loading with _Q and _indices
     ste_fp16,  # STE-FP16 rounding for ANE-matching training
 )
 from .layer_qat import (
@@ -63,6 +64,7 @@ __all__ = [
     'get_inference_mode_v2',
     'snap_model_for_ane_v2',
     'convert_model_to_fp16_v2',
+    'load_v2_checkpoint',
     'ste_fp16',
     # Training utilities
     'compute_kd_loss_batch',

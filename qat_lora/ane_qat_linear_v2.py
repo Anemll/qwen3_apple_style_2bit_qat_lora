@@ -955,3 +955,86 @@ def convert_model_to_fp16_v2(model: nn.Module, verbose: bool = True) -> int:
         print(f"  Ready for FP16 training pipeline")
 
     return count
+
+
+def load_v2_checkpoint(
+    model: nn.Module,
+    checkpoint_path: str,
+    device: Optional[torch.device] = None,
+    verbose: bool = True,
+) -> dict:
+    """Load a V2 checkpoint with proper handling of _Q and _indices buffers.
+
+    PyTorch's load_state_dict doesn't load tensors into None buffers.
+    This function pre-registers the buffers with correct shapes before loading.
+
+    Args:
+        model: Model with V2 layers (after replace_linear_with_anemll_v2)
+        checkpoint_path: Path to the checkpoint file
+        device: Device to load to (default: CPU)
+        verbose: Print loading statistics
+
+    Returns:
+        Dictionary with loading statistics
+    """
+    device = device or torch.device('cpu')
+
+    # Load checkpoint
+    state_dict = torch.load(checkpoint_path, map_location='cpu')
+
+    # Find V2 layers and pre-register buffers with correct shapes
+    v2_layers = {}
+    for name, module in model.named_modules():
+        if isinstance(module, AnemllQATLinearV2):
+            v2_layers[name] = module
+
+    # Check for _Q and _indices in checkpoint and pre-register them
+    q_loaded = 0
+    indices_loaded = 0
+
+    for name, module in v2_layers.items():
+        # Look for _Q key
+        q_key = f"{name}._Q"
+        if q_key in state_dict:
+            q_tensor = state_dict[q_key]
+            # Re-register buffer with actual tensor (not None)
+            module.register_buffer("_Q", q_tensor.to(device))
+            q_loaded += 1
+
+        # Look for _indices key
+        indices_key = f"{name}._indices"
+        if indices_key in state_dict:
+            indices_tensor = state_dict[indices_key]
+            module.register_buffer("_indices", indices_tensor.to(device))
+            indices_loaded += 1
+
+    # Now load the rest of the state dict
+    result = model.load_state_dict(state_dict, strict=False)
+
+    # Move to device
+    model.to(device)
+
+    stats = {
+        'v2_layers': len(v2_layers),
+        'q_loaded': q_loaded,
+        'indices_loaded': indices_loaded,
+        'missing_keys': len(result.missing_keys),
+        'unexpected_keys': len(result.unexpected_keys),
+    }
+
+    if verbose:
+        print(f"\n[V2 Checkpoint Loaded]")
+        print(f"  V2 layers: {stats['v2_layers']}")
+        print(f"  _Q loaded: {stats['q_loaded']}")
+        print(f"  _indices loaded: {stats['indices_loaded']}")
+        print(f"  Missing keys: {stats['missing_keys']}")
+        # Unexpected should be 0 now since we pre-loaded _Q and _indices
+        remaining_unexpected = stats['unexpected_keys'] - (q_loaded + indices_loaded)
+        print(f"  Unexpected keys (other): {max(0, remaining_unexpected)}")
+
+        if stats['q_loaded'] == stats['v2_layers']:
+            print(f"  Ready for inference (no freeze_Q needed)")
+        else:
+            print(f"  Call freeze_Q_all() before inference")
+
+    return stats
