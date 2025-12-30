@@ -49,6 +49,12 @@ class AnemllQuantConfigV2:
     magnitude_activation: str = "softplus"  # "identity" | "abs" | "softplus"
     magnitude_eps: float = 1e-6
 
+    # FP16-safe epsilon for normalization (1e-8 underflows in FP16)
+    norm_eps: float = 1e-6
+
+    # STE-FP16: Apply FP16 rounding in forward with FP32 gradients (for ANE matching)
+    use_ste_fp16: bool = False
+
     @property
     def lut_bits(self) -> int:
         return int(math.ceil(math.log2(self.lut_size)))
@@ -98,6 +104,33 @@ def quantize_to_lut_indices(
     y_pos = (x / step_pos) + half
     y = torch.where(x < 0, y_neg, y_pos)
     return torch.round(y).long().clamp(0, lut_size - 1)
+
+
+# =============================================================================
+# STE-FP16 UTILITIES
+# =============================================================================
+
+def ste_fp16(x: torch.Tensor) -> torch.Tensor:
+    """Straight-through estimator for FP16 rounding.
+
+    Forward: Rounds x to FP16 precision (matches ANE behavior).
+    Backward: Identity gradient (passes through as if no rounding).
+
+    This allows training with FP32 master weights while the forward pass
+    matches what ANE will actually execute in FP16.
+
+    Args:
+        x: Input tensor (any dtype)
+
+    Returns:
+        Tensor with FP16-rounded values but same dtype as input.
+        Gradients flow through unchanged.
+    """
+    if x.dtype == torch.float16:
+        return x  # Already FP16, no rounding needed
+    x16 = x.to(torch.float16)
+    # STE: forward uses x16 values, backward pretends this is identity
+    return x + (x16.to(x.dtype) - x).detach()
 
 
 # =============================================================================
@@ -264,7 +297,8 @@ class AnemllQATLinearV2(nn.Module):
         if getattr(self, '_scales_baked', False):
             return self.scale_A, self.scale_B, self.rank_magnitude
 
-        eps = 1e-8
+        # Use config-driven eps (1e-6 is FP16-safe, 1e-8 underflows in FP16)
+        eps = getattr(self.config, 'norm_eps', 1e-6)
 
         # Start from raw params
         A = self.scale_A
@@ -319,8 +353,9 @@ class AnemllQATLinearV2(nn.Module):
         # so S is guaranteed >= 0. No clamp needed.
         if getattr(self.config, "force_positive_scales", False):
             return S
-        # Fallback clamp only when scales can go negative
-        return S.clamp(min=1e-8)
+        # Fallback clamp only when scales can go negative (use FP16-safe eps)
+        eps = getattr(self.config, 'norm_eps', 1e-6)
+        return S.clamp(min=eps)
 
     @torch.no_grad()
     def freeze_Q(self):
@@ -408,16 +443,32 @@ class AnemllQATLinearV2(nn.Module):
         g: torch.Tensor,
         Q: torch.Tensor,
     ) -> torch.Tensor:
-        """Loop-based rank-by-rank forward (better for training)."""
+        """Loop-based rank-by-rank forward (better for training).
+
+        When use_ste_fp16=True, applies FP16 rounding at each step with
+        straight-through gradients. This makes the forward pass match ANE's
+        FP16 behavior while keeping FP32 gradients for stable training.
+        """
+        use_ste = getattr(self.config, 'use_ste_fp16', False)
         y = torch.zeros(*x.shape[:-1], self.out_features, device=x.device, dtype=x.dtype)
 
         for k in range(self.scale_rank):
             b_k = B_dir[k, :].to(x.dtype)  # [in]
             a_k = (g[k] * A_dir[:, k]).to(x.dtype)  # [out]
 
+            # Apply STE-FP16 to scale vectors
+            if use_ste:
+                b_k = ste_fp16(b_k)
+                a_k = ste_fp16(a_k)
+
             # Q @ (b_k * x)
             scaled_x = x * b_k  # [..., in]
+            if use_ste:
+                scaled_x = ste_fp16(scaled_x)
+
             Qx = F.linear(scaled_x, Q)  # [..., out]
+            if use_ste:
+                Qx = ste_fp16(Qx)
 
             # Accumulate with a_k weighting
             y = y + a_k * Qx  # [..., out]
@@ -432,20 +483,35 @@ class AnemllQATLinearV2(nn.Module):
         g: torch.Tensor,
         Q: torch.Tensor,
     ) -> torch.Tensor:
-        """Batched rank-by-rank forward (fewer ops for CoreML)."""
+        """Batched rank-by-rank forward (fewer ops for CoreML).
+
+        When use_ste_fp16=True, applies FP16 rounding at key steps with
+        straight-through gradients.
+        """
+        use_ste = getattr(self.config, 'use_ste_fp16', False)
+
         # Stack all b_k: [rank, in]
         B = B_dir.to(x.dtype)
 
         # Stack all a_k with magnitudes: [rank, out]
         A = (A_dir * g).T.to(x.dtype)  # [rank, out]
 
+        # Apply STE-FP16 to scale matrices
+        if use_ste:
+            B = ste_fp16(B)
+            A = ste_fp16(A)
+
         # Compute all scaled inputs at once
         # x: [..., in], B: [rank, in] -> X_rank: [..., rank, in]
         X_rank = x.unsqueeze(-2) * B  # [..., rank, in]
+        if use_ste:
+            X_rank = ste_fp16(X_rank)
 
         # Apply Q to each rank's scaled input
         # Q: [out, in] -> Y_rank: [..., rank, out]
         Y_rank = torch.einsum('...ri,oi->...ro', X_rank, Q)  # [..., rank, out]
+        if use_ste:
+            Y_rank = ste_fp16(Y_rank)
 
         # Weight by A and sum over ranks
         # A: [rank, out] -> y: [..., out]
