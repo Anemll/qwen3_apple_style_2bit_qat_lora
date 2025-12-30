@@ -1332,10 +1332,15 @@ def train_e2e(
             # Backward pass with optional scaler for FP16
             if scaler is not None:
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                # Gradient clipping for FP16 stability
+                if use_fp16:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
             if scheduler is not None:
