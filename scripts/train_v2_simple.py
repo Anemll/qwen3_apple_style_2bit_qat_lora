@@ -159,6 +159,12 @@ def main():
 
     v2_model.to(device)
 
+    # Save initial V2 state (before training)
+    initial_path = f"{args.output_dir}/v2_initial.pt"
+    os.makedirs(args.output_dir, exist_ok=True)
+    torch.save(v2_model.state_dict(), initial_path)
+    print(f"  Saved initial V2 to {initial_path}")
+
     # =========================================================================
     # STEP 3: Freeze Q and train
     # =========================================================================
