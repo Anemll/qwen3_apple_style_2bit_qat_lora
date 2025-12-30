@@ -227,7 +227,7 @@ class AnemllQATLinearV2(nn.Module):
 
         # Use batched forward (for CoreML) or loop (for PyTorch training)
         # Auto-enable batched for high rank to reduce STE calls (4*rank -> 4)
-        self.use_batched_forward = scale_rank >= 16
+        self.use_batched_forward = self.scale_rank >= 16
 
         # V2 defaults to factored inference (rank-by-rank) for ANE compatibility
         # Set to False for faster PyTorch inference (single matmul)
