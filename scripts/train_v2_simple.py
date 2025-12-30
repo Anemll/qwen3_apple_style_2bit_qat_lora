@@ -219,13 +219,24 @@ def main():
             # --- LUT ---
             m2.lut.data.copy_(m1.lut.data.float())
 
-            # --- Scales: use V1 get_scales() (includes clamp) ---
-            S = m1.get_scales().float()[:, :m2.in_features]  # [out, in]
-            U, s, Vh = torch.linalg.svd(S, full_matrices=False)
-            r = m2.scale_rank
-            m2.scale_A.data.copy_(U[:, :r])
-            m2.scale_B.data.copy_(Vh[:r, :])
-            m2.rank_magnitude.data.copy_(s[:r])
+            # --- Scales: preserve V1 factorization (norm-based, not SVD) ---
+            # SVD re-factors and loses information; norm-based preserves V1 structure
+            A = m1.scale_A.float()  # [out, rank]
+            B = m1.scale_B[:, :m2.in_features].float()  # [rank, in]
+
+            A_norms = A.norm(dim=0, keepdim=True).clamp(min=1e-6)  # [1, rank]
+            B_norms = B.norm(dim=1, keepdim=True).clamp(min=1e-6)  # [rank, 1]
+
+            A_dir = A / A_norms  # unit-norm columns
+            B_dir = B / B_norms  # unit-norm rows
+            magnitude = (A_norms.squeeze() * B_norms.squeeze())  # [rank]
+
+            m2.scale_A.data.copy_(A_dir)
+            m2.scale_B.data.copy_(B_dir)
+            m2.rank_magnitude.data.copy_(magnitude)
+
+            # Get clamped scales for Q computation
+            S = m1.get_scales().float()[:, :m2.in_features]  # [out, in] with clamp
 
             # --- Q: check if V1 weight is already snapped ---
             w1 = m1.weight.data.float()[:, :m2.in_features]
