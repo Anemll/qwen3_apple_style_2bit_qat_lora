@@ -13,6 +13,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import random
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
@@ -1139,6 +1140,7 @@ def train_e2e(
     eval_steps: int = 200,
     eval_samples: int = 40,
     save_dir: str = None,
+    save_steps: int = 0,
     verbose: bool = True,
     use_cosine_schedule: bool = False,
     warmup_steps: int = 0,
@@ -1165,7 +1167,8 @@ def train_e2e(
         logging_steps: Log every N steps
         eval_steps: Evaluate every N steps
         eval_samples: Samples for evaluation
-        save_dir: Directory to save best checkpoint (optional)
+        save_dir: Directory to save checkpoints (optional)
+        save_steps: Save checkpoint every N steps (0 to disable periodic saves)
         verbose: Print progress
         use_cosine_schedule: Use cosine annealing LR schedule
         warmup_steps: Linear warmup steps (0 to disable)
@@ -1391,6 +1394,14 @@ def train_e2e(
                         if verbose:
                             print(f"  [Saved best checkpoint: {best_loss:.4f}]")
                 model.train()
+
+            # Periodic checkpoint saving
+            if save_steps > 0 and save_dir and step % save_steps == 0:
+                os.makedirs(save_dir, exist_ok=True)
+                ckpt_path = os.path.join(save_dir, f"checkpoint_step{step}.pt")
+                torch.save(model.state_dict(), ckpt_path)
+                if verbose:
+                    print(f"  [Checkpoint saved: {ckpt_path}]")
 
     # Final evaluation
     model.eval()

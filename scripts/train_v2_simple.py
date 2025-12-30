@@ -40,6 +40,7 @@ def main():
     parser.add_argument('--hard-full', type=float, default=0.00005, help='Hard label full vocab weight')
     parser.add_argument('--g-only', action='store_true', help='Train only rank_magnitude (G), freeze A and B')
     parser.add_argument('--mlp-only', action='store_true', help='Train only MLP layers, freeze attention')
+    parser.add_argument('--save-steps', type=int, default=0, help='Save checkpoint every N steps (0=disabled)')
     args = parser.parse_args()
 
     # Validate inputs - need v1, v2 checkpoint, or from-scratch
@@ -347,6 +348,8 @@ def main():
         hard_full_weight=args.hard_full,
         logging_steps=20,
         eval_steps=100,
+        save_dir=args.output_dir,
+        save_steps=args.save_steps,
         verbose=True,
         use_fp16=False,  # STE handles FP16
     )
