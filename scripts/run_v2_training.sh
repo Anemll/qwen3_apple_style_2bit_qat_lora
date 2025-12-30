@@ -2,16 +2,35 @@
 # =============================================================================
 # V2 STE-FP16 Training Script for Colab
 # =============================================================================
-# Usage: bash scripts/run_v2_training.sh
+# Usage: bash scripts/run_v2_training.sh [--force]
+#
+# Options:
+#   --force    Force re-extraction of checkpoint and cache (skip existence check)
 #
 # This script:
-# 1. Extracts checkpoint from Google Drive
-# 2. Extracts L128 cache from Google Drive
+# 1. Extracts checkpoint from Google Drive (skips if exists, unless --force)
+# 2. Extracts L128 cache from Google Drive (skips if exists, unless --force)
 # 3. Runs V2 training with STE-FP16
 # 4. Saves output to Google Drive
 # =============================================================================
 
 set -e  # Exit on error
+
+# Parse arguments
+FORCE=false
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --force)
+            FORCE=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: bash scripts/run_v2_training.sh [--force]"
+            exit 1
+            ;;
+    esac
+done
 
 # =============================================================================
 # CONFIGURATION - Edit these paths as needed
@@ -45,6 +64,7 @@ LR=1e-4
 echo "============================================================"
 echo "V2 STE-FP16 Training"
 echo "============================================================"
+[ "$FORCE" = true ] && echo "Mode: --force (re-extract all)"
 
 if [ ! -f "qat_lora/__init__.py" ]; then
     echo "ERROR: Run this script from the repo root directory"
@@ -78,8 +98,9 @@ echo "[1/4] Extracting checkpoint..."
 
 mkdir -p "$LOCAL_RUNS"
 
-if [ ! -f "$LOCAL_RUNS/$CHECKPOINT_FILE" ]; then
+if [ "$FORCE" = true ] || [ ! -f "$LOCAL_RUNS/$CHECKPOINT_FILE" ]; then
     if [ -f "$DRIVE_RUNS/$CHECKPOINT_ARCHIVE" ]; then
+        [ "$FORCE" = true ] && echo "  --force: Re-extracting..."
         echo "  Extracting $CHECKPOINT_ARCHIVE..."
         tar -xzf "$DRIVE_RUNS/$CHECKPOINT_ARCHIVE" -C "$LOCAL_RUNS/"
         echo "  Done."
@@ -111,8 +132,9 @@ echo "[2/4] Extracting L128 cache..."
 
 mkdir -p "$LOCAL_CACHES"
 
-if [ ! -d "$LOCAL_CACHES/$CACHE_DIR" ]; then
+if [ "$FORCE" = true ] || [ ! -d "$LOCAL_CACHES/$CACHE_DIR" ]; then
     if [ -f "$DRIVE_CACHES/$CACHE_ARCHIVE" ]; then
+        [ "$FORCE" = true ] && echo "  --force: Re-extracting..."
         echo "  Extracting $CACHE_ARCHIVE..."
         tar -xzf "$DRIVE_CACHES/$CACHE_ARCHIVE" -C "$LOCAL_CACHES/"
         echo "  Done."
