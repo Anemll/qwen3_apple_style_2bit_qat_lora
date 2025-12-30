@@ -114,6 +114,10 @@ def parse_args():
     parser.add_argument('--model-id', type=str, default='Qwen/Qwen3-0.6B',
                         help='Base model ID')
 
+    # Cache directory (use existing pre-cached KD data)
+    parser.add_argument('--cache-dir', type=str,
+                        help='Path to pre-cached KD dataset (skips teacher loading)')
+
     # Debug
     parser.add_argument('--dry-run', action='store_true',
                         help='Just check config, don\'t train')
@@ -171,6 +175,8 @@ def main():
     print(f"  Batch size: {cfg['batch_size']}")
     print(f"\nCheckpoint: {args.v1_checkpoint}")
     print(f"Output: {args.output_dir}")
+    if args.cache_dir:
+        print(f"Cache: {args.cache_dir} (pre-cached KD data)")
 
     if args.dry_run:
         print("\n[DRY RUN] Config looks good. Remove --dry-run to train.")
