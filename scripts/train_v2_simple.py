@@ -199,6 +199,8 @@ def main():
 
         def is_lut_snapped(w, lut, tol=1e-3):
             """Check if weight is already snapped to LUT values."""
+            # Ensure same device
+            lut = lut.to(w.device)
             diff = (w.unsqueeze(-1) - lut.view(1, 1, -1)).abs().min(dim=-1).values
             return (diff.max().item() < tol) and (w.abs().max().item() <= 1.2)
 
@@ -227,7 +229,7 @@ def main():
 
             # --- Q: check if V1 weight is already snapped ---
             w1 = m1.weight.data.float()[:, :m2.in_features]
-            lut = m2.lut.data.float()
+            lut = m2.lut.data.float().to(w1.device)  # Ensure same device
 
             if is_lut_snapped(w1, lut):
                 # V1 weight IS the Q (already LUT values)
