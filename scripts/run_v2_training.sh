@@ -57,6 +57,20 @@ echo "Working directory: $(pwd)"
 echo ""
 
 # =============================================================================
+# STEP 0.5: Install dependencies
+# =============================================================================
+
+echo "[0/4] Installing dependencies..."
+pip install -q transformers accelerate datasets sentencepiece protobuf
+echo "  Done."
+echo ""
+
+# Check GPU
+echo "GPU Info:"
+nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv 2>/dev/null || echo "  No GPU detected"
+echo ""
+
+# =============================================================================
 # STEP 1: Extract checkpoint
 # =============================================================================
 
