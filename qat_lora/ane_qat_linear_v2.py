@@ -38,6 +38,7 @@ class AnemllQuantConfigV2:
 
     lut_size: int = 16  # Number of LUT entries (4-bit = 16, 2-bit = 4)
     scale_rank: int = 4  # Rank for low-rank scales
+    group_size: int = 128  # Group size for scale initialization (same as V1)
     lut_include_zero: bool = False  # Whether LUT includes 0
     learnable_lut: bool = False  # Whether LUT values are trainable
 
@@ -257,18 +258,38 @@ class AnemllQATLinearV2(nn.Module):
     def _init_scales_from_weight(self):
         """Initialize scale parameters with unit-norm + magnitude decomposition.
 
-        Uses SVD which gives orthonormal u and vh directly:
+        Uses V1's group-based initialization:
+        1. Compute per-group max-abs scales
+        2. Expand to per-weight
+        3. SVD to get unit-norm A, B and magnitudes G
+
+        Result:
         - scale_A = u[:, :r] (unit-norm columns)
         - scale_B = vh[:r, :] (unit-norm rows)
-        - rank_magnitude = s[:r] (singular values = magnitudes)
+        - rank_magnitude = s[:r] (singular values = magnitudes G)
         """
         w = self.weight.float()
+        group_size = self.config.group_size
 
-        # Compute per-weight scales (max-abs per output)
-        # Simple approach: use abs(weight) as initial scale estimate
-        scales_per_weight = w.abs().clamp(min=1e-8)
+        # Pad input dimension to multiple of group_size
+        pad = (group_size - self.in_features % group_size) % group_size
+        if pad > 0:
+            w = F.pad(w, (0, pad))
 
-        # SVD: scales ≈ u @ diag(s) @ vh
+        padded_in = w.size(1)
+        num_groups = padded_in // group_size
+
+        # Step 1: Compute per-group max-abs scales [out, num_groups]
+        grouped = w.view(self.out_features, num_groups, group_size)
+        scales_per_group = grouped.abs().amax(dim=2).clamp(min=1e-8)
+
+        # Step 2: Expand to per-weight [out, padded_in]
+        scales_per_weight = scales_per_group.repeat_interleave(group_size, dim=1)
+
+        # Trim to actual input size (V2 doesn't use padding in forward)
+        scales_per_weight = scales_per_weight[:, :self.in_features]
+
+        # Step 3: SVD: scales ≈ u @ diag(s) @ vh
         u, s, vh = torch.linalg.svd(scales_per_weight, full_matrices=False)
         r = self.scale_rank
 
