@@ -34,17 +34,57 @@ Training runs history with names and descriptions.
 
 ## Run History
 
-### 2024-XX-XX: Q4→Q2 Progressive
+### 2024-12-31: SpeedRun0 - Q4→Q2 Progressive
 
-**Goal**: Train Q2 from Q4 base for faster convergence
+**Goal**: Test speedrun setup, convert Q4→Q2, train MLP
 
-**Steps**:
-1. Start with `q4_fp32` (loss ~0.73)
-2. Convert Q4→Q2 with `convert_q4_to_q2.py`
-3. Train MLP only for 2000-4000 steps
-4. Full E2E training
+**Instance**: Colab T4 (free)
 
-**Result**: TBD
+**Config**:
+- Cache: L64 (913MB)
+- Checkpoint: q4_fp32 → convert → q2_init
+- Training: MLP-only, 2000 steps
+
+**Commands**:
+```bash
+# Setup pulled:
+source speedrun/setup.sh L64 q4_fp32
+# [CACHE] Extracting alpaca_chat_think_both_L64_K64_R128.tgz... Done
+# [CKPT] Extracting anemll_v2_q4_a4_from_v1_finetuned.tgz...
+
+# Then convert:
+python scripts/convert_q4_to_q2.py \
+    --q4-checkpoint runs/speedrun/anemll_v2_q4_a4_from_v1_finetuned.pt \
+    --output runs/speedrun/q2_init.pt \
+    --eval --cache-dir caches/alpaca_chat_think_both_L64_K64_R128
+
+# Then train:
+python scripts/train_v2_simple.py \
+    --v2-checkpoint runs/speedrun/q2_init.pt \
+    --cache-dir caches/alpaca_chat_think_both_L64_K64_R128 \
+    --output-dir runs/speedrun \
+    --mlp-only --max-steps 2000 \
+    --gdrive-dir /content/drive/MyDrive/qwen3_runs/speedrun0
+```
+
+**Result**: COMPLETE
+
+**Conversion Time:**
+| Instance | CPU Cores | Time |
+|----------|-----------|------|
+| A100 | 12 | ~3 min |
+| T4 | 2 | ~15 min (estimated) |
+
+**Output:**
+- `runs/speedrun/q2_init.pt` created
+- **KD Loss: 5.8265** (expected ~5.8)
+- 196 layers converted (84 MLP + 112 Attn)
+
+**Notes:**
+- Conversion is CPU-bound (k-means clustering)
+- GPU not used during conversion, only for eval
+- A100's 12 cores helped vs T4's 2 cores
+- Inference test: empty response (expected before training)
 
 ---
 
