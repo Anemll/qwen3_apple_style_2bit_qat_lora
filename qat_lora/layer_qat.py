@@ -13,6 +13,7 @@ Usage:
 
 from __future__ import annotations
 
+import csv
 import os
 import random
 from pathlib import Path
@@ -1305,6 +1306,22 @@ def train_e2e(
     if verbose:
         print(f"\nInitial KD Loss: {initial_loss:.4f}")
 
+    # Setup CSV logging
+    csv_file = None
+    csv_writer = None
+    csv_path = None
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        csv_path = os.path.join(save_dir, "training_log.csv")
+        csv_file = open(csv_path, 'w', newline='')
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(['step', 'train_loss', 'eval_loss', 'lr', 'elapsed_sec'])
+        # Write initial eval
+        csv_writer.writerow([0, '', f'{initial_loss:.6f}', f'{lr:.2e}', '0.0'])
+        csv_file.flush()
+        if verbose:
+            print(f"CSV log: {csv_path}")
+
     # Training loop
     model.train()
     step = 0
@@ -1360,7 +1377,7 @@ def train_e2e(
             step += 1
 
             # Logging
-            if verbose and step % logging_steps == 0:
+            if step % logging_steps == 0:
                 avg_loss = total_loss / logging_steps
                 elapsed = time.time() - t_start
                 eta = elapsed / step * (max_steps - step) if step > 0 else 0
@@ -1369,12 +1386,18 @@ def train_e2e(
                     if s < 3600:
                         return f"{int(s)//60}:{int(s)%60:02d}"
                     return f"{int(s)//3600}:{(int(s)%3600)//60:02d}:{int(s)%60:02d}"
-                # Show current LR if using schedule
-                if scheduler is not None:
-                    current_lr = scheduler.get_last_lr()[0]
-                    print(f"[{step}/{max_steps}] loss={avg_loss:.4f} lr={current_lr:.2e} ({fmt_time(elapsed)}, ETA {fmt_time(eta)})")
-                else:
-                    print(f"[{step}/{max_steps}] loss={avg_loss:.4f} ({fmt_time(elapsed)}, ETA {fmt_time(eta)})")
+                # Get current LR
+                current_lr = scheduler.get_last_lr()[0] if scheduler is not None else lr
+                # Print if verbose
+                if verbose:
+                    if scheduler is not None:
+                        print(f"[{step}/{max_steps}] loss={avg_loss:.4f} lr={current_lr:.2e} ({fmt_time(elapsed)}, ETA {fmt_time(eta)})")
+                    else:
+                        print(f"[{step}/{max_steps}] loss={avg_loss:.4f} ({fmt_time(elapsed)}, ETA {fmt_time(eta)})")
+                # Write to CSV
+                if csv_writer is not None:
+                    csv_writer.writerow([step, f'{avg_loss:.6f}', '', f'{current_lr:.2e}', f'{elapsed:.1f}'])
+                    csv_file.flush()
                 loss_history.append(avg_loss)
                 total_loss = 0.0
 
@@ -1382,8 +1405,14 @@ def train_e2e(
             if step % eval_steps == 0:
                 model.eval()
                 eval_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=eval_samples, temperature=temperature)
+                elapsed = time.time() - t_start
+                current_lr = scheduler.get_last_lr()[0] if scheduler is not None else lr
                 if verbose:
                     print(f"  [Eval] KD Loss: {eval_loss:.4f} (best: {best_loss:.4f})")
+                # Write eval to CSV
+                if csv_writer is not None:
+                    csv_writer.writerow([step, '', f'{eval_loss:.6f}', f'{current_lr:.2e}', f'{elapsed:.1f}'])
+                    csv_file.flush()
                 if eval_loss < best_loss:
                     best_loss = eval_loss
                     # Save best state in memory
@@ -1406,6 +1435,15 @@ def train_e2e(
     # Final evaluation
     model.eval()
     final_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=eval_samples, temperature=temperature)
+    elapsed = time.time() - t_start
+
+    # Write final eval to CSV
+    if csv_writer is not None:
+        current_lr = scheduler.get_last_lr()[0] if scheduler is not None else lr
+        csv_writer.writerow([step, '', f'{final_loss:.6f}', f'{current_lr:.2e}', f'{elapsed:.1f}'])
+        csv_file.close()
+        if verbose:
+            print(f"CSV log saved to: {csv_path}")
 
     # Update best if final is better
     if final_loss < best_loss:
@@ -1416,8 +1454,6 @@ def train_e2e(
             torch.save(best_state, os.path.join(save_dir, "best_state_dict.pt"))
             if verbose:
                 print(f"  [Saved best checkpoint: {best_loss:.4f}]")
-
-    elapsed = time.time() - t_start
 
     if verbose:
         print(f"\n=== Results ===")
@@ -1448,4 +1484,5 @@ def train_e2e(
         'steps': step,
         'time_sec': elapsed,
         'loss_history': loss_history,
+        'csv_path': csv_path,
     }
