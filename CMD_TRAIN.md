@@ -147,6 +147,28 @@ python scripts/test_inference.py checkpoint.pt \
     --interactive
 ```
 
+## Convert Q4_A4 to Q2_A4
+
+Start Q2 training from a trained Q4 checkpoint (progressive quantization):
+
+```bash
+# Convert Q4_A4 (rank=4) → Q2_A4 (MLP rank=32, Attn rank=8)
+python scripts/convert_q4_to_q2.py \
+    --q4-checkpoint /path/to/q4_a4_v2.pt \
+    --output runs/q2_from_q4/q2_init.pt
+
+# Then train
+python scripts/train_v2_simple.py \
+    --v2-checkpoint runs/q2_from_q4/q2_init.pt \
+    --cache-dir caches/alpaca_chat_think_both_L128_K128_R1024 \
+    --output-dir runs/q2_from_q4 \
+    --max-steps 1000
+```
+
+Conversion does:
+- **Attention**: Keep lut=16 (4-bit), expand rank 4→8
+- **MLP**: Reduce lut 16→4 (k-means), expand rank 4→32
+
 ## Snap for ANE Export
 
 Convert checkpoint to FP16 for ANE:
