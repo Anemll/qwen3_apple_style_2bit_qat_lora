@@ -141,6 +141,59 @@ python scripts/train_v2_simple.py \
 
 ---
 
+### 2024-12-31: SR-003 - Performance Benchmark
+
+**Goal**: Find max batch size and measure throughput with gradient checkpointing
+
+**Instance**: Colab A100 40GB
+
+**Config**:
+- Cache: L64 (seq_len=64)
+- Gradient checkpointing: enabled (use_reentrant=False)
+- Test: 3 steps per batch size
+
+**Command**:
+```bash
+source speedrun/setup.sh L64
+python speedrun/benchmark.py --cache-dir $CACHE_DIR --find-max-batch
+```
+
+**Result**: COMPLETE ✓
+
+| Batch | Step(s) | Memory | t/s | Loss | Status |
+|-------|---------|--------|-----|------|--------|
+| 8 | 15.016 | 8,734M | 34 | 8.09 | OK |
+| 16 | 16.787 | 9,983M | 61 | 7.99 | OK |
+| 32 | 21.222 | 12,479M | 97 | 7.92 | OK |
+| 64 | 30.348 | 17,471M | 135 | 7.26 | OK |
+| 128 | 48.673 | 27,455M | 168 | 7.68 | OK |
+| **144** | **53.245** | **29,951M** | **173** | 7.68 | **MAX** |
+| 152+ | - | - | - | - | OOM |
+
+**Key Findings**:
+- **Max batch size: 144** (with gradient checkpointing, L64)
+- **Best throughput: 173 t/s** at batch=144
+- Memory scales sub-linearly: 8→144 batch = 18x, but 8.7→30GB = 3.4x
+- Throughput scales well: 34→173 t/s = 5x improvement
+
+**Gradient Checkpointing Impact** (batch=8):
+- Without: ~96 t/s, ~25GB memory
+- With: ~34 t/s, ~8.7GB memory (-65% memory, -65% speed)
+- But enables batch=144 → 173 t/s (1.8x faster than baseline!)
+
+**Recommended Settings** (A100 40GB):
+| Cache | Max Batch | Expected t/s |
+|-------|-----------|--------------|
+| L64 (seq=64) | 144 | ~173 |
+| L128 (seq=128) | ~72 | ~85 (estimated) |
+
+**Notes**:
+- Binary search finds exact max (not just powers of 2)
+- V2 model cached to `runs/speedrun/v2_benchmark_model.pt` for fast reruns
+- Fix applied: `use_reentrant=False` for gradient checkpointing
+
+---
+
 ### Template for New Runs
 
 ```markdown
