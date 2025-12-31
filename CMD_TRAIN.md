@@ -146,6 +146,55 @@ cp runs/v2_output/*.pt /content/drive/MyDrive/qwen3_runs/v2_output/
 bash scripts/save_to_drive.sh runs/v2_output/v2_q2a4_fp32_TIMESTAMP.pt my_checkpoint
 ```
 
+## KD Cache Options
+
+Different caches for different batch sizes:
+
+| Cache | L | K | R | Size | Est. Batch |
+|-------|---|---|---|------|------------|
+| `alpaca_chat_think_both_L128_K128_R1024` | 128 | 128 | 1024 | ~16 GB | 4-6 |
+| `alpaca_chat_think_both_L64_K64_R128` | 64 | 64 | 128 | ~1.5 GB | 16-32 |
+
+### Load cache from Google Drive (Colab)
+
+```bash
+# Full cache (L128_K128)
+CACHE_NAME="alpaca_chat_think_both_L128_K128_R1024"
+mkdir -p caches/$CACHE_NAME
+tar -xzf /content/drive/MyDrive/qwen3_caches/$CACHE_NAME.tgz -C caches/
+
+# Small cache (L64_K64) - for bigger batches
+CACHE_NAME="alpaca_chat_think_both_L64_K64_R128"
+mkdir -p caches/$CACHE_NAME
+tar -xzf /content/drive/MyDrive/qwen3_caches/$CACHE_NAME.tgz -C caches/
+```
+
+### Generate small cache (L64_K64)
+
+Use notebook `notebooks/Generate_KD_Cache_K64_K128.ipynb` with:
+```python
+TOP_K = 64
+RANDOM_NEGATIVES = 128
+MAX_LENGTH = 64
+```
+
+Or terminal:
+```bash
+python scripts/precompute_teacher_topk.py \
+  --teacher_model_name_or_path Qwen/Qwen3-0.6B \
+  --dataset_name tatsu-lab/alpaca \
+  --dataset_split train \
+  --dataset_format alpaca_chat \
+  --enable_thinking both \
+  --max_length 64 \
+  --topk 64 \
+  --rand_neg 128 \
+  --num_sequences 20000 \
+  --batch_size 32 \
+  --device cuda \
+  --output_dir caches/alpaca_chat_think_both_L64_K64_R128
+```
+
 ## Q2_A4 Configuration
 
 Default configuration for 2-bit MLP / 4-bit Attention:
