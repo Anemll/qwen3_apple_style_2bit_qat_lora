@@ -531,3 +531,181 @@ runs/anemll_final/
 | 16 | 4-bit | Higher | Balanced |
 | 256 | 8-bit | Highest | Minimal compression |
 
+---
+
+## 10. V2 Training Pipeline (Recommended)
+
+V2 is the latest training architecture with improved low-rank scale factorization and STE-FP16 support.
+
+### V2 Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/train_v2_simple.py` | Main V2 training (V1→V2, resume, from scratch) |
+| `scripts/convert_q4_to_q2.py` | Progressive quantization (Q4→Q2 conversion) |
+| `scripts/snap_and_test_v2.py` | Snap model to FP16 for ANE export |
+| `scripts/convert_v1_to_v2.py` | Convert V1 checkpoint to V2 format |
+| `scripts/test_inference.py` | Test V2 model inference |
+
+### 10.1 Train V2 from V1 Checkpoint
+
+```bash
+python scripts/train_v2_simple.py \
+    --v1-checkpoint runs/v1/backup_mlp_e2e_w.pt \
+    --cache-dir caches/alpaca_chat_think_both_L128_K128_R1024 \
+    --output-dir runs/v2_output \
+    --max-steps 1000 \
+    --lr 5e-5 \
+    --batch-size 8
+```
+
+### 10.2 Resume V2 Training
+
+```bash
+python scripts/train_v2_simple.py \
+    --v2-checkpoint runs/v2_output/v2_q2a4_fp32_TIMESTAMP.pt \
+    --cache-dir caches/alpaca_chat_think_both_L128_K128_R1024 \
+    --output-dir runs/v2_output \
+    --max-steps 500
+```
+
+### 10.3 Train V2 from Scratch
+
+```bash
+python scripts/train_v2_simple.py \
+    --from-scratch \
+    --cache-dir caches/alpaca_chat_think_both_L128_K128_R1024 \
+    --output-dir runs/v2_scratch \
+    --max-steps 1000 \
+    --lr 1e-4
+```
+
+### V2 Training Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--v1-checkpoint` | None | V1 checkpoint for conversion |
+| `--v2-checkpoint` | None | V2 checkpoint to resume |
+| `--from-scratch` | False | Train without any checkpoint |
+| `--cache-dir` | Required | KD cache directory |
+| `--output-dir` | runs/v2_output | Output directory |
+| `--max-steps` | 1000 | Training steps |
+| `--lr` | 5e-5 | Learning rate |
+| `--batch-size` | 8 | Batch size |
+| `--save-steps` | 0 | Checkpoint interval (0=disabled) |
+| `--g-only` | False | Train only rank magnitudes |
+| `--mlp-only` | False | Train only MLP layers |
+| `--wandb` | False | Enable W&B logging |
+
+---
+
+## 11. Progressive Quantization (Q4→Q2)
+
+For maximum quality with 2-bit weights, use progressive quantization:
+1. Train at 4-bit (Q4_A4)
+2. Convert to 2-bit (Q2_A4)
+3. Fine-tune at 2-bit
+
+See [A1Q.md](A1Q.md) for detailed documentation.
+
+### 11.1 Convert Q4_A4 to Q2_A4
+
+```bash
+python scripts/convert_q4_to_q2.py \
+    --q4-checkpoint runs/q4_base/checkpoint.pt \
+    --output runs/q2_from_q4/q2_init.pt \
+    --eval \
+    --cache-dir caches/alpaca_chat_think_both_L128_K128_R1024
+```
+
+### Q4→Q2 Conversion Options
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--q4-checkpoint` | Required | Source Q4_A4 checkpoint |
+| `--output` | Required | Output Q2_A4 checkpoint path |
+| `--q4-rank` | 4 | Source Q4 scale rank |
+| `--q2-mlp-rank` | 32 | Target MLP scale rank |
+| `--q2-attn-rank` | 8 | Target attention scale rank |
+| `--q2-mlp-lut-size` | 4 | Target MLP LUT (4=2-bit) |
+| `--q2-attn-lut-size` | 16 | Target attention LUT (16=4-bit) |
+| `--eval` | False | Evaluate KD loss after conversion |
+| `--cache-dir` | None | KD cache for evaluation |
+
+### 11.2 Train After Conversion
+
+```bash
+python scripts/train_v2_simple.py \
+    --v2-checkpoint runs/q2_from_q4/q2_init.pt \
+    --cache-dir caches/alpaca_chat_think_both_L128_K128_R1024 \
+    --output-dir runs/q2_from_q4 \
+    --max-steps 1000
+```
+
+### Convergence Comparison
+
+| Method | Initial Loss | Steps to 0.7 | Time |
+|--------|-------------|--------------|------|
+| Q2 from scratch | ~10.0 | ~3000 | ~3 hrs |
+| Q4→Q2 progressive | ~5.8 | ~500 | ~30 min |
+
+---
+
+## 12. Export for ANE (Apple Neural Engine)
+
+### 12.1 Snap to FP16
+
+```bash
+python scripts/snap_and_test_v2.py \
+    --checkpoint runs/v2_output/checkpoint.pt \
+    --fp16 \
+    --output runs/export/model_fp16.pt
+```
+
+### 12.2 Test Inference
+
+```bash
+# Single prompt
+python scripts/test_inference.py runs/export/model_fp16.pt \
+    --version v2 \
+    --lut-bits 2 \
+    --attn-lut-bits 4 \
+    --scale-rank 32 \
+    --attn-scale-rank 8 \
+    --prompt "What is 2+2?"
+
+# Interactive mode
+python scripts/test_inference.py runs/export/model_fp16.pt \
+    --version v2 \
+    --interactive
+```
+
+---
+
+## 13. V2 Configuration Reference
+
+### Q2_A4 Configuration (2-bit MLP, 4-bit Attention)
+
+| Component | LUT Size | LUT Bits | Scale Rank |
+|-----------|----------|----------|------------|
+| MLP | 4 | 2 | 32 |
+| Attention | 16 | 4 | 8 |
+
+### Q4_A4 Configuration (4-bit uniform)
+
+| Component | LUT Size | LUT Bits | Scale Rank |
+|-----------|----------|----------|------------|
+| MLP | 16 | 4 | 4 |
+| Attention | 16 | 4 | 4 |
+
+### V2 AnemllQuantConfigV2 Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `lut_size` | 4 | LUT entries (4=2-bit, 16=4-bit) |
+| `scale_rank` | 32 | Low-rank decomposition rank |
+| `force_positive_scales` | False | Force positive scale values |
+| `magnitude_activation` | 'identity' | Activation for rank magnitudes |
+| `use_ste_fp16` | True | STE for FP16 rounding in forward |
+| `norm_eps` | 1e-6 | Epsilon for normalization (FP16-safe) |
+
