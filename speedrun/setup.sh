@@ -92,7 +92,18 @@ pull_cache() {
         return 0
     fi
 
-    # Prefer .tgz (faster single-file transfer)
+    # Prefer .tar.lz4 (fastest)
+    local lz4_path="$GDRIVE_CACHES/${cache_name}.tar.lz4"
+    if [ -f "$lz4_path" ]; then
+        echo "[CACHE] Extracting $cache_name.tar.lz4 (lz4 - fast)..."
+        which lz4 >/dev/null || apt-get install -qq lz4
+        mkdir -p "$cache_dir"
+        tar -I lz4 -xf "$lz4_path" -C caches/
+        echo "[CACHE] Done"
+        return 0
+    fi
+
+    # Fall back to .tgz
     local tgz_path="$GDRIVE_CACHES/${cache_name}.tgz"
     if [ -f "$tgz_path" ]; then
         echo "[CACHE] Extracting $cache_name.tgz..."
@@ -113,7 +124,7 @@ pull_cache() {
 
     echo "[CACHE] ERROR: Not found: $cache_name"
     echo "[CACHE] Available:"
-    ls "$GDRIVE_CACHES" 2>/dev/null | grep -E '\.(tgz|pt)$|^[^.]+$' | head -5
+    ls "$GDRIVE_CACHES" 2>/dev/null | grep -E '\.(tar\.lz4|tgz|pt)$|^[^.]+$' | head -5
     return 1
 }
 
