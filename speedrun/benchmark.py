@@ -325,10 +325,9 @@ def find_max_batch_size(
     model_id: str,
     gradient_checkpointing: bool = True,
     steps: int = 3,
+    rebuild_model: bool = False,
 ) -> int:
     """Find maximum batch size that fits in GPU memory."""
-    import tempfile
-
     seq_len = get_seq_len_from_cache(cache_dir)
     gpu_mem_gb = get_gpu_total_memory_gb()
 
@@ -338,21 +337,10 @@ def find_max_batch_size(
     print(f"Gradient checkpointing: {'ON' if gradient_checkpointing else 'OFF'}")
     print(f"{'='*60}")
 
-    # Create V2 model once (slow) and save to disk
-    print("\n[1/2] Creating V2 model (one-time)...")
-    v2_model = create_v2_model(model_id, verbose=True)
+    # Get or create cached V2 model
+    v2_model_path = get_or_create_v2_model(model_id, rebuild=rebuild_model)
 
-    # Save to temp file for fast reloading
-    v2_model_path = tempfile.mktemp(suffix='.pt')
-    print(f"  Saving to {v2_model_path}...", end=" ", flush=True)
-    t0 = time.time()
-    torch.save(v2_model, v2_model_path)
-    print(f"done ({time.time()-t0:.1f}s)")
-
-    del v2_model
-    reset_gpu_memory()
-
-    print("\n[2/2] Finding max batch size...")
+    print("\n[*] Finding max batch size...")
 
     # Print header
     print_result_header(seq_len)
@@ -362,33 +350,28 @@ def find_max_batch_size(
     max_working_batch = 0
     results = []
 
-    try:
-        for batch in batch_sizes:
-            print(f"\n  Trying batch={batch}...", end=" ", flush=True)
-            result = run_benchmark(
-                cache_dir=cache_dir,
-                batch_size=batch,
-                steps=steps,
-                gradient_checkpointing=gradient_checkpointing,
-                device=device,
-                model_id=model_id,
-                verbose=False,
-                v2_model_path=v2_model_path,
-            )
-            results.append(result)
+    for batch in batch_sizes:
+        print(f"\n  Trying batch={batch}...", end=" ", flush=True)
+        result = run_benchmark(
+            cache_dir=cache_dir,
+            batch_size=batch,
+            steps=steps,
+            gradient_checkpointing=gradient_checkpointing,
+            device=device,
+            model_id=model_id,
+            verbose=False,
+            v2_model_path=v2_model_path,
+        )
+        results.append(result)
 
-            if result.success:
-                max_working_batch = batch
-                print(f"OK (mem={result.peak_memory_mb:.0f}M, t/s={result.tokens_per_sec:.0f})")
-                print_result_row(result)
-            else:
-                print(f"OOM")
-                print_result_row(result)
-                break
-    finally:
-        # Cleanup temp file
-        if os.path.exists(v2_model_path):
-            os.remove(v2_model_path)
+        if result.success:
+            max_working_batch = batch
+            print(f"OK (mem={result.peak_memory_mb:.0f}M, t/s={result.tokens_per_sec:.0f})")
+            print_result_row(result)
+        else:
+            print(f"OOM")
+            print_result_row(result)
+            break
 
     print(f"\n{'='*60}")
     print(f"MAX BATCH SIZE: {max_working_batch}")
@@ -401,6 +384,31 @@ def find_max_batch_size(
     return max_working_batch
 
 
+V2_MODEL_CACHE = "runs/speedrun/v2_benchmark_model.pt"
+
+
+def get_or_create_v2_model(model_id: str, rebuild: bool = False) -> str:
+    """Get cached V2 model path, creating if needed."""
+    os.makedirs(os.path.dirname(V2_MODEL_CACHE), exist_ok=True)
+
+    if os.path.exists(V2_MODEL_CACHE) and not rebuild:
+        print(f"[*] Using cached V2 model: {V2_MODEL_CACHE}")
+        return V2_MODEL_CACHE
+
+    print(f"\n[*] Creating V2 model (one-time, will cache to {V2_MODEL_CACHE})...")
+    v2_model = create_v2_model(model_id, verbose=True)
+
+    print(f"  Saving to {V2_MODEL_CACHE}...", end=" ", flush=True)
+    t0 = time.time()
+    torch.save(v2_model, V2_MODEL_CACHE)
+    print(f"done ({time.time()-t0:.1f}s)")
+
+    del v2_model
+    reset_gpu_memory()
+
+    return V2_MODEL_CACHE
+
+
 def main():
     parser = argparse.ArgumentParser(description='SpeedRun Benchmark')
     parser.add_argument('--cache-dir', type=str, required=True, help='KD cache directory')
@@ -411,6 +419,8 @@ def main():
     parser.add_argument('--find-max-batch', action='store_true', help='Find maximum batch size')
     parser.add_argument('--batch-sizes', type=str, default=None,
                         help='Custom batch sizes to test (comma-separated, e.g., "8,16,32")')
+    parser.add_argument('--rebuild-model', action='store_true',
+                        help='Rebuild V2 model cache even if it exists')
     args = parser.parse_args()
 
     assert os.path.exists(args.cache_dir), f"Cache dir not found: {args.cache_dir}"
@@ -421,6 +431,9 @@ def main():
         print(f"GPU: {torch.cuda.get_device_name()}")
         print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
+    # Get or create cached V2 model (reused across all benchmarks)
+    v2_model_path = get_or_create_v2_model(args.model_id, rebuild=args.rebuild_model)
+
     # Find max batch mode
     if args.find_max_batch:
         find_max_batch_size(
@@ -429,79 +442,59 @@ def main():
             model_id=args.model_id,
             gradient_checkpointing=True,
             steps=3,  # Quick test with 3 steps
+            rebuild_model=False,  # Already created above
         )
         print("\nDone!")
         return
 
-    import tempfile
-
     results = []
     seq_len = get_seq_len_from_cache(args.cache_dir)
 
-    # Create V2 model once (slow) - reuse for all benchmarks
-    print("\n[1/2] Creating V2 model (one-time)...")
-    v2_model = create_v2_model(args.model_id, verbose=True)
+    print("\n[*] Running benchmarks...")
 
-    # Save to temp file for fast reloading
-    v2_model_path = tempfile.mktemp(suffix='.pt')
-    print(f"  Saving to {v2_model_path}...", end=" ", flush=True)
-    t0 = time.time()
-    torch.save(v2_model, v2_model_path)
-    print(f"done ({time.time()-t0:.1f}s)")
+    # Print header once at the start
+    print_result_header(seq_len)
 
-    del v2_model
-    reset_gpu_memory()
+    # Benchmark 1: Baseline (batch=8, no checkpointing)
+    if not args.skip_baseline:
+        result = run_benchmark(
+            cache_dir=args.cache_dir,
+            batch_size=8,
+            steps=args.steps,
+            gradient_checkpointing=False,
+            device=device,
+            model_id=args.model_id,
+            v2_model_path=v2_model_path,
+        )
+        results.append(result)
+        print_result_row(result)
 
-    print("\n[2/2] Running benchmarks...")
+    # Benchmark 2: With checkpointing (batch=8)
+    if not args.skip_checkpointing:
+        result = run_benchmark(
+            cache_dir=args.cache_dir,
+            batch_size=8,
+            steps=args.steps,
+            gradient_checkpointing=True,
+            device=device,
+            model_id=args.model_id,
+            v2_model_path=v2_model_path,
+        )
+        results.append(result)
+        print_result_row(result)
 
-    try:
-        # Print header once at the start
-        print_result_header(seq_len)
-
-        # Benchmark 1: Baseline (batch=8, no checkpointing)
-        if not args.skip_baseline:
-            result = run_benchmark(
-                cache_dir=args.cache_dir,
-                batch_size=8,
-                steps=args.steps,
-                gradient_checkpointing=False,
-                device=device,
-                model_id=args.model_id,
-                v2_model_path=v2_model_path,
-            )
-            results.append(result)
-            print_result_row(result)
-
-        # Benchmark 2: With checkpointing (batch=8)
-        if not args.skip_checkpointing:
-            result = run_benchmark(
-                cache_dir=args.cache_dir,
-                batch_size=8,
-                steps=args.steps,
-                gradient_checkpointing=True,
-                device=device,
-                model_id=args.model_id,
-                v2_model_path=v2_model_path,
-            )
-            results.append(result)
-            print_result_row(result)
-
-            # Benchmark 3: With checkpointing (batch=16) - to show memory savings
-            result = run_benchmark(
-                cache_dir=args.cache_dir,
-                batch_size=16,
-                steps=args.steps,
-                gradient_checkpointing=True,
-                device=device,
-                model_id=args.model_id,
-                v2_model_path=v2_model_path,
-            )
-            results.append(result)
-            print_result_row(result)
-    finally:
-        # Cleanup temp file
-        if os.path.exists(v2_model_path):
-            os.remove(v2_model_path)
+        # Benchmark 3: With checkpointing (batch=16) - to show memory savings
+        result = run_benchmark(
+            cache_dir=args.cache_dir,
+            batch_size=16,
+            steps=args.steps,
+            gradient_checkpointing=True,
+            device=device,
+            model_id=args.model_id,
+            v2_model_path=v2_model_path,
+        )
+        results.append(result)
+        print_result_row(result)
 
     # Print summary
     print_summary(results)
