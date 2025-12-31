@@ -72,15 +72,17 @@ python scripts/convert_q4_to_q2.py \
     --eval \
     --cache-dir "$CACHE_DIR"
 
-echo "[5/6] Creating .tgz..."
+echo "[5/6] Creating .tar.lz4 (fast compression)..."
+# Install lz4 if needed
+which lz4 >/dev/null || apt-get install -qq lz4
 cd "$OUTPUT_DIR"
-tar -czvf "${OUTPUT_NAME}.tgz" q2_init.pt config.json 2>/dev/null || \
-tar -czvf "${OUTPUT_NAME}.tgz" q2_init.pt
+tar -I lz4 -cvf "${OUTPUT_NAME}.tar.lz4" q2_init.pt config.json 2>/dev/null || \
+tar -I lz4 -cvf "${OUTPUT_NAME}.tar.lz4" q2_init.pt
 cd -
 
 echo "[6/6] Pushing to Google Drive..."
-cp "$OUTPUT_DIR/${OUTPUT_NAME}.tgz" "$GDRIVE_RUNS/"
-echo "  Uploaded: $GDRIVE_RUNS/${OUTPUT_NAME}.tgz"
+rsync -ah --progress "$OUTPUT_DIR/${OUTPUT_NAME}.tar.lz4" "$GDRIVE_RUNS/"
+echo "  Uploaded: $GDRIVE_RUNS/${OUTPUT_NAME}.tar.lz4"
 
 # Cleanup extracted Q4
 rm -f "$OUTPUT_DIR"/*.pt.backup 2>/dev/null

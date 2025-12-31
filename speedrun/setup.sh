@@ -44,7 +44,7 @@ CKPT_MAP["q2_best"]="$GDRIVE_RUNS/Q2A4_BINIT_0.5855/best_state_dict.pt"
 CKPT_MAP["q2_0.53"]="$GDRIVE_RUNS/v2_a2_q2_best_fp32_0.5341.tgz"
 CKPT_MAP["q4_fp32"]="$GDRIVE_RUNS/anemll_v2_q4_a4_from_v1_finetuned.tgz"
 CKPT_MAP["q4_fp16"]="$GDRIVE_RUNS/anemll_v2_q4_a4_ste_fp16_from_v1.tgz"
-CKPT_MAP["q2_init"]="$GDRIVE_RUNS/q2_init_from_q4.tgz"
+CKPT_MAP["q2_init"]="$GDRIVE_RUNS/q2_init_from_q4.tar.lz4"
 
 # =============================================================================
 # ENVIRONMENT SETUP
@@ -156,8 +156,20 @@ pull_checkpoint() {
         return 0
     fi
 
-    # Handle .tgz vs .pt
-    if [[ "$ckpt_path" == *.tgz ]]; then
+    # Handle .tar.lz4 vs .tgz vs .pt
+    if [[ "$ckpt_path" == *.tar.lz4 ]]; then
+        if [ -f "$ckpt_path" ]; then
+            echo "[CKPT] Extracting $(basename $ckpt_path) (lz4 - fast)..."
+            # Install lz4 if needed
+            which lz4 >/dev/null || apt-get install -qq lz4
+            tar -I lz4 -xf "$ckpt_path" -C "$dest_dir/"
+            export CHECKPOINT=$(find "$dest_dir" -name "*.pt" 2>/dev/null | head -1)
+            echo "[CKPT] Ready: $CHECKPOINT"
+        else
+            echo "[CKPT] ERROR: Not found: $ckpt_path"
+            return 1
+        fi
+    elif [[ "$ckpt_path" == *.tgz ]]; then
         if [ -f "$ckpt_path" ]; then
             echo "[CKPT] Extracting $(basename $ckpt_path)..."
             tar -xzf "$ckpt_path" -C "$dest_dir/"
