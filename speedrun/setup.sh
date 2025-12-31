@@ -1,12 +1,13 @@
 #!/bin/bash
 # Speedrun Setup Script
-# Usage: source speedrun/setup.sh [cache] [checkpoint]
+# Usage: source speedrun/setup.sh [cache] [checkpoint] [--force]
 #
 # Examples:
 #   source speedrun/setup.sh                      # Just env setup
 #   source speedrun/setup.sh L64                  # Env + L64 cache
 #   source speedrun/setup.sh L64 q2_best          # Env + L64 cache + Q2 best checkpoint
-#   source speedrun/setup.sh L128 q4_v1           # Env + L128 cache + Q4 from V1
+#   source speedrun/setup.sh L128 q4_fp32         # Env + L128 cache + Q4 from V1
+#   source speedrun/setup.sh L64 q4_fp32 --force  # Force re-extract even if exists
 
 set -e
 
@@ -131,9 +132,11 @@ fi
 # CHECKPOINT SETUP
 # =============================================================================
 CKPT_ARG="${2:-}"
+FORCE_FLAG="${3:-}"
 
 pull_checkpoint() {
     local ckpt_name="$1"
+    local force="$2"
     local dest_dir="runs/speedrun"
 
     # Check mapping first
@@ -142,6 +145,15 @@ pull_checkpoint() {
     if [ -z "$ckpt_path" ]; then
         # Try direct path
         ckpt_path="$GDRIVE_RUNS/$ckpt_name"
+    fi
+
+    # Check if already extracted (skip unless --force)
+    local existing_pt=$(find "$dest_dir" -name "*.pt" 2>/dev/null | head -1)
+    if [ -n "$existing_pt" ] && [ "$force" != "--force" ]; then
+        echo "[CKPT] Already exists: $existing_pt"
+        echo "[CKPT] Use --force to re-extract"
+        export CHECKPOINT="$existing_pt"
+        return 0
     fi
 
     # Handle .tgz vs .pt
@@ -163,13 +175,13 @@ pull_checkpoint() {
         echo "[CKPT] Ready: $CHECKPOINT"
     else
         echo "[CKPT] ERROR: Not found: $ckpt_name"
-        echo "[CKPT] Available shortcuts: q2_best, q2_0.53, q4_v1"
+        echo "[CKPT] Available shortcuts: q2_best, q2_0.53, q4_fp32"
         return 1
     fi
 }
 
 if [ -n "$CKPT_ARG" ]; then
-    pull_checkpoint "$CKPT_ARG"
+    pull_checkpoint "$CKPT_ARG" "$FORCE_FLAG"
 fi
 
 # =============================================================================
