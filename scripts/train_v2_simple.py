@@ -45,6 +45,9 @@ def main():
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
     parser.add_argument('--wandb-project', type=str, default='qwen3-qat', help='W&B project name')
     parser.add_argument('--wandb-run', type=str, default=None, help='W&B run name (default: auto)')
+    # Google Drive upload
+    parser.add_argument('--gdrive-dir', type=str, default=None,
+                        help='Google Drive directory to upload FP32 checkpoint (creates if missing)')
     args = parser.parse_args()
 
     # Validate inputs - need v1, v2 checkpoint, or from-scratch
@@ -393,6 +396,33 @@ def main():
     fp16_path = f"{args.output_dir}/v2_q2a4_fp16_{timestamp}.pt"
     torch.save(v2_model.state_dict(), fp16_path)
     print(f"  FP16: {fp16_path}")
+
+    # =========================================================================
+    # STEP 5: Upload to Google Drive (optional)
+    # =========================================================================
+    if args.gdrive_dir:
+        import shutil
+        print(f"\n[5/5] Uploading to Google Drive...")
+        gdrive_path = Path(args.gdrive_dir)
+
+        # Create directory if missing
+        if not gdrive_path.exists():
+            try:
+                gdrive_path.mkdir(parents=True, exist_ok=True)
+                print(f"  Created: {gdrive_path}")
+            except Exception as e:
+                print(f"  ERROR creating directory: {e}")
+                print("  Skipping upload.")
+                gdrive_path = None
+
+        if gdrive_path and gdrive_path.exists():
+            # Upload FP32 only
+            dest_fp32 = gdrive_path / Path(fp32_path).name
+            try:
+                shutil.copy2(fp32_path, dest_fp32)
+                print(f"  Uploaded: {dest_fp32}")
+            except Exception as e:
+                print(f"  ERROR uploading: {e}")
 
     print("\nDone!")
 

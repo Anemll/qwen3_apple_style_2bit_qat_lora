@@ -606,7 +606,7 @@ For maximum quality with 2-bit weights, use progressive quantization:
 2. Convert to 2-bit (Q2_A4)
 3. Fine-tune at 2-bit
 
-See [A1Q.md](A1Q.md) for detailed documentation.
+See [AQ1.md](AQ1.md) for detailed documentation.
 
 ### 11.1 Convert Q4_A4 to Q2_A4
 

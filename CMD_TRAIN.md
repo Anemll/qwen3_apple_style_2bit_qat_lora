@@ -1,6 +1,6 @@
-# ANEMLL-QUANT-1: V2 QAT Training Commands
+# ANEMLL-QUANT-1: V2 KD-QAT Training Commands
 
-> **Architecture Overview:** See [A1Q.md](A1Q.md) for V1 vs V2 architecture details, STE-FP16, and progressive quantization concepts.
+> **Architecture Overview:** See [AQ1.md](AQ1.md) for V1 vs V2 architecture details, STE-FP16, and progressive quantization concepts.
 
 ---
 
@@ -12,7 +12,7 @@ Best quality through staged training:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  1. Train V1 (standard QAT)                             │
+│  1. Train V1 (KD-QAT with teacher distillation)         │
 │     - Full A@B materialization OK during training       │
 │     - Focus on convergence quality                      │
 │                                                         │
@@ -85,18 +85,40 @@ Best for 2-bit quality - train at higher precision first:
 │     - Easier to converge at higher precision            │
 │                                                         │
 │  2. Convert Q4 → Q2                                     │
-│     - K-means LUT reduction: 16 → 4 entries             │
+│     - K-means LUT reduction: 16 → 4 entries (MLP only)  │
 │     - Rank expansion: 4 → 32 (MLP), 4 → 8 (Attn)        │
 │                                                         │
-│  3. Fine-tune Q2_A4                                     │
-│     - Recover quality lost during conversion            │
-│     - ~500-1000 steps                                   │
+│  3. Fine-tune Q2_A4 (MLP-only, ~2x faster)              │
+│     - Attention unchanged (still 4-bit from Q4)         │
+│     - Focus on MLP which has major changes              │
+│     - ~500 steps with --mlp-only                        │
 │                                                         │
 │  4. Snap to FP16 for ANE export                         │
 └─────────────────────────────────────────────────────────┘
 ```
 
-See [A1Q.md](A1Q.md) for detailed progressive quantization documentation.
+**Commands:**
+```bash
+# Step 2: Convert Q4 → Q2
+python scripts/convert_q4_to_q2.py \
+    --q4-checkpoint runs/q4/checkpoint.pt \
+    --output runs/q2_from_q4/q2_init.pt
+
+# Step 3: Fine-tune MLP only (attention already good from Q4)
+python scripts/train_v2_simple.py \
+    --v2-checkpoint runs/q2_from_q4/q2_init.pt \
+    --cache-dir caches/alpaca_chat_think_both_L128_K128_R1024 \
+    --output-dir runs/q2_from_q4 \
+    --mlp-only \
+    --max-steps 500
+
+# Step 4: Snap for ANE
+python scripts/snap_and_test_v2.py \
+    --checkpoint runs/q2_from_q4/best_state_dict.pt \
+    --fp16 --output runs/export/model_fp16.pt
+```
+
+See [AQ1.md](AQ1.md) for detailed progressive quantization documentation.
 
 ---
 
@@ -262,6 +284,7 @@ python scripts/train_v2_simple.py \
 | `--wandb` | Enable Weights & Biases logging | False |
 | `--wandb-project` | W&B project name | qwen3-qat |
 | `--wandb-run` | W&B run name | auto |
+| `--gdrive-dir` | Auto-upload FP32 checkpoint to Google Drive | None |
 
 ## Logging
 
@@ -387,6 +410,25 @@ This creates:
 - `config.json` - Configuration for ANE
 
 ## Save to Google Drive
+
+### Auto-upload During Training (Recommended)
+
+Use `--gdrive-dir` to automatically upload FP32 checkpoint after training:
+
+```bash
+python scripts/train_v2_simple.py \
+    --v2-checkpoint runs/v2_output/checkpoint.pt \
+    --cache-dir caches/alpaca_chat_think_both_L128_K128_R1024 \
+    --output-dir runs/v2_output \
+    --max-steps 1000 \
+    --gdrive-dir /content/drive/MyDrive/qwen3_runs/v2_output
+```
+
+This will:
+- Create the directory if it doesn't exist
+- Upload only the FP32 checkpoint (smaller than FP16 for same precision)
+
+### Manual Copy
 
 ```bash
 # Copy checkpoints

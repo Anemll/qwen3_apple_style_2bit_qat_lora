@@ -4,7 +4,33 @@ This document describes the ANEMLL-QUANT-1 quantization architecture for efficie
 
 ---
 
-## 1. Core Concept: Weight Decomposition
+## 1. KD-QAT: Knowledge Distillation + Quantization-Aware Training
+
+ANEMLL-QUANT-1 uses **KD-QAT** (Knowledge Distillation QAT), not standard QAT:
+
+| Component | Role |
+|-----------|------|
+| **Teacher** | Full-precision model (FP16/BF16) |
+| **Student** | Quantized model being trained |
+| **Loss** | KL divergence between teacher/student logits |
+
+```
+Teacher (frozen) ──→ soft labels (logits)
+                           ↓
+Student (training) ──→ match teacher distribution
+```
+
+**Why KD?** Standard QAT uses hard labels (ground truth tokens). KD preserves the teacher's "dark knowledge" - the full probability distribution over vocabulary, not just the correct answer.
+
+**KD Loss:**
+```python
+loss = KL_div(student_logits / T, teacher_logits / T) * T²
+```
+Where `T` is temperature (typically 2.0) - softens distributions for better gradient signal.
+
+---
+
+## 2. Weight Decomposition
 
 ANEMLL-QUANT-1 decomposes weights into two components (similar to exponent × mantissa in floating point):
 
@@ -22,7 +48,7 @@ This separation allows:
 
 ---
 
-## 2. LUT-Based Quantization
+## 3. LUT-Based Quantization
 
 The quantized values come from a learned **Lookup Table (LUT)**:
 
@@ -39,7 +65,7 @@ Each weight maps to one LUT entry via its index. The LUT values are learned duri
 
 ---
 
-## 3. Low-Rank Scale Compression
+## 4. Low-Rank Scale Compression
 
 Per-weight scales would require [out × in] parameters - too expensive!
 
@@ -59,7 +85,7 @@ Where:
 
 ---
 
-## 4. Scale Initialization (Block Quantization + SVD)
+## 5. Scale Initialization (Block Quantization + SVD)
 
 How do we initialize A and B? We use **block quantization** to derive initial scales, then **SVD** to compress them.
 
@@ -109,7 +135,7 @@ The SVD finds the best rank-r approximation to the scale matrix.
 
 ---
 
-## 5. V1: Training-Efficient Architecture
+## 6. V1: Training-Efficient Architecture
 
 Combining LUT quantization with low-rank scales:
 
@@ -144,7 +170,7 @@ V1 materializes `A @ B` as a full [out × in] matrix, which seems wasteful - but
 
 ---
 
-## 6. V2: ANE-Friendly Refactoring
+## 7. V2: ANE-Friendly Refactoring
 
 V2 refactors the forward pass to avoid materializing the [out × in] scale matrix.
 
@@ -221,7 +247,7 @@ for k in range(rank):
 
 ---
 
-## 7. V1 vs V2 Component Comparison
+## 8. V1 vs V2 Component Comparison
 
 | Component | V1 | V2 |
 |-----------|----|----|
@@ -233,7 +259,7 @@ for k in range(rank):
 
 ---
 
-## 8. STE-FP16: Training for ANE Matching
+## 9. STE-FP16: Training for ANE Matching
 
 ANE runs in FP16. To ensure training matches deployment, we use **Straight-Through Estimator**:
 
@@ -252,7 +278,7 @@ def ste_fp16(x):
 
 ---
 
-## 9. Quantization Configurations
+## 10. Quantization Configurations
 
 ### Q2_A4: 2-bit MLP, 4-bit Attention
 
@@ -272,7 +298,7 @@ def ste_fp16(x):
 
 ---
 
-## 10. Training Workflows
+## 11. Training Workflows
 
 ### Workflow A: V1 → V2 (Best Quality)
 
@@ -303,7 +329,7 @@ Train Q4_A4 → Convert to Q2_A4 → Fine-tune → Export FP16
 
 ---
 
-## 11. Progressive Quantization: Q4 → Q2
+## 12. Progressive Quantization: Q4 → Q2
 
 ### The Problem with 2-bit from Scratch
 
@@ -373,12 +399,30 @@ new_g[4:] = 0.01  # Small init for new ranks
 
 **Why expand rank?** The low-rank scale matrix `A @ B` must now compensate for the coarser LUT. Higher rank = more expressiveness.
 
-#### Step 3: Fine-tune
+#### Step 3: Fine-tune (MLP-only recommended)
 
 After conversion, fine-tune to recover quality:
 - Existing ranks already encode useful structure
 - New ranks learn to fill the gaps
 - ~500 steps typically sufficient
+
+**Optimization:** Use `--mlp-only` flag for Q4→Q2 fine-tuning:
+
+```bash
+python scripts/train_v2_simple.py \
+    --v2-checkpoint runs/q2_from_q4/q2_init.pt \
+    --mlp-only \
+    --max-steps 500
+```
+
+**Why MLP-only?**
+
+| Component | Q4→Q2 Change | Train? |
+|-----------|--------------|--------|
+| MLP | LUT 16→4, rank 4→32 | ✓ Yes (major change) |
+| Attention | LUT 16→16, rank 4→8 | ✗ No (minor change) |
+
+**Speedup:** ~2× faster (train 3 MLP vs 7 total projections per layer)
 
 ### The Mathematics
 
@@ -398,7 +442,7 @@ The goal: `W_q2 ≈ W_q4` despite having only 4 LUT values.
 
 ---
 
-## 12. Training Results
+## 13. Training Results
 
 ### V1 → V2 Conversion
 
@@ -419,7 +463,7 @@ The goal: `W_q2 ≈ W_q4` despite having only 4 LUT values.
 
 ---
 
-## 13. Memory & Performance
+## 14. Memory & Performance
 
 ### Scale Memory Comparison
 
