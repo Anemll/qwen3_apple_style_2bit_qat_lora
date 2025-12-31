@@ -149,8 +149,8 @@ pull_checkpoint() {
         if [ -f "$ckpt_path" ]; then
             echo "[CKPT] Extracting $(basename $ckpt_path)..."
             tar -xzf "$ckpt_path" -C "$dest_dir/"
-            # Find the .pt file
-            export CHECKPOINT=$(ls "$dest_dir"/*.pt 2>/dev/null | head -1)
+            # Find the .pt file (search recursively for subdirectories)
+            export CHECKPOINT=$(find "$dest_dir" -name "*.pt" 2>/dev/null | head -1)
             echo "[CKPT] Ready: $CHECKPOINT"
         else
             echo "[CKPT] ERROR: Not found: $ckpt_path"
