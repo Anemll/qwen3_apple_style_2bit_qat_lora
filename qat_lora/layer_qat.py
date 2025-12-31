@@ -1147,6 +1147,10 @@ def train_e2e(
     warmup_steps: int = 0,
     min_lr_ratio: float = 0.1,
     use_fp16: bool = False,
+    use_wandb: bool = False,
+    wandb_project: str = "qwen3-qat",
+    wandb_run_name: str = None,
+    wandb_config: dict = None,
 ) -> dict:
     """End-to-end KD-QAT training (all layers unfrozen).
 
@@ -1175,6 +1179,10 @@ def train_e2e(
         warmup_steps: Linear warmup steps (0 to disable)
         min_lr_ratio: Minimum LR as ratio of peak LR (default 0.1 = 10% of lr)
         use_fp16: Enable FP16 training with GradScaler (CUDA only)
+        use_wandb: Enable Weights & Biases logging (requires wandb package)
+        wandb_project: W&B project name (default: "qwen3-qat")
+        wandb_run_name: W&B run name (default: auto-generated)
+        wandb_config: Additional config dict to log to W&B
 
     Returns:
         Dict with 'initial_loss', 'final_loss', 'best_loss', 'steps', 'time_sec'
@@ -1204,6 +1212,48 @@ def train_e2e(
         else:
             if verbose:
                 print(f"[FP16] Warning: FP16 training on {device.type} without GradScaler")
+
+    # Setup wandb logging
+    wandb_run = None
+    if use_wandb:
+        try:
+            import wandb
+            # Build config for wandb
+            run_config = {
+                'max_steps': max_steps,
+                'batch_size': batch_size,
+                'lr': lr,
+                'temperature': temperature,
+                'train_weights': train_weights,
+                'train_scales': train_scales,
+                'train_g_only': train_g_only,
+                'train_mlp_only': train_mlp_only,
+                'hard_top1_weight': hard_top1_weight,
+                'hard_full_weight': hard_full_weight,
+                'use_cosine_schedule': use_cosine_schedule,
+                'warmup_steps': warmup_steps,
+                'min_lr_ratio': min_lr_ratio,
+                'use_fp16': use_fp16,
+                'device': str(device),
+                'model_dtype': str(model_dtype),
+            }
+            if wandb_config:
+                run_config.update(wandb_config)
+
+            wandb_run = wandb.init(
+                project=wandb_project,
+                name=wandb_run_name,
+                config=run_config,
+                reinit=True,
+            )
+            if verbose:
+                print(f"[wandb] Logging to: {wandb_run.url}")
+        except ImportError:
+            print("[wandb] Warning: wandb not installed. Install with: pip install wandb")
+            use_wandb = False
+        except Exception as e:
+            print(f"[wandb] Warning: Failed to initialize wandb: {e}")
+            use_wandb = False
 
     # Set trainable parameters
     trainable = 0
@@ -1398,6 +1448,15 @@ def train_e2e(
                 if csv_writer is not None:
                     csv_writer.writerow([step, f'{avg_loss:.6f}', '', f'{current_lr:.2e}', f'{elapsed:.1f}'])
                     csv_file.flush()
+                # Log to wandb
+                if use_wandb and wandb_run is not None:
+                    import wandb
+                    wandb.log({
+                        'train/loss': avg_loss,
+                        'train/lr': current_lr,
+                        'train/step': step,
+                        'train/elapsed_sec': elapsed,
+                    }, step=step)
                 loss_history.append(avg_loss)
                 total_loss = 0.0
 
@@ -1413,6 +1472,13 @@ def train_e2e(
                 if csv_writer is not None:
                     csv_writer.writerow([step, '', f'{eval_loss:.6f}', f'{current_lr:.2e}', f'{elapsed:.1f}'])
                     csv_file.flush()
+                # Log to wandb
+                if use_wandb and wandb_run is not None:
+                    import wandb
+                    wandb.log({
+                        'eval/loss': eval_loss,
+                        'eval/best_loss': best_loss,
+                    }, step=step)
                 if eval_loss < best_loss:
                     best_loss = eval_loss
                     # Save best state in memory
@@ -1445,6 +1511,19 @@ def train_e2e(
         if verbose:
             print(f"CSV log saved to: {csv_path}")
 
+    # Log final results to wandb
+    if use_wandb and wandb_run is not None:
+        import wandb
+        wandb.log({
+            'eval/loss': final_loss,
+            'eval/best_loss': best_loss,
+            'summary/initial_loss': initial_loss,
+            'summary/final_loss': final_loss,
+            'summary/best_loss': best_loss,
+            'summary/improvement': initial_loss - final_loss,
+            'summary/time_sec': elapsed,
+        }, step=step)
+
     # Update best if final is better
     if final_loss < best_loss:
         best_loss = final_loss
@@ -1476,6 +1555,15 @@ def train_e2e(
     import gc
     gc.collect()
 
+    # Finish wandb run
+    wandb_url = None
+    if use_wandb and wandb_run is not None:
+        import wandb
+        wandb_url = wandb_run.url
+        wandb.finish()
+        if verbose:
+            print(f"[wandb] Run finished: {wandb_url}")
+
     return {
         'initial_loss': initial_loss,
         'final_loss': final_loss,
@@ -1485,4 +1573,5 @@ def train_e2e(
         'time_sec': elapsed,
         'loss_history': loss_history,
         'csv_path': csv_path,
+        'wandb_url': wandb_url,
     }

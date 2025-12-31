@@ -41,6 +41,10 @@ def main():
     parser.add_argument('--g-only', action='store_true', help='Train only rank_magnitude (G), freeze A and B')
     parser.add_argument('--mlp-only', action='store_true', help='Train only MLP layers, freeze attention')
     parser.add_argument('--save-steps', type=int, default=0, help='Save checkpoint every N steps (0=disabled)')
+    # Wandb logging
+    parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb-project', type=str, default='qwen3-qat', help='W&B project name')
+    parser.add_argument('--wandb-run', type=str, default=None, help='W&B run name (default: auto)')
     args = parser.parse_args()
 
     # Validate inputs - need v1, v2 checkpoint, or from-scratch
@@ -330,6 +334,20 @@ def main():
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    # Build wandb config with run info
+    wandb_config = {
+        'model_id': args.model_id,
+        'mlp_lut_size': MLP_LUT_SIZE,
+        'mlp_rank': MLP_RANK,
+        'attn_lut_size': ATTN_LUT_SIZE,
+        'attn_rank': ATTN_RANK,
+        'group_size': GROUP_SIZE,
+        'v1_checkpoint': args.v1_checkpoint,
+        'v2_checkpoint': args.v2_checkpoint,
+        'from_scratch': args.from_scratch,
+        'cache_dir': args.cache_dir,
+    }
+
     result = train_e2e(
         model=v2_model,
         cache_dir=args.cache_dir,
@@ -352,6 +370,10 @@ def main():
         save_steps=args.save_steps,
         verbose=True,
         use_fp16=False,  # STE handles FP16
+        use_wandb=args.wandb,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run,
+        wandb_config=wandb_config,
     )
 
     print(f"\n  Final loss: {result.get('final_loss', 'N/A')}")

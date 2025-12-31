@@ -93,6 +93,33 @@ python scripts/train_v2_simple.py \
 | `--save-steps` | Save checkpoint every N steps | 0 (disabled) |
 | `--g-only` | Train only G (rank_magnitude) | False |
 | `--mlp-only` | Train only MLP layers | False |
+| `--wandb` | Enable Weights & Biases logging | False |
+| `--wandb-project` | W&B project name | qwen3-qat |
+| `--wandb-run` | W&B run name | auto |
+
+## Logging
+
+Training automatically saves:
+- `training_log.csv` - CSV with step, train_loss, eval_loss, lr, elapsed_sec
+- Periodic checkpoints (if `--save-steps` > 0)
+- Best checkpoint (`best_state_dict.pt`)
+
+### Weights & Biases
+
+Enable W&B logging for experiment tracking:
+
+```bash
+pip install wandb
+wandb login
+
+python scripts/train_v2_simple.py \
+    --v2-checkpoint runs/v2_output/checkpoint.pt \
+    --cache-dir caches/alpaca_chat_think_both_L128_K128_R1024 \
+    --output-dir runs/v2_output \
+    --wandb \
+    --wandb-project my-qat-project \
+    --wandb-run experiment-1
+```
 
 ## Inference Testing
 
