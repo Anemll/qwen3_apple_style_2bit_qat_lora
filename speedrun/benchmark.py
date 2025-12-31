@@ -197,7 +197,8 @@ def run_benchmark(
             if verbose:
                 print("  Loading V2 model from cache...", end=" ", flush=True)
             t0 = time.time()
-            model = torch.load(v2_model_path, map_location='cpu')
+            # weights_only=False required for loading full model objects
+            model = torch.load(v2_model_path, map_location='cpu', weights_only=False)
             if verbose:
                 print(f"done ({time.time()-t0:.1f}s)")
         else:
