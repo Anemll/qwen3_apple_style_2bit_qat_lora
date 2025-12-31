@@ -77,6 +77,43 @@ echo "[ENV] Working dir: $(pwd)"
 # Create directories
 mkdir -p caches runs/speedrun
 
+# Local temp dir for fast extraction (Colab SSD)
+LOCAL_TMP="/content"
+
+# =============================================================================
+# HELPER: Fast archive extraction (rsync to local, extract, cleanup)
+# =============================================================================
+fast_extract() {
+    local src_path="$1"
+    local dest_dir="$2"
+    local archive_name=$(basename "$src_path")
+
+    if [ "$PLATFORM" = "colab" ] && [ -d "$LOCAL_TMP" ]; then
+        # Colab: rsync to local SSD first (2-3x faster)
+        echo "  Copying to local SSD..."
+        rsync -ah --progress "$src_path" "$LOCAL_TMP/"
+
+        echo "  Extracting locally..."
+        if [[ "$archive_name" == *.tar.lz4 ]]; then
+            which lz4 >/dev/null || apt-get install -qq lz4
+            tar -I lz4 -xf "$LOCAL_TMP/$archive_name" -C "$dest_dir/"
+        elif [[ "$archive_name" == *.tgz ]]; then
+            tar -xzf "$LOCAL_TMP/$archive_name" -C "$dest_dir/"
+        fi
+
+        # Cleanup local copy
+        rm -f "$LOCAL_TMP/$archive_name"
+    else
+        # macOS or no local tmp: extract directly
+        if [[ "$archive_name" == *.tar.lz4 ]]; then
+            which lz4 >/dev/null 2>&1 || { echo "lz4 not found"; return 1; }
+            tar -I lz4 -xf "$src_path" -C "$dest_dir/"
+        elif [[ "$archive_name" == *.tgz ]]; then
+            tar -xzf "$src_path" -C "$dest_dir/"
+        fi
+    fi
+}
+
 # =============================================================================
 # CACHE SETUP
 # =============================================================================
@@ -95,14 +132,13 @@ pull_cache() {
 
     # Remove empty/broken cache dir
     [ -d "$cache_dir" ] && rm -rf "$cache_dir"
+    mkdir -p "$cache_dir"
 
     # Prefer .tar.lz4 (fastest)
     local lz4_path="$GDRIVE_CACHES/${cache_name}.tar.lz4"
     if [ -f "$lz4_path" ]; then
-        echo "[CACHE] Extracting $cache_name.tar.lz4 (lz4 - fast)..."
-        which lz4 >/dev/null || apt-get install -qq lz4
-        mkdir -p "$cache_dir"
-        tar -I lz4 -xf "$lz4_path" -C caches/
+        echo "[CACHE] Extracting $cache_name.tar.lz4 (lz4 + rsync)..."
+        fast_extract "$lz4_path" "caches"
         # Verify extraction worked
         local pt_count=$(ls "$cache_dir"/*.pt 2>/dev/null | wc -l)
         if [ "$pt_count" -gt 0 ]; then
@@ -111,16 +147,17 @@ pull_cache() {
         else
             echo "[CACHE] WARN: lz4 extraction failed, trying tgz..."
             rm -rf "$cache_dir"
+            mkdir -p "$cache_dir"
         fi
     fi
 
     # Fall back to .tgz
     local tgz_path="$GDRIVE_CACHES/${cache_name}.tgz"
     if [ -f "$tgz_path" ]; then
-        echo "[CACHE] Extracting $cache_name.tgz..."
-        mkdir -p "$cache_dir"
-        tar -xzf "$tgz_path" -C caches/
-        echo "[CACHE] Done"
+        echo "[CACHE] Extracting $cache_name.tgz (rsync + extract)..."
+        fast_extract "$tgz_path" "caches"
+        local pt_count=$(ls "$cache_dir"/*.pt 2>/dev/null | wc -l)
+        echo "[CACHE] Done ($pt_count files)"
         return 0
     fi
 
@@ -128,7 +165,7 @@ pull_cache() {
     local dir_path="$GDRIVE_CACHES/$cache_name"
     if [ -d "$dir_path" ]; then
         echo "[CACHE] Copying $cache_name (directory - slower)..."
-        cp -r "$dir_path" "caches/"
+        rsync -ah --progress "$dir_path/" "$cache_dir/"
         echo "[CACHE] Done"
         return 0
     fi
@@ -181,10 +218,8 @@ pull_checkpoint() {
     # Handle .tar.lz4 vs .tgz vs .pt
     if [[ "$ckpt_path" == *.tar.lz4 ]]; then
         if [ -f "$ckpt_path" ]; then
-            echo "[CKPT] Extracting $(basename $ckpt_path) (lz4 - fast)..."
-            # Install lz4 if needed
-            which lz4 >/dev/null || apt-get install -qq lz4
-            tar -I lz4 -xf "$ckpt_path" -C "$dest_dir/"
+            echo "[CKPT] Extracting $(basename $ckpt_path) (lz4 + rsync)..."
+            fast_extract "$ckpt_path" "$dest_dir"
             export CHECKPOINT=$(find "$dest_dir" -name "*.pt" 2>/dev/null | head -1)
             echo "[CKPT] Ready: $CHECKPOINT"
         else
@@ -193,9 +228,8 @@ pull_checkpoint() {
         fi
     elif [[ "$ckpt_path" == *.tgz ]]; then
         if [ -f "$ckpt_path" ]; then
-            echo "[CKPT] Extracting $(basename $ckpt_path)..."
-            tar -xzf "$ckpt_path" -C "$dest_dir/"
-            # Find the .pt file (search recursively for subdirectories)
+            echo "[CKPT] Extracting $(basename $ckpt_path) (rsync + extract)..."
+            fast_extract "$ckpt_path" "$dest_dir"
             export CHECKPOINT=$(find "$dest_dir" -name "*.pt" 2>/dev/null | head -1)
             echo "[CKPT] Ready: $CHECKPOINT"
         else
@@ -204,7 +238,7 @@ pull_checkpoint() {
         fi
     elif [ -f "$ckpt_path" ]; then
         echo "[CKPT] Copying $(basename $ckpt_path)..."
-        cp "$ckpt_path" "$dest_dir/"
+        rsync -ah --progress "$ckpt_path" "$dest_dir/"
         export CHECKPOINT="$dest_dir/$(basename $ckpt_path)"
         echo "[CKPT] Ready: $CHECKPOINT"
     else
