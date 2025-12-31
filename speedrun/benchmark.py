@@ -345,9 +345,10 @@ def find_max_batch_size(
     # Print header
     print_result_header(seq_len)
 
-    # Start with batch=8, double until OOM
+    # Phase 1: Double until OOM to find range
     batch_sizes = [8, 16, 32, 64, 128, 256, 512]
     max_working_batch = 0
+    first_failing_batch = None
     results = []
 
     for batch in batch_sizes:
@@ -369,9 +370,45 @@ def find_max_batch_size(
             print(f"OK (mem={result.peak_memory_mb:.0f}M, t/s={result.tokens_per_sec:.0f})")
             print_result_row(result)
         else:
+            first_failing_batch = batch
             print(f"OOM")
             print_result_row(result)
             break
+
+    # Phase 2: Binary search for exact max (e.g., find 48 between 32 and 64)
+    if first_failing_batch and max_working_batch > 0:
+        low, high = max_working_batch, first_failing_batch
+        while high - low > 8:  # Stop when range is <=8
+            mid = (low + high) // 2
+            # Round to multiple of 8 for efficiency
+            mid = (mid // 8) * 8
+            if mid == low:
+                mid = low + 8
+            if mid >= high:
+                break
+
+            print(f"\n  Binary search: trying batch={mid}...", end=" ", flush=True)
+            result = run_benchmark(
+                cache_dir=cache_dir,
+                batch_size=mid,
+                steps=steps,
+                gradient_checkpointing=gradient_checkpointing,
+                device=device,
+                model_id=model_id,
+                verbose=False,
+                v2_model_path=v2_model_path,
+            )
+            results.append(result)
+
+            if result.success:
+                low = mid
+                max_working_batch = mid
+                print(f"OK (mem={result.peak_memory_mb:.0f}M, t/s={result.tokens_per_sec:.0f})")
+                print_result_row(result)
+            else:
+                high = mid
+                print(f"OOM")
+                print_result_row(result)
 
     print(f"\n{'='*60}")
     print(f"MAX BATCH SIZE: {max_working_batch}")
