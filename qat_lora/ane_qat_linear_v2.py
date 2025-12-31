@@ -446,12 +446,14 @@ class AnemllQATLinearV2(nn.Module):
         if self.bias is not None:
             y = y + self.bias.to(x.dtype)
 
-        # Add LoRA if enabled
+        # Add LoRA if enabled (in-place for memory efficiency)
         if self.lora_r > 0:
             x_d = self.lora_drop(x) if self.lora_drop is not None else x
             lora_A = self.lora_A.to(x.dtype)
             lora_B = self.lora_B.to(x.dtype)
-            y = y + (x_d @ lora_A.t() @ lora_B.t()) * self.scaling
+            # In-place addition: y += ... is more memory efficient
+            hidden = x_d @ lora_A.t()  # [*, lora_r] - small intermediate
+            y += (hidden @ lora_B.t()) * self.scaling
 
         return y
 

@@ -8,6 +8,7 @@ Quick setup scripts for training on Colab/remote instances.
 |--------|---------|
 | `setup.sh` | Environment setup, pull caches/checkpoints |
 | `create_q2_init.sh` | Q4→Q2 conversion on low-end instance |
+| `benchmark.py` | Training performance benchmarks |
 
 ## Usage
 
@@ -53,12 +54,13 @@ source speedrun/setup.sh L64 q2_init
 3. **Full Training**: Use `L128` cache (better quality)
 4. **Low-end Instance**: Run `create_q2_init.sh` on T4/T3 (CPU conversion)
 
-## Notebooks
+## Notebooks / Tasks
 
-| Notebook | Purpose |
-|----------|---------|
-| `SR-001.ipynb` | Q4→Q2 conversion + upload |
-| `SR-002.ipynb` | Q2 MLP training |
+| Task | Purpose |
+|------|---------|
+| `SR-001` | Q4→Q2 conversion + upload |
+| `SR-002` | Q2 MLP training |
+| `SR-003` | Performance benchmark (benchmark.py) |
 
 ### SR-001: Q4→Q2 Conversion
 
@@ -88,14 +90,50 @@ Cells are labeled with `# [CELL N]` comments for easy navigation.
 
 **Recommended:** Run training in terminal (CELL 5 prints commands)
 
+### SR-003: Performance Benchmark
+
+Benchmark training optimizations (in-place LoRA, gradient checkpointing).
+
+```bash
+# Setup + run benchmarks
+source speedrun/setup.sh L64
+python speedrun/benchmark.py --cache-dir $CACHE_DIR --steps 20
+```
+
+**What it measures:**
+
+| Metric | Description |
+|--------|-------------|
+| Step time | Seconds per training step |
+| Peak memory | GPU memory usage (MB) |
+| t/s | Throughput (tokens per second) |
+
+**Benchmarks run:**
+1. Baseline (batch=8) - no optimizations
+2. Gradient checkpointing (batch=8) - same batch, less memory
+3. Gradient checkpointing (batch=16) - larger batch enabled by memory savings
+
+**Expected results (T4 16GB, L64 cache):**
+
+| Config | Step(s) | Memory | t/s |
+|--------|---------|--------|-----|
+| batch=8 | ~0.45 | ~8.5 GB | ~1150 |
+| batch=8+checkpointing | ~0.52 | ~5.2 GB | ~980 |
+| batch=16+checkpointing | ~0.85 | ~9.8 GB | ~1200 |
+
+*t/s = tokens/sec = batch × seq_len × steps / time*
+
+**Key insight:** Checkpointing reduces memory ~40%, enabling larger batches for same throughput with better gradient estimates.
+
 ## Directory Structure
 
 ```
 speedrun/
-├── README.md       # This file
-├── log.md          # Run history
-├── setup.sh        # Environment setup
-└── create_q2_init.sh  # Q4→Q2 conversion
+├── README.md         # This file
+├── log.md            # Run history
+├── setup.sh          # Environment setup
+├── benchmark.py      # Training performance benchmarks
+└── create_q2_init.sh # Q4→Q2 conversion
 ```
 
 ## Google Drive Paths

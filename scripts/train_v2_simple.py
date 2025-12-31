@@ -48,6 +48,9 @@ def main():
     # Google Drive upload
     parser.add_argument('--gdrive-dir', type=str, default=None,
                         help='Google Drive directory to upload FP32 checkpoint (creates if missing)')
+    # Memory optimization
+    parser.add_argument('--gradient-checkpointing', action='store_true',
+                        help='Enable gradient checkpointing (trades ~15%% speed for ~40%% memory)')
     args = parser.parse_args()
 
     # Validate inputs - need v1, v2 checkpoint, or from-scratch
@@ -315,6 +318,16 @@ def main():
         initial_path = f"{args.output_dir}/v2_initial.pt"
         torch.save(v2_model.state_dict(), initial_path)
         print(f"  Saved initial V2 to {initial_path}")
+
+    # =========================================================================
+    # GRADIENT CHECKPOINTING (optional memory optimization)
+    # =========================================================================
+    if args.gradient_checkpointing:
+        if hasattr(v2_model, 'gradient_checkpointing_enable'):
+            v2_model.gradient_checkpointing_enable()
+            print("\n[*] Gradient checkpointing enabled (trades ~15% speed for ~40% memory)")
+        else:
+            print("\n[!] Warning: Model does not support gradient_checkpointing_enable()")
 
     # =========================================================================
     # STEP 3: Freeze Q and train
