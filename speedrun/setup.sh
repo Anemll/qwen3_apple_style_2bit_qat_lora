@@ -130,6 +130,19 @@ pull_cache() {
         return 0
     fi
 
+    # Check for nested directory from previous extraction
+    local nested_dir="$cache_dir/$cache_name"
+    if [ -d "$nested_dir" ]; then
+        local nested_count=$(ls "$nested_dir"/*.pt 2>/dev/null | wc -l)
+        if [ "$nested_count" -gt 0 ]; then
+            echo "[CACHE] Fixing nested structure from previous extraction..."
+            mv "$nested_dir"/* "$cache_dir/"
+            rmdir "$nested_dir"
+            echo "[CACHE] $cache_name ready ($nested_count files)"
+            return 0
+        fi
+    fi
+
     # Remove empty/broken cache dir
     [ -d "$cache_dir" ] && rm -rf "$cache_dir"
     mkdir -p "$cache_dir"
@@ -168,6 +181,22 @@ pull_cache() {
         echo "[CACHE] Extracting $cache_name.tgz (rsync + extract)..."
         fast_extract "$tgz_path" "caches"
         local pt_count=$(ls "$cache_dir"/*.pt 2>/dev/null | wc -l)
+        if [ "$pt_count" -gt 0 ]; then
+            echo "[CACHE] Done ($pt_count files)"
+            return 0
+        fi
+        # Check for nested directory (tgz bug: name/name/*.pt)
+        local nested_dir="$cache_dir/$cache_name"
+        if [ -d "$nested_dir" ]; then
+            local nested_count=$(ls "$nested_dir"/*.pt 2>/dev/null | wc -l)
+            if [ "$nested_count" -gt 0 ]; then
+                echo "[CACHE] Fixing nested structure..."
+                mv "$nested_dir"/* "$cache_dir/"
+                rmdir "$nested_dir"
+                echo "[CACHE] Done ($nested_count files)"
+                return 0
+            fi
+        fi
         echo "[CACHE] Done ($pt_count files)"
         return 0
     fi
