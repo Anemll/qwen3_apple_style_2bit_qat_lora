@@ -34,7 +34,7 @@ Training runs history with names and descriptions.
 
 ## Run History
 
-### 2024-12-31: SpeedRun0 - Q4→Q2 Progressive
+### 2024-12-31: SR-001 - Q4→Q2 Conversion
 
 **Goal**: Test speedrun setup, convert Q4→Q2, train MLP
 
