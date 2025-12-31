@@ -1438,12 +1438,14 @@ def train_e2e(
                     return f"{int(s)//3600}:{(int(s)%3600)//60:02d}:{int(s)%60:02d}"
                 # Get current LR
                 current_lr = scheduler.get_last_lr()[0] if scheduler is not None else lr
+                # Calculate throughput
+                it_per_sec = step / elapsed if elapsed > 0 else 0
                 # Print if verbose
                 if verbose:
                     if scheduler is not None:
-                        print(f"[{step}/{max_steps}] loss={avg_loss:.4f} lr={current_lr:.2e} ({fmt_time(elapsed)}, ETA {fmt_time(eta)})")
+                        print(f"[{step}/{max_steps}] loss={avg_loss:.4f} lr={current_lr:.2e} ({fmt_time(elapsed)}, ETA {fmt_time(eta)}, {it_per_sec:.2f} it/s)")
                     else:
-                        print(f"[{step}/{max_steps}] loss={avg_loss:.4f} ({fmt_time(elapsed)}, ETA {fmt_time(eta)})")
+                        print(f"[{step}/{max_steps}] loss={avg_loss:.4f} ({fmt_time(elapsed)}, ETA {fmt_time(eta)}, {it_per_sec:.2f} it/s)")
                 # Write to CSV
                 if csv_writer is not None:
                     csv_writer.writerow([step, f'{avg_loss:.6f}', '', f'{current_lr:.2e}', f'{elapsed:.1f}'])
