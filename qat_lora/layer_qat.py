@@ -1379,6 +1379,7 @@ def train_e2e(
     best_loss = initial_loss
     best_state = None
     loss_history = []
+    seq_len = None  # Will be set from first batch
 
     while step < max_steps:
         dataset = KDCacheDataset(cache_dir, shuffle=True)
@@ -1387,6 +1388,19 @@ def train_e2e(
         for batch in dataloader:
             if step >= max_steps:
                 break
+
+            # Get seq_len from first batch and print estimated total tokens
+            if seq_len is None and 'input_ids' in batch:
+                seq_len = batch['input_ids'].shape[1]
+                total_tokens_est = batch_size * seq_len * max_steps
+                if total_tokens_est >= 1e9:
+                    tok_str = f"{total_tokens_est/1e9:.2f}B"
+                elif total_tokens_est >= 1e6:
+                    tok_str = f"{total_tokens_est/1e6:.1f}M"
+                else:
+                    tok_str = f"{total_tokens_est/1e3:.0f}K"
+                if verbose:
+                    print(f"Estimated total tokens: {tok_str} (batch={batch_size}, seq={seq_len}, steps={max_steps})")
 
             # Forward pass with optional autocast for FP16
             if use_fp16:
@@ -1440,12 +1454,14 @@ def train_e2e(
                 current_lr = scheduler.get_last_lr()[0] if scheduler is not None else lr
                 # Calculate throughput
                 it_per_sec = step / elapsed if elapsed > 0 else 0
+                tok_per_sec = it_per_sec * batch_size * (seq_len or 0)
+                throughput_str = f"{tok_per_sec/1000:.1f}k tok/s" if seq_len else f"{it_per_sec:.2f} it/s"
                 # Print if verbose
                 if verbose:
                     if scheduler is not None:
-                        print(f"[{step}/{max_steps}] loss={avg_loss:.4f} lr={current_lr:.2e} ({fmt_time(elapsed)}, ETA {fmt_time(eta)}, {it_per_sec:.2f} it/s)")
+                        print(f"[{step}/{max_steps}] loss={avg_loss:.4f} lr={current_lr:.2e} ({fmt_time(elapsed)}, ETA {fmt_time(eta)}, {throughput_str})")
                     else:
-                        print(f"[{step}/{max_steps}] loss={avg_loss:.4f} ({fmt_time(elapsed)}, ETA {fmt_time(eta)}, {it_per_sec:.2f} it/s)")
+                        print(f"[{step}/{max_steps}] loss={avg_loss:.4f} ({fmt_time(elapsed)}, ETA {fmt_time(eta)}, {throughput_str})")
                 # Write to CSV
                 if csv_writer is not None:
                     csv_writer.writerow([step, f'{avg_loss:.6f}', '', f'{current_lr:.2e}', f'{elapsed:.1f}'])
@@ -1542,6 +1558,17 @@ def train_e2e(
         print(f"Final:   {final_loss:.4f}")
         print(f"Best:    {best_loss:.4f}")
         print(f"Improvement: {initial_loss - final_loss:.4f}")
+        # Total tokens processed
+        if seq_len is not None:
+            total_tokens = batch_size * seq_len * step
+            if total_tokens >= 1e9:
+                tok_str = f"{total_tokens/1e9:.2f}B"
+            elif total_tokens >= 1e6:
+                tok_str = f"{total_tokens/1e6:.1f}M"
+            else:
+                tok_str = f"{total_tokens/1e3:.0f}K"
+            avg_tok_per_sec = total_tokens / elapsed if elapsed > 0 else 0
+            print(f"Tokens:  {tok_str} ({avg_tok_per_sec/1000:.1f}k tok/s avg)")
         print(f"Time: {elapsed:.1f}s")
 
     # Cleanup to free GPU memory
