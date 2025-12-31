@@ -162,8 +162,11 @@ def run_benchmark(
         # Enable gradient checkpointing if requested
         if gradient_checkpointing:
             if hasattr(model, 'gradient_checkpointing_enable'):
-                model.gradient_checkpointing_enable()
-                print("  Gradient checkpointing: ENABLED")
+                # use_reentrant=False is required when inputs don't have requires_grad
+                model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+                print("  Gradient checkpointing: ENABLED (use_reentrant=False)")
             else:
                 print("  Warning: Model doesn't support gradient checkpointing")
 
@@ -245,9 +248,9 @@ def run_benchmark(
 def print_results(results: list[BenchmarkResult]):
     """Print benchmark results in a nice table."""
     print("\n")
-    print("=" * 80)
+    print("=" * 88)
     print("BENCHMARK RESULTS")
-    print("=" * 80)
+    print("=" * 88)
 
     # Show seq_len from first result
     if results:
@@ -255,18 +258,18 @@ def print_results(results: list[BenchmarkResult]):
     print()
 
     # Header
-    print(f"{'Config':<30} {'Batch':>6} {'Step(s)':>8} {'Memory':>10} {'t/s':>10} {'Status':>8}")
-    print("-" * 80)
+    print(f"{'Config':<30} {'Batch':>6} {'Step(s)':>8} {'Memory':>10} {'t/s':>10} {'Loss':>8} {'Status':>8}")
+    print("-" * 88)
 
     for r in results:
         if r.success:
-            print(f"{r.name:<30} {r.batch_size:>6} {r.step_time:>8.3f} {r.peak_memory_mb:>9.0f}M {r.tokens_per_sec:>10.0f} {'OK':>8}")
+            print(f"{r.name:<30} {r.batch_size:>6} {r.step_time:>8.3f} {r.peak_memory_mb:>9.0f}M {r.tokens_per_sec:>10.0f} {r.final_loss:>8.4f} {'OK':>8}")
         else:
             error_short = r.error[:20] if r.error else "Unknown"
-            print(f"{r.name:<30} {r.batch_size:>6} {'---':>8} {r.peak_memory_mb:>9.0f}M {'---':>10} {'FAIL':>8}")
+            print(f"{r.name:<30} {r.batch_size:>6} {'---':>8} {r.peak_memory_mb:>9.0f}M {'---':>10} {'---':>8} {'FAIL':>8}")
             print(f"  Error: {error_short}...")
 
-    print("-" * 80)
+    print("-" * 88)
 
     # Summary
     successful = [r for r in results if r.success]

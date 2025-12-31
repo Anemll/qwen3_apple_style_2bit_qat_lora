@@ -324,8 +324,11 @@ def main():
     # =========================================================================
     if args.gradient_checkpointing:
         if hasattr(v2_model, 'gradient_checkpointing_enable'):
-            v2_model.gradient_checkpointing_enable()
-            print("\n[*] Gradient checkpointing enabled (trades ~15% speed for ~40% memory)")
+            # use_reentrant=False is required when inputs don't have requires_grad
+            v2_model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            print("\n[*] Gradient checkpointing enabled (use_reentrant=False, trades ~15% speed for ~40% memory)")
         else:
             print("\n[!] Warning: Model does not support gradient_checkpointing_enable()")
 
