@@ -86,11 +86,15 @@ pull_cache() {
     local cache_name="$1"
     local cache_dir="caches/$cache_name"
 
-    if [ -d "$cache_dir" ] && [ "$(ls -A $cache_dir 2>/dev/null)" ]; then
-        local count=$(ls "$cache_dir"/*.pt 2>/dev/null | wc -l)
+    # Check if cache has .pt files (not just directory exists)
+    local count=$(ls "$cache_dir"/*.pt 2>/dev/null | wc -l)
+    if [ "$count" -gt 0 ]; then
         echo "[CACHE] $cache_name exists ($count files)"
         return 0
     fi
+
+    # Remove empty/broken cache dir
+    [ -d "$cache_dir" ] && rm -rf "$cache_dir"
 
     # Prefer .tar.lz4 (fastest)
     local lz4_path="$GDRIVE_CACHES/${cache_name}.tar.lz4"
@@ -99,8 +103,15 @@ pull_cache() {
         which lz4 >/dev/null || apt-get install -qq lz4
         mkdir -p "$cache_dir"
         tar -I lz4 -xf "$lz4_path" -C caches/
-        echo "[CACHE] Done"
-        return 0
+        # Verify extraction worked
+        local pt_count=$(ls "$cache_dir"/*.pt 2>/dev/null | wc -l)
+        if [ "$pt_count" -gt 0 ]; then
+            echo "[CACHE] Done ($pt_count files)"
+            return 0
+        else
+            echo "[CACHE] WARN: lz4 extraction failed, trying tgz..."
+            rm -rf "$cache_dir"
+        fi
     fi
 
     # Fall back to .tgz
