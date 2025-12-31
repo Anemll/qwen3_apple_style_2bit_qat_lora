@@ -144,11 +144,22 @@ pull_cache() {
         if [ "$pt_count" -gt 0 ]; then
             echo "[CACHE] Done ($pt_count files)"
             return 0
-        else
-            echo "[CACHE] WARN: lz4 extraction failed, trying tgz..."
-            rm -rf "$cache_dir"
-            mkdir -p "$cache_dir"
         fi
+        # Check for nested directory (lz4 bug: name/name/*.pt)
+        local nested_dir="$cache_dir/$cache_name"
+        if [ -d "$nested_dir" ]; then
+            local nested_count=$(ls "$nested_dir"/*.pt 2>/dev/null | wc -l)
+            if [ "$nested_count" -gt 0 ]; then
+                echo "[CACHE] Fixing nested structure..."
+                mv "$nested_dir"/* "$cache_dir/"
+                rmdir "$nested_dir"
+                echo "[CACHE] Done ($nested_count files)"
+                return 0
+            fi
+        fi
+        echo "[CACHE] WARN: lz4 extraction failed, trying tgz..."
+        rm -rf "$cache_dir"
+        mkdir -p "$cache_dir"
     fi
 
     # Fall back to .tgz
