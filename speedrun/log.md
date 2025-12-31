@@ -182,10 +182,23 @@ python speedrun/benchmark.py --cache-dir $CACHE_DIR --find-max-batch
 - But enables batch=144 → 173 t/s (1.8x faster than baseline!)
 
 **Recommended Settings** (A100 40GB):
-| Cache | Max Batch | Expected t/s |
-|-------|-----------|--------------|
-| L64 (seq=64) | 144 | ~173 |
-| L128 (seq=128) | ~72 | ~85 (estimated) |
+| Cache | Max Batch | Best t/s | Memory |
+|-------|-----------|----------|--------|
+| L64 (seq=64) | 144 | 173 | 30GB |
+| L128 (seq=128) | 72 | 172 | 30GB |
+
+### L128 Benchmark Results
+
+| Batch | Step(s) | Memory | t/s | Loss | Status |
+|-------|---------|--------|-----|------|--------|
+| 8 | 17.775 | 9,987M | 58 | 10.32 | OK |
+| 16 | 21.524 | 12,487M | 95 | 10.26 | OK |
+| 32 | 30.682 | 17,487M | 133 | 10.08 | OK |
+| 64 | 49.136 | 27,487M | 167 | 9.95 | OK |
+| **72** | **53.589** | **29,987M** | **172** | 10.01 | **MAX** |
+| 80+ | - | - | - | - | OOM |
+
+**Key Finding:** L128 max batch (72) is exactly half of L64 max batch (144), as expected since seq_len doubles.
 
 **Notes**:
 - Binary search finds exact max (not just powers of 2)
