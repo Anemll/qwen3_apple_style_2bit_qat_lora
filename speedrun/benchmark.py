@@ -47,29 +47,69 @@ class BenchmarkResult:
     error: Optional[str] = None
 
 
+def get_device():
+    """Get best available device: TPU > CUDA > CPU."""
+    # Try TPU first
+    try:
+        import torch_xla.core.xla_model as xm
+        return xm.xla_device()
+    except ImportError:
+        pass
+    # Fall back to CUDA
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    return torch.device('cpu')
+
+
+def is_tpu_device(device) -> bool:
+    """Check if device is a TPU."""
+    return 'xla' in str(device).lower()
+
+
 def get_gpu_memory_mb() -> float:
-    """Get current GPU memory usage in MB."""
+    """Get current memory usage in MB (0 for TPU - not available)."""
     if torch.cuda.is_available():
         return torch.cuda.max_memory_allocated() / 1024 / 1024
-    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        # MPS doesn't have easy memory tracking
-        return 0.0
+    # TPU/MPS/CPU: memory tracking not available
     return 0.0
 
 
 def get_gpu_total_memory_gb() -> float:
-    """Get total GPU memory in GB."""
+    """Get total memory in GB."""
     if torch.cuda.is_available():
         return torch.cuda.get_device_properties(0).total_memory / 1024**3
-    return 0.0
+    # TPU v6e-1 has 16GB HBM - hardcoded
+    return 16.0
 
 
 def reset_gpu_memory():
-    """Reset GPU memory tracking."""
+    """Reset memory tracking."""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+    # TPU: just gc.collect() (no equivalent API)
+
+
+def tpu_mark_step():
+    """Mark step for TPU (no-op for CUDA/CPU)."""
+    try:
+        import torch_xla.core.xla_model as xm
+        xm.mark_step()
+    except ImportError:
+        pass
+
+
+def print_device_info(device):
+    """Print device info."""
+    if is_tpu_device(device):
+        print(f"Device: TPU")
+        print(f"Memory: 16 GB HBM (estimated)")
+    elif torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name()}")
+        print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    else:
+        print(f"Device: {device}")
 
 
 def get_seq_len_from_cache(cache_dir: str) -> int:
@@ -644,11 +684,8 @@ def main():
 
     assert os.path.exists(args.cache_dir), f"Cache dir not found: {args.cache_dir}"
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name()}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    device = get_device()
+    print_device_info(device)
 
     # Get or create cached V2 model (reused across all benchmarks)
     v2_model_path = get_or_create_v2_model(

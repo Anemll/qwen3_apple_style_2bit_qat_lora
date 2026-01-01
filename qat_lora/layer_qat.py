@@ -1437,6 +1437,13 @@ def train_e2e(
                 scheduler.step()
             optimizer.zero_grad()
 
+            # TPU: mark step to compile and execute graph
+            try:
+                import torch_xla.core.xla_model as xm
+                xm.mark_step()
+            except ImportError:
+                pass
+
             total_loss += loss.item()
             step += 1
 
