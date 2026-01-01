@@ -147,9 +147,9 @@ def print_result_row(r: BenchmarkResult):
     if r.success:
         print(f"{r.name:<30} {r.batch_size:>6} {r.step_time:>8.3f} {r.peak_memory_mb:>9.0f}M {r.tokens_per_sec:>10.0f} {r.final_loss:>8.4f} {'OK':>8}")
     else:
-        error_short = r.error[:30] if r.error else "Unknown"
+        error_short = r.error[:80] if r.error else "Unknown"
         print(f"{r.name:<30} {r.batch_size:>6} {'---':>8} {r.peak_memory_mb:>9.0f}M {'---':>10} {'---':>8} {'FAIL':>8}")
-        print(f"  Error: {error_short}...")
+        print(f"  Error: {error_short}")
 
 
 def create_v2_model(model_id: str = "Qwen/Qwen3-0.6B", verbose: bool = True,
