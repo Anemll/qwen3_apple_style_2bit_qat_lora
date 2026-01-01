@@ -359,14 +359,10 @@ def find_max_batch_size(
     seq_len = get_seq_len_from_cache(cache_dir)
     gpu_mem_gb = get_gpu_total_memory_gb()
 
-    # Estimate initial batch size
-    estimated = estimate_max_batch(gpu_mem_gb, seq_len)
-
     print(f"\n{'='*60}")
     print(f"Finding max batch size for {gpu_mem_gb:.1f} GB GPU")
     print(f"Sequence length: {seq_len}")
     print(f"Gradient checkpointing: {'ON' if gradient_checkpointing else 'OFF'}")
-    print(f"Estimated max batch: {estimated}")
     print(f"{'='*60}")
 
     # Get or create cached V2 model path
@@ -386,6 +382,7 @@ def find_max_batch_size(
             print(f"  Please re-run to reload from GDrive or recreate model.")
             raise RuntimeError(f"Corrupted cache deleted. Please re-run.")
         raise
+    reset_gpu_memory()
     model.to(device)
     if gradient_checkpointing and hasattr(model, 'gradient_checkpointing_enable'):
         model.gradient_checkpointing_enable(
@@ -393,6 +390,17 @@ def find_max_batch_size(
         )
     freeze_Q_all(model, verbose=False)
     print(f"done ({time.time()-t0:.1f}s)")
+
+    # Estimate after loading - now we know actual model memory usage
+    model_mem_mb = get_gpu_memory_mb()
+    available_mb = (gpu_mem_gb * 1024 * 0.95) - model_mem_mb  # 5% buffer
+    per_sample_mb = seq_len * 2.5  # ~160MB for seq=64
+    estimated = int(available_mb / per_sample_mb)
+    estimated = (estimated // 8) * 8  # Round to multiple of 8
+    estimated = max(8, min(512, estimated))
+    print(f"  Model memory: {model_mem_mb:.0f} MB")
+    print(f"  Available for batches: {available_mb:.0f} MB")
+    print(f"  Estimated max batch: {estimated}")
 
     print("\n[*] Testing batch sizes...")
 
