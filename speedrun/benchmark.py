@@ -170,7 +170,7 @@ def create_v2_model(model_id: str = "Qwen/Qwen3-0.6B", verbose: bool = True,
     t0 = time.time()
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=dtype,
+        dtype=dtype,  # Note: torch_dtype is deprecated
         trust_remote_code=True,
     )
     if verbose:
@@ -601,7 +601,8 @@ V2_MODEL_CACHE = "runs/speedrun/v2_benchmark_model.pt"
 
 
 def get_or_create_v2_model(model_id: str, rebuild: bool = False,
-                           load_from: str = None, save_to: str = None) -> str:
+                           load_from: str = None, save_to: str = None,
+                           dtype: torch.dtype = torch.float32) -> str:
     """Get cached V2 model path, creating if needed.
 
     Args:
@@ -609,6 +610,7 @@ def get_or_create_v2_model(model_id: str, rebuild: bool = False,
         rebuild: Force rebuild even if cache exists
         load_from: Load pre-saved model from this path (e.g., GDrive)
         save_to: Save model to this path after creation (e.g., GDrive)
+        dtype: Model dtype (fp32 or bf16)
     """
     # Priority 1: Use local cache if exists
     os.makedirs(os.path.dirname(V2_MODEL_CACHE), exist_ok=True)
@@ -640,7 +642,7 @@ def get_or_create_v2_model(model_id: str, rebuild: bool = False,
 
     # Priority 4: Create new model
     print(f"\n[*] Creating V2 model (one-time)...")
-    v2_model = create_v2_model(model_id, verbose=True)
+    v2_model = create_v2_model(model_id, dtype=dtype, verbose=True)
 
     print(f"  Saving to {V2_MODEL_CACHE}...", end=" ", flush=True)
     t0 = time.time()
@@ -696,6 +698,7 @@ def main():
         rebuild=args.rebuild_model,
         load_from=args.load_model,
         save_to=args.save_model,
+        dtype=train_dtype,
     )
 
     # Find max batch mode (minimal: 2 steps, no warmup)
