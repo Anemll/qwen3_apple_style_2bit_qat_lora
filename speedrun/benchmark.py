@@ -109,7 +109,8 @@ def print_result_row(r: BenchmarkResult):
         print(f"  Error: {error_short}...")
 
 
-def create_v2_model(model_id: str = "Qwen/Qwen3-0.6B", verbose: bool = True):
+def create_v2_model(model_id: str = "Qwen/Qwen3-0.6B", verbose: bool = True,
+                    dtype: torch.dtype = torch.float32):
     """Create a V2 quantized model (slow operation, do once)."""
     from transformers import AutoModelForCausalLM
     from qat_lora import (
@@ -117,12 +118,16 @@ def create_v2_model(model_id: str = "Qwen/Qwen3-0.6B", verbose: bool = True):
         replace_linear_with_anemll_v2,
     )
 
+    # STE-FP16 only used for FP32 training (ANE compatibility)
+    use_ste = (dtype == torch.float32)
+
     if verbose:
-        print("  Loading base model...", end=" ", flush=True)
+        dtype_str = 'fp32' if dtype == torch.float32 else 'bf16'
+        print(f"  Loading base model ({dtype_str})...", end=" ", flush=True)
     t0 = time.time()
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=torch.float32,
+        torch_dtype=dtype,
         trust_remote_code=True,
     )
     if verbose:
@@ -137,7 +142,7 @@ def create_v2_model(model_id: str = "Qwen/Qwen3-0.6B", verbose: bool = True):
         group_size=32,
         force_positive_scales=False,
         magnitude_activation='identity',
-        use_ste_fp16=True,
+        use_ste_fp16=use_ste,
     )
     attn_config = AnemllQuantConfigV2(
         lut_size=16,
@@ -145,7 +150,7 @@ def create_v2_model(model_id: str = "Qwen/Qwen3-0.6B", verbose: bool = True):
         group_size=32,
         force_positive_scales=False,
         magnitude_activation='identity',
-        use_ste_fp16=True,
+        use_ste_fp16=use_ste,
     )
     replace_linear_with_anemll_v2(
         model,
@@ -171,6 +176,7 @@ def run_benchmark(
     verbose: bool = True,
     v2_model_path: str = None,  # Path to saved V2 model (fast reload)
     warmup_steps: int = 10,  # Set to 0 for fast max-batch testing
+    dtype: torch.dtype = torch.float32,
 ) -> BenchmarkResult:
     """Run a single benchmark configuration."""
     from qat_lora import (
@@ -196,7 +202,8 @@ def run_benchmark(
         if v2_model_path is not None:
             # Fast path: load entire model from disk
             if verbose:
-                print("  Loading V2 model from cache...", end=" ", flush=True)
+                dtype_str = 'fp32' if dtype == torch.float32 else 'bf16'
+                print(f"  Loading V2 model from cache ({dtype_str})...", end=" ", flush=True)
             t0 = time.time()
             # weights_only=False required for loading full model objects
             model = torch.load(v2_model_path, map_location='cpu', weights_only=False)
@@ -204,13 +211,13 @@ def run_benchmark(
                 print(f"done ({time.time()-t0:.1f}s)")
         else:
             # Slow path: create V2 model from scratch
-            model = create_v2_model(model_id, verbose=verbose)
+            model = create_v2_model(model_id, verbose=verbose, dtype=dtype)
 
-        # Move to device
+        # Move to device and cast to target dtype
         if verbose:
             print("  Moving to GPU...", end=" ", flush=True)
         t0 = time.time()
-        model.to(device)
+        model.to(device=device, dtype=dtype)
         if verbose:
             print(f"done ({time.time()-t0:.1f}s)")
 
@@ -352,6 +359,7 @@ def find_max_batch_size(
     steps: int = 2,  # Minimal: just 2 steps to test memory/throughput
     warmup_steps: int = 0,  # No warmup for speed
     rebuild_model: bool = False,
+    dtype: torch.dtype = torch.float32,
 ) -> int:
     """Find maximum batch size that fits in GPU memory using estimation + binary search."""
     from qat_lora import freeze_Q_all, train_e2e
@@ -359,9 +367,10 @@ def find_max_batch_size(
     seq_len = get_seq_len_from_cache(cache_dir)
     gpu_mem_gb = get_gpu_total_memory_gb()
 
+    dtype_str = 'fp32' if dtype == torch.float32 else 'bf16'
     print(f"\n{'='*60}")
     print(f"Finding max batch size for {gpu_mem_gb:.1f} GB GPU")
-    print(f"Sequence length: {seq_len}")
+    print(f"Sequence length: {seq_len}, dtype: {dtype_str}")
     print(f"Gradient checkpointing: {'ON' if gradient_checkpointing else 'OFF'}")
     print(f"{'='*60}")
 
@@ -383,7 +392,7 @@ def find_max_batch_size(
             raise RuntimeError(f"Corrupted cache deleted. Please re-run.")
         raise
     reset_gpu_memory()
-    model.to(device)
+    model.to(device=device, dtype=dtype)
     if gradient_checkpointing and hasattr(model, 'gradient_checkpointing_enable'):
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -481,7 +490,7 @@ def find_max_batch_size(
         print("  reloading model...", end=" ", flush=True)
         t0 = time.time()
         m = torch.load(v2_model_path, map_location='cpu', weights_only=False)
-        m.to(device)
+        m.to(device=device, dtype=dtype)
         if gradient_checkpointing and hasattr(m, 'gradient_checkpointing_enable'):
             m.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -614,6 +623,8 @@ def main():
     parser.add_argument('--cache-dir', type=str, required=True, help='KD cache directory')
     parser.add_argument('--steps', type=int, default=20, help='Steps per benchmark')
     parser.add_argument('--model-id', type=str, default='Qwen/Qwen3-0.6B', help='Model ID')
+    parser.add_argument('--dtype', type=str, default='fp32', choices=['fp32', 'bf16'],
+                        help='Training dtype: fp32 (default, ANE-safe), bf16 (2x faster)')
     parser.add_argument('--skip-baseline', action='store_true', help='Skip baseline benchmark')
     parser.add_argument('--skip-checkpointing', action='store_true', help='Skip checkpointing benchmarks')
     parser.add_argument('--find-max-batch', action='store_true', help='Find maximum batch size')
@@ -626,6 +637,10 @@ def main():
     parser.add_argument('--save-model', type=str, default=None,
                         help='Save V2 model to path after creation (e.g., GDrive)')
     args = parser.parse_args()
+
+    # Dtype mapping
+    dtype_map = {'fp32': torch.float32, 'bf16': torch.bfloat16}
+    train_dtype = dtype_map[args.dtype]
 
     assert os.path.exists(args.cache_dir), f"Cache dir not found: {args.cache_dir}"
 
@@ -652,6 +667,7 @@ def main():
             gradient_checkpointing=True,
             # Uses defaults: steps=2, warmup_steps=0 for speed
             rebuild_model=False,  # Already created above
+            dtype=train_dtype,
         )
         print("\nDone!")
         return
@@ -674,6 +690,7 @@ def main():
             device=device,
             model_id=args.model_id,
             v2_model_path=v2_model_path,
+            dtype=train_dtype,
         )
         results.append(result)
         print_result_row(result)
@@ -688,6 +705,7 @@ def main():
             device=device,
             model_id=args.model_id,
             v2_model_path=v2_model_path,
+            dtype=train_dtype,
         )
         results.append(result)
         print_result_row(result)
@@ -701,6 +719,7 @@ def main():
             device=device,
             model_id=args.model_id,
             v2_model_path=v2_model_path,
+            dtype=train_dtype,
         )
         results.append(result)
         print_result_row(result)
