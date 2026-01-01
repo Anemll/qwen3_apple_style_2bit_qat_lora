@@ -240,13 +240,16 @@ def compute_kd_loss_batch(
     Returns:
         Combined loss scalar (KL + hard label losses)
     """
+    # Get model dtype for consistent precision (bf16 on TPU)
+    model_dtype = next(model.parameters()).dtype
+
     input_ids = batch['input_ids'].to(device)
     attention_mask = batch.get('attention_mask')
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)
 
     topk_idx = batch['topk_idx'].to(device).long()
-    topk_logits = batch['topk_logits'].to(device).float()
+    topk_logits = batch['topk_logits'].to(device).to(model_dtype)  # Match model dtype
 
     # Get hidden states (not full logits)
     def forward_pass():
