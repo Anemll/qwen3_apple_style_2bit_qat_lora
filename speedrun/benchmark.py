@@ -170,6 +170,7 @@ def run_benchmark(
     model_id: str = "Qwen/Qwen3-0.6B",
     verbose: bool = True,
     v2_model_path: str = None,  # Path to saved V2 model (fast reload)
+    warmup_steps: int = 10,  # Set to 0 for fast max-batch testing
 ) -> BenchmarkResult:
     """Run a single benchmark configuration."""
     from qat_lora import (
@@ -248,7 +249,7 @@ def run_benchmark(
             batch_size=batch_size,
             lr=5e-5,
             use_cosine_schedule=True,
-            warmup_steps=10,
+            warmup_steps=warmup_steps,
             temperature=2.0,
             train_weights=False,
             train_scales=True,
@@ -319,40 +320,65 @@ def print_summary(results: list[BenchmarkResult]):
             print(f"  Memory: {memory_change:+.1f}%")
 
 
+def estimate_max_batch(gpu_mem_gb: float, seq_len: int) -> int:
+    """Estimate max batch size based on GPU memory and sequence length.
+
+    Based on A100 40GB benchmarks:
+    - L64 (seq=64): max=144, uses ~30GB
+    - L128 (seq=128): max=72, uses ~30GB
+    - Base memory (model + overhead) ≈ 7GB
+    - Per-sample memory ≈ seq_len * 2.5MB
+    """
+    base_memory_gb = 7.0  # Model + CUDA overhead
+    per_sample_mb = seq_len * 2.5  # ~160MB for seq=64, ~320MB for seq=128
+
+    available_gb = gpu_mem_gb * 0.85 - base_memory_gb  # 15% buffer
+    available_mb = available_gb * 1024
+
+    estimated = int(available_mb / per_sample_mb)
+    # Round down to multiple of 8
+    estimated = (estimated // 8) * 8
+    # Clamp to reasonable range
+    estimated = max(8, min(512, estimated))
+
+    return estimated
+
+
 def find_max_batch_size(
     cache_dir: str,
     device: torch.device,
     model_id: str,
     gradient_checkpointing: bool = True,
-    steps: int = 3,
+    steps: int = 2,  # Minimal: just 2 steps to test memory/throughput
+    warmup_steps: int = 0,  # No warmup for speed
     rebuild_model: bool = False,
 ) -> int:
-    """Find maximum batch size that fits in GPU memory."""
+    """Find maximum batch size that fits in GPU memory using estimation + binary search."""
     seq_len = get_seq_len_from_cache(cache_dir)
     gpu_mem_gb = get_gpu_total_memory_gb()
+
+    # Estimate initial batch size
+    estimated = estimate_max_batch(gpu_mem_gb, seq_len)
 
     print(f"\n{'='*60}")
     print(f"Finding max batch size for {gpu_mem_gb:.1f} GB GPU")
     print(f"Sequence length: {seq_len}")
     print(f"Gradient checkpointing: {'ON' if gradient_checkpointing else 'OFF'}")
+    print(f"Estimated max batch: {estimated}")
     print(f"{'='*60}")
 
     # Get or create cached V2 model
     v2_model_path = get_or_create_v2_model(model_id, rebuild=rebuild_model)
 
-    print("\n[*] Finding max batch size...")
+    print("\n[*] Testing estimated batch size...")
 
     # Print header
     print_result_header(seq_len)
 
-    # Phase 1: Double until OOM to find range
-    batch_sizes = [8, 16, 32, 64, 128, 256, 512]
-    max_working_batch = 0
-    first_failing_batch = None
-    results = []
-
-    for batch in batch_sizes:
-        print(f"\n  Trying batch={batch}...", end=" ", flush=True)
+    # Helper to test a batch size
+    def test_batch(batch: int) -> tuple:
+        print(f"\n  batch={batch}: loading model...", end=" ", flush=True)
+        t0 = time.time()
         result = run_benchmark(
             cache_dir=cache_dir,
             batch_size=batch,
@@ -362,63 +388,61 @@ def find_max_batch_size(
             model_id=model_id,
             verbose=False,
             v2_model_path=v2_model_path,
+            warmup_steps=warmup_steps,
         )
-        results.append(result)
-
+        elapsed = time.time() - t0
         if result.success:
-            max_working_batch = batch
-            print(f"OK (mem={result.peak_memory_mb:.0f}M, t/s={result.tokens_per_sec:.0f})")
+            print(f"done ({elapsed:.1f}s) -> OK (mem={result.peak_memory_mb:.0f}M, t/s={result.tokens_per_sec:.0f})")
             print_result_row(result)
         else:
-            first_failing_batch = batch
-            print(f"OOM")
+            print(f"done ({elapsed:.1f}s) -> OOM")
             print_result_row(result)
+        return result.success, result
+
+    # Test estimated batch size
+    success, _ = test_batch(estimated)
+
+    if success:
+        # Estimate worked - search upward
+        low = estimated
+        high = min(512, int(estimated * 1.5))
+        high = (high // 8) * 8
+    else:
+        # Estimate too high - search downward
+        low = 8
+        high = estimated
+
+    max_working = low if success else 0
+
+    # Binary search for exact max
+    print(f"\n[*] Binary search in range [{low}, {high}]...")
+
+    while high - low > 8:
+        mid = (low + high) // 2
+        mid = (mid // 8) * 8  # Round to multiple of 8
+        if mid == low:
+            mid = low + 8
+        if mid >= high:
             break
 
-    # Phase 2: Binary search for exact max (e.g., find 48 between 32 and 64)
-    if first_failing_batch and max_working_batch > 0:
-        low, high = max_working_batch, first_failing_batch
-        while high - low > 8:  # Stop when range is <=8
-            mid = (low + high) // 2
-            # Round to multiple of 8 for efficiency
-            mid = (mid // 8) * 8
-            if mid == low:
-                mid = low + 8
-            if mid >= high:
-                break
+        success, _ = test_batch(mid)
 
-            print(f"\n  Binary search: trying batch={mid}...", end=" ", flush=True)
-            result = run_benchmark(
-                cache_dir=cache_dir,
-                batch_size=mid,
-                steps=steps,
-                gradient_checkpointing=gradient_checkpointing,
-                device=device,
-                model_id=model_id,
-                verbose=False,
-                v2_model_path=v2_model_path,
-            )
-            results.append(result)
+        if success:
+            low = mid
+            max_working = mid
+        else:
+            high = mid
 
-            if result.success:
-                low = mid
-                max_working_batch = mid
-                print(f"OK (mem={result.peak_memory_mb:.0f}M, t/s={result.tokens_per_sec:.0f})")
-                print_result_row(result)
-            else:
-                high = mid
-                print(f"OOM")
-                print_result_row(result)
-
+    # Final result
     print(f"\n{'='*60}")
-    print(f"MAX BATCH SIZE: {max_working_batch}")
+    print(f"MAX BATCH SIZE: {max_working}")
     if gradient_checkpointing:
         print(f"  (with gradient checkpointing)")
     else:
         print(f"  (without gradient checkpointing)")
     print(f"{'='*60}")
 
-    return max_working_batch
+    return max_working
 
 
 V2_MODEL_CACHE = "runs/speedrun/v2_benchmark_model.pt"
@@ -434,23 +458,22 @@ def get_or_create_v2_model(model_id: str, rebuild: bool = False,
         load_from: Load pre-saved model from this path (e.g., GDrive)
         save_to: Save model to this path after creation (e.g., GDrive)
     """
-    # Priority 1: Load from specified path (e.g., GDrive)
+    # Priority 1: Use local cache if exists
+    os.makedirs(os.path.dirname(V2_MODEL_CACHE), exist_ok=True)
+    if os.path.exists(V2_MODEL_CACHE) and not rebuild:
+        print(f"[*] Using cached V2 model: {V2_MODEL_CACHE}")
+        return V2_MODEL_CACHE
+
+    # Priority 2: Load from specified path (e.g., GDrive) and copy to local
     if load_from and os.path.exists(load_from) and not rebuild:
         print(f"[*] Loading V2 model from: {load_from}")
         # Copy to local cache for faster subsequent loads
         if load_from != V2_MODEL_CACHE:
-            os.makedirs(os.path.dirname(V2_MODEL_CACHE), exist_ok=True)
             import shutil
             print(f"  Copying to local cache...", end=" ", flush=True)
             t0 = time.time()
             shutil.copy(load_from, V2_MODEL_CACHE)
             print(f"done ({time.time()-t0:.1f}s)")
-        return V2_MODEL_CACHE
-
-    # Priority 2: Use local cache
-    os.makedirs(os.path.dirname(V2_MODEL_CACHE), exist_ok=True)
-    if os.path.exists(V2_MODEL_CACHE) and not rebuild:
-        print(f"[*] Using cached V2 model: {V2_MODEL_CACHE}")
         return V2_MODEL_CACHE
 
     # Priority 3: Create new model
@@ -510,14 +533,14 @@ def main():
         save_to=args.save_model,
     )
 
-    # Find max batch mode
+    # Find max batch mode (minimal: 2 steps, no warmup)
     if args.find_max_batch:
         find_max_batch_size(
             cache_dir=args.cache_dir,
             device=device,
             model_id=args.model_id,
             gradient_checkpointing=True,
-            steps=3,  # Quick test with 3 steps
+            # Uses defaults: steps=2, warmup_steps=0 for speed
             rebuild_model=False,  # Already created above
         )
         print("\nDone!")
