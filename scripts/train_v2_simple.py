@@ -179,8 +179,8 @@ def main():
             print(f"  Manually loaded {q_loaded} _Q buffers")
 
         t0 = time.time()
-        print("  Moving to GPU...", end=" ", flush=True)
-        v2_model.to(device)
+        print(f"  Moving to GPU ({args.dtype})...", end=" ", flush=True)
+        v2_model.to(device=device, dtype=train_dtype)
         print(f"done ({time.time()-t0:.1f}s)")
 
     elif args.from_scratch:
@@ -225,8 +225,8 @@ def main():
         print(f"done ({time.time()-t0:.1f}s)")
 
         t0 = time.time()
-        print("  Moving to GPU...", end=" ", flush=True)
-        v2_model.to(device)
+        print(f"  Moving to GPU ({args.dtype})...", end=" ", flush=True)
+        v2_model.to(device=device, dtype=train_dtype)
         print(f"done ({time.time()-t0:.1f}s)")
 
         # Save initial state
@@ -328,7 +328,9 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
-        v2_model.to(device)
+        print(f"  Moving to GPU ({args.dtype})...", end=" ", flush=True)
+        v2_model.to(device=device, dtype=train_dtype)
+        print("done")
 
         # Save initial V2 state (before training)
         initial_path = f"{args.output_dir}/v2_initial.pt"
