@@ -547,7 +547,11 @@ def get_or_create_v2_model(model_id: str, rebuild: bool = False,
         print(f"[*] Using cached V2 model: {V2_MODEL_CACHE}")
         return V2_MODEL_CACHE
 
-    # Priority 2: Load from specified path (e.g., GDrive) and copy to local
+    # Priority 2: If save_to path exists, use it as load source (avoid recreating)
+    if save_to and os.path.exists(save_to) and not rebuild:
+        load_from = save_to  # Use existing file instead of creating new
+
+    # Priority 3: Load from specified path (e.g., GDrive) and copy to local
     if load_from and os.path.exists(load_from) and not rebuild:
         print(f"[*] Loading V2 model from: {load_from}")
         # Copy to local cache for faster subsequent loads

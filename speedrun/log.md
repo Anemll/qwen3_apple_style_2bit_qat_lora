@@ -204,6 +204,7 @@ python speedrun/benchmark.py --cache-dir $CACHE_DIR --find-max-batch
 - Binary search finds exact max (not just powers of 2)
 - V2 model cached to `runs/speedrun/v2_benchmark_model.pt` for fast reruns
 - Fix applied: `use_reentrant=False` for gradient checkpointing
+- Quick test mode (2 steps, no warmup) gives lower t/s (~155) due to JIT overhead; sustained t/s is ~173
 
 ---
 
