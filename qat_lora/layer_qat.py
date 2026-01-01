@@ -1437,13 +1437,14 @@ def train_e2e(
                 scheduler.step()
             optimizer.zero_grad()
 
-            # TPU: sync to compile and execute graph
+            # TPU: mark step boundary (non-blocking, allows pipelining)
             try:
-                import torch_xla
-                torch_xla.sync()
+                import torch_xla.core.xla_model as xm
+                xm.mark_step()
             except (ImportError, RuntimeError):
                 pass
 
+            # Track loss (item() forces sync, so only call when needed)
             total_loss += loss.item()
             step += 1
 
