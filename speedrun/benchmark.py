@@ -265,7 +265,8 @@ def run_benchmark(
             print(f"done ({time.time()-t0:.1f}s)")
 
         # Enable gradient checkpointing if requested
-        if gradient_checkpointing:
+        # Skip on TPU - causes 'torch.xla' error in transformers
+        if gradient_checkpointing and not is_tpu_device(device):
             if hasattr(model, 'gradient_checkpointing_enable'):
                 # use_reentrant=False is required when inputs don't have requires_grad
                 model.gradient_checkpointing_enable(
@@ -276,6 +277,9 @@ def run_benchmark(
             else:
                 if verbose:
                     print("  Warning: Model doesn't support gradient checkpointing")
+        elif gradient_checkpointing and is_tpu_device(device):
+            if verbose:
+                print("  Gradient checkpointing: SKIPPED (TPU incompatible)")
 
         # Freeze Q
         if verbose:
@@ -419,10 +423,15 @@ def find_max_batch_size(
         device_name = "CPU"
 
     dtype_str = 'fp32' if dtype == torch.float32 else 'bf16'
+    # Gradient checkpointing status (skipped on TPU due to torch.xla bug)
+    if is_tpu_device(device):
+        gc_status = "OFF (TPU incompatible)"
+    else:
+        gc_status = "ON" if gradient_checkpointing else "OFF"
     print(f"\n{'='*60}")
     print(f"Finding max batch size for {gpu_mem_gb:.1f} GB {device_name}")
     print(f"Sequence length: {seq_len}, dtype: {dtype_str}")
-    print(f"Gradient checkpointing: {'ON' if gradient_checkpointing else 'OFF'}")
+    print(f"Gradient checkpointing: {gc_status}")
     print(f"{'='*60}")
 
     # Get or create cached V2 model path
@@ -444,7 +453,8 @@ def find_max_batch_size(
         raise
     reset_gpu_memory()
     model.to(device=device, dtype=dtype)
-    if gradient_checkpointing and hasattr(model, 'gradient_checkpointing_enable'):
+    # Skip gradient checkpointing on TPU - causes 'torch.xla' error in transformers
+    if gradient_checkpointing and hasattr(model, 'gradient_checkpointing_enable') and not is_tpu_device(device):
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
@@ -542,7 +552,8 @@ def find_max_batch_size(
         t0 = time.time()
         m = torch.load(v2_model_path, map_location='cpu', weights_only=False)
         m.to(device=device, dtype=dtype)
-        if gradient_checkpointing and hasattr(m, 'gradient_checkpointing_enable'):
+        # Skip gradient checkpointing on TPU - causes 'torch.xla' error
+        if gradient_checkpointing and hasattr(m, 'gradient_checkpointing_enable') and not is_tpu_device(device):
             m.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
