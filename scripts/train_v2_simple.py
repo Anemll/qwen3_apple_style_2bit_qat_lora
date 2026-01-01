@@ -51,6 +51,9 @@ def main():
     # Memory optimization
     parser.add_argument('--gradient-checkpointing', action='store_true',
                         help='Enable gradient checkpointing (trades ~15%% speed for ~40%% memory)')
+    # Training precision
+    parser.add_argument('--dtype', type=str, default='fp32', choices=['fp32', 'bf16', 'fp16'],
+                        help='Training dtype: fp32 (default, ANE-safe), bf16 (2x faster), fp16 (fastest but risky)')
     args = parser.parse_args()
 
     # Validate inputs - need v1, v2 checkpoint, or from-scratch
@@ -65,7 +68,17 @@ def main():
     assert os.path.exists(args.cache_dir), f"Cache dir not found: {args.cache_dir}"
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Dtype mapping
+    dtype_map = {
+        'fp32': torch.float32,
+        'bf16': torch.bfloat16,
+        'fp16': torch.float16,
+    }
+    train_dtype = dtype_map[args.dtype]
+
     print(f"Device: {device}")
+    print(f"Training dtype: {args.dtype}")
     if args.v2_checkpoint:
         print(f"V2 checkpoint: {args.v2_checkpoint}")
     elif args.from_scratch:
@@ -104,6 +117,9 @@ def main():
 
     import time
 
+    # Only use STE-FP16 when training in FP32 (for ANE compatibility)
+    use_ste = (args.dtype == 'fp32')
+
     if args.v2_checkpoint:
         # Direct V2 load (skip conversion)
         print("\n[1/3] Loading V2 checkpoint directly...")
@@ -112,7 +128,7 @@ def main():
         print("  Loading base model...", end=" ", flush=True)
         v2_model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
-            torch_dtype=torch.float32,  # FP32 master weights
+            torch_dtype=train_dtype,  # Training dtype (fp32/bf16/fp16)
             trust_remote_code=True,
         )
         print(f"done ({time.time()-t0:.1f}s)")
@@ -125,7 +141,7 @@ def main():
             group_size=GROUP_SIZE,
             force_positive_scales=False,
             magnitude_activation='identity',
-            use_ste_fp16=True,
+            use_ste_fp16=use_ste,
         )
         v2_attn_config = AnemllQuantConfigV2(
             lut_size=ATTN_LUT_SIZE,
@@ -133,7 +149,7 @@ def main():
             group_size=GROUP_SIZE,
             force_positive_scales=False,
             magnitude_activation='identity',
-            use_ste_fp16=True,
+            use_ste_fp16=use_ste,
         )
 
         replace_linear_with_anemll_v2(
@@ -175,7 +191,7 @@ def main():
         print("  Loading base model...", end=" ", flush=True)
         v2_model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
-            torch_dtype=torch.float32,  # FP32 master weights
+            torch_dtype=train_dtype,  # Training dtype (fp32/bf16/fp16)
             trust_remote_code=True,
         )
         print(f"done ({time.time()-t0:.1f}s)")
@@ -188,7 +204,7 @@ def main():
             group_size=GROUP_SIZE,
             force_positive_scales=False,
             magnitude_activation='identity',
-            use_ste_fp16=True,
+            use_ste_fp16=use_ste,
         )
         v2_attn_config = AnemllQuantConfigV2(
             lut_size=ATTN_LUT_SIZE,
@@ -196,7 +212,7 @@ def main():
             group_size=GROUP_SIZE,
             force_positive_scales=False,
             magnitude_activation='identity',
-            use_ste_fp16=True,
+            use_ste_fp16=use_ste,
         )
 
         replace_linear_with_anemll_v2(
@@ -249,7 +265,7 @@ def main():
 
         v2_model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
-            torch_dtype=torch.float32,  # FP32 master weights
+            torch_dtype=train_dtype,  # Training dtype (fp32/bf16/fp16)
             trust_remote_code=True,
         )
 
@@ -259,7 +275,7 @@ def main():
             group_size=GROUP_SIZE,
             force_positive_scales=False,
             magnitude_activation='identity',
-            use_ste_fp16=True,
+            use_ste_fp16=use_ste,
         )
         v2_attn_config = AnemllQuantConfigV2(
             lut_size=ATTN_LUT_SIZE,
@@ -267,7 +283,7 @@ def main():
             group_size=GROUP_SIZE,
             force_positive_scales=False,
             magnitude_activation='identity',
-            use_ste_fp16=True,
+            use_ste_fp16=use_ste,
         )
 
         replace_linear_with_anemll_v2(
@@ -365,6 +381,8 @@ def main():
         'v2_checkpoint': args.v2_checkpoint,
         'from_scratch': args.from_scratch,
         'cache_dir': args.cache_dir,
+        'dtype': args.dtype,
+        'use_ste_fp16': use_ste,
     }
 
     result = train_e2e(
@@ -402,13 +420,14 @@ def main():
     # =========================================================================
     print("\n[4/4] Saving model...")
 
-    # FP32 checkpoint
-    fp32_path = f"{args.output_dir}/v2_q2a4_fp32_{timestamp}.pt"
-    torch.save(v2_model.state_dict(), fp32_path)
-    print(f"  FP32: {fp32_path}")
+    # Save in training dtype first
+    native_path = f"{args.output_dir}/v2_q2a4_{args.dtype}_{timestamp}.pt"
+    torch.save(v2_model.state_dict(), native_path)
+    print(f"  {args.dtype.upper()}: {native_path}")
 
-    # FP16 checkpoint
-    v2_model.half()
+    # Always save FP16 for ANE export (convert if needed)
+    if args.dtype != 'fp16':
+        v2_model.half()
     fp16_path = f"{args.output_dir}/v2_q2a4_fp16_{timestamp}.pt"
     torch.save(v2_model.state_dict(), fp16_path)
     print(f"  FP16: {fp16_path}")
@@ -432,11 +451,11 @@ def main():
                 gdrive_path = None
 
         if gdrive_path and gdrive_path.exists():
-            # Upload FP32 only
-            dest_fp32 = gdrive_path / Path(fp32_path).name
+            # Upload native dtype checkpoint
+            dest_native = gdrive_path / Path(native_path).name
             try:
-                shutil.copy2(fp32_path, dest_fp32)
-                print(f"  Uploaded: {dest_fp32}")
+                shutil.copy2(native_path, dest_native)
+                print(f"  Uploaded: {dest_native}")
             except Exception as e:
                 print(f"  ERROR uploading: {e}")
 
