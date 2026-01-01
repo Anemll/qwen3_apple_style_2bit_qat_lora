@@ -1411,8 +1411,8 @@ def train_e2e(
                 if verbose:
                     print(f"Estimated total tokens: {tok_str} (batch={batch_size}, seq={seq_len}, steps={max_steps})")
 
-                # TPU debug: print dtypes on first step
-                if 'xla' in str(device).lower() and verbose:
+                # TPU debug: ALWAYS print dtypes on first step
+                if 'xla' in str(device).lower():
                     model_dtype = next(model.parameters()).dtype
                     print(f"[TPU DEBUG] model dtype: {model_dtype}, device: {device}")
 
