@@ -116,13 +116,21 @@ python speedrun/benchmark.py --cache-dir $CACHE_DIR --steps 20
 2. Gradient checkpointing (batch=8) - same batch, less memory
 3. Gradient checkpointing (batch=16) - larger batch enabled by memory savings
 
-**Expected results (T4 16GB, L64 cache):**
+**Expected results (L64 cache, seq=64, BF16, gradient checkpointing ON):**
 
-| Config | Step(s) | Memory | t/s |
-|--------|---------|--------|-----|
-| batch=8 | ~0.45 | ~8.5 GB | ~1150 |
-| batch=8+checkpointing | ~0.52 | ~5.2 GB | ~980 |
-| batch=16+checkpointing | ~0.85 | ~9.8 GB | ~1200 |
+| GPU | VRAM | Max Batch | Step(s) | Memory | t/s |
+|-----|------|-----------|---------|--------|-----|
+| T4 | 16 GB | 16 | ~0.85 | ~9.8 GB | ~1200 |
+| L4 | 22 GB | 128 | ~54 | ~16 GB | ~152 |
+| A100 | 40 GB | 480 | ~49 | ~46 GB | ~628 |
+
+**L4 detailed results (22.2 GB):**
+
+| Batch | Step(s) | Memory | t/s | Loss |
+|-------|---------|--------|-----|------|
+| 96 | 44.5 | 13.5 GB | 138 | 7.29 |
+| 120 | 51.5 | 15.6 GB | 149 | 6.19 |
+| 128 | 53.9 | 16.2 GB | 152 | 5.68 |
 
 *t/s = tokens/sec = batch × seq_len × steps / time*
 
