@@ -60,7 +60,10 @@ source speedrun/setup.sh L64 q2_init
 |------|---------|
 | `SR-001` | Q4→Q2 conversion + upload |
 | `SR-002` | Q2 MLP training |
-| `SR-003` | Performance benchmark (benchmark.py) |
+| `SR-003` | Performance benchmark (legacy) |
+| `SR-004` | Performance benchmark (current) |
+
+**Note:** Notebooks include a `Rev:` line at the top for version tracking. Update when making changes.
 
 ### SR-001: Q4→Q2 Conversion
 
