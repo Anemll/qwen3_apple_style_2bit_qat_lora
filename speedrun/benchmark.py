@@ -410,9 +410,17 @@ def find_max_batch_size(
     seq_len = get_seq_len_from_cache(cache_dir)
     gpu_mem_gb = get_gpu_total_memory_gb()
 
+    # Determine device name for display
+    if is_tpu_device(device):
+        device_name = "TPU"
+    elif device.type == 'cuda':
+        device_name = "GPU"
+    else:
+        device_name = "CPU"
+
     dtype_str = 'fp32' if dtype == torch.float32 else 'bf16'
     print(f"\n{'='*60}")
-    print(f"Finding max batch size for {gpu_mem_gb:.1f} GB GPU")
+    print(f"Finding max batch size for {gpu_mem_gb:.1f} GB {device_name}")
     print(f"Sequence length: {seq_len}, dtype: {dtype_str}")
     print(f"Gradient checkpointing: {'ON' if gradient_checkpointing else 'OFF'}")
     print(f"{'='*60}")
