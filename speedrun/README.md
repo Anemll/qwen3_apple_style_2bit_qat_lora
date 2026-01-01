@@ -120,7 +120,7 @@ python speedrun/benchmark.py --cache-dir $CACHE_DIR --steps 20
 
 | GPU | VRAM | Max Batch | Step(s) | Memory | t/s |
 |-----|------|-----------|---------|--------|-----|
-| T4 | 16 GB | 16 | ~0.85 | ~9.8 GB | ~1200 |
+| T4 | 16 GB | 8 | - | - | ~7 |
 | L4 | 22 GB | 128 | ~54 | ~16 GB | ~152 |
 | A100 | 40 GB | 480 | ~49 | ~46 GB | ~628 |
 
