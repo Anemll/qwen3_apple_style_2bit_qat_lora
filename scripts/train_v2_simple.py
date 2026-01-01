@@ -54,6 +54,8 @@ def main():
     # Training precision
     parser.add_argument('--dtype', type=str, default='fp32', choices=['fp32', 'bf16', 'fp16'],
                         help='Training dtype: fp32 (default, ANE-safe), bf16 (2x faster), fp16 (fastest but risky)')
+    parser.add_argument('--mixed-precision', action='store_true',
+                        help='Mixed precision: FP32 master weights + BF16 compute (best of both)')
     args = parser.parse_args()
 
     # Validate inputs - need v1, v2 checkpoint, or from-scratch
@@ -75,10 +77,16 @@ def main():
         'bf16': torch.bfloat16,
         'fp16': torch.float16,
     }
-    train_dtype = dtype_map[args.dtype]
 
-    print(f"Device: {device}")
-    print(f"Training dtype: {args.dtype}")
+    # Mixed precision: FP32 master weights + BF16 compute
+    if args.mixed_precision:
+        train_dtype = torch.float32  # Always FP32 for master weights
+        print(f"Device: {device}")
+        print(f"Training: Mixed Precision (FP32 weights + BF16 compute)")
+    else:
+        train_dtype = dtype_map[args.dtype]
+        print(f"Device: {device}")
+        print(f"Training dtype: {args.dtype}")
     if args.v2_checkpoint:
         print(f"V2 checkpoint: {args.v2_checkpoint}")
     elif args.from_scratch:
@@ -385,6 +393,7 @@ def main():
         'cache_dir': args.cache_dir,
         'dtype': args.dtype,
         'use_ste_fp16': use_ste,
+        'mixed_precision': args.mixed_precision,
     }
 
     result = train_e2e(
@@ -409,6 +418,7 @@ def main():
         save_steps=args.save_steps,
         verbose=True,
         use_fp16=False,  # STE handles FP16
+        use_mixed_precision=args.mixed_precision,
         use_wandb=args.wandb,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run,

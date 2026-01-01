@@ -1150,6 +1150,7 @@ def train_e2e(
     warmup_steps: int = 0,
     min_lr_ratio: float = 0.1,
     use_fp16: bool = False,
+    use_mixed_precision: bool = False,
     use_wandb: bool = False,
     wandb_project: str = "qwen3-qat",
     wandb_run_name: str = None,
@@ -1182,6 +1183,7 @@ def train_e2e(
         warmup_steps: Linear warmup steps (0 to disable)
         min_lr_ratio: Minimum LR as ratio of peak LR (default 0.1 = 10% of lr)
         use_fp16: Enable FP16 training with GradScaler (CUDA only)
+        use_mixed_precision: Enable mixed precision (FP32 master weights + BF16 compute)
         use_wandb: Enable Weights & Biases logging (requires wandb package)
         wandb_project: W&B project name (default: "qwen3-qat")
         wandb_run_name: W&B run name (default: auto-generated)
@@ -1312,6 +1314,10 @@ def train_e2e(
     if verbose:
         print(f"=== End-to-End KD-QAT ===")
         print(f"Mode: {mode}")
+        if use_mixed_precision:
+            print(f"Precision: Mixed (FP32 weights + BF16 compute)")
+        elif use_fp16:
+            print(f"Precision: FP16 with GradScaler")
         print(f"Trainable params: {trainable:,}")
         if train_mlp_only:
             print(f"Frozen attention params: {attn_frozen:,}")
@@ -1410,9 +1416,18 @@ def train_e2e(
                     model_dtype = next(model.parameters()).dtype
                     print(f"[TPU DEBUG] model dtype: {model_dtype}, device: {device}")
 
-            # Forward pass with optional autocast for FP16
+            # Forward pass with optional autocast for FP16 or mixed precision
             if use_fp16:
                 with torch.amp.autocast(device_type=device.type, dtype=torch.float16):
+                    loss = compute_kd_loss_batch(
+                        model, batch, device, temperature,
+                        no_grad=False,
+                        hard_top1_weight=hard_top1_weight,
+                        hard_full_weight=hard_full_weight,
+                    )
+            elif use_mixed_precision:
+                # Mixed precision: FP32 master weights + BF16 compute
+                with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
                     loss = compute_kd_loss_batch(
                         model, batch, device, temperature,
                         no_grad=False,
