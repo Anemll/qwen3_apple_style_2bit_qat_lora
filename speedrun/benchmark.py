@@ -468,6 +468,11 @@ def find_max_batch_size(
     estimated = int(available_mb / per_sample_mb)
     estimated = (estimated // 8) * 8  # Round to multiple of 8
     estimated = max(8, min(512, estimated))
+
+    # TPU: Much more conservative - no gradient checkpointing, XLA compilation overhead
+    # Crashes are not catchable, so start low
+    if is_tpu_device(device):
+        estimated = min(estimated, 24)  # TPU max without checkpointing ~16-24
     print(f"  Model memory: {model_mem_mb:.0f} MB")
     print(f"  Available for batches: {available_mb:.0f} MB")
     print(f"  Estimated max batch: {estimated}")
