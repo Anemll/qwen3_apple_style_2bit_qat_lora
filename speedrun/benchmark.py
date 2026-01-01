@@ -477,10 +477,43 @@ def find_max_batch_size(
     # Print header
     print_result_header(seq_len)
 
+    # TPU graph compilation warmup flag (per batch size)
+    tpu_warmup_done = {}
+
     # Helper to test a batch size (reuses model, only reloads after OOM)
     def test_batch(batch: int, current_model) -> tuple:
         """Test batch size. Returns (success, result, model).
         Model is None after OOM (needs reload)."""
+        nonlocal tpu_warmup_done
+
+        # TPU: Pre-compile graph with 1 warmup step (excluded from timing)
+        if is_tpu_device(device) and batch not in tpu_warmup_done:
+            print(f"\n  batch={batch}: compiling graph...", end="", flush=True)
+            try:
+                train_e2e(
+                    model=current_model,
+                    cache_dir=cache_dir,
+                    device=device,
+                    max_steps=1,  # Just 1 step to compile
+                    batch_size=batch,
+                    lr=5e-5,
+                    use_cosine_schedule=False,
+                    warmup_steps=0,
+                    temperature=2.0,
+                    train_weights=False,
+                    train_scales=True,
+                    logging_steps=999,
+                    eval_steps=999,
+                    verbose=False,
+                    use_fp16=False,
+                )
+                tpu_mark_step()  # Ensure graph is compiled
+                tpu_warmup_done[batch] = True
+                print("done. ", end="", flush=True)
+            except Exception as e:
+                # Warmup failed (likely OOM), proceed to actual test
+                print(f"skip ({str(e)[:30]}). ", end="", flush=True)
+
         print(f"\n  batch={batch}: ", end="", flush=True)
         t0 = time.time()
 
