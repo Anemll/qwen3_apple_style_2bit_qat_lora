@@ -15,7 +15,7 @@ set -e
 # CONFIG - Auto-detect platform
 # =============================================================================
 
-# Detect Google Drive path
+# Detect Google Drive path or TPU VM
 if [ -d "/content/drive/MyDrive" ]; then
     # Colab
     GDRIVE_BASE="/content/drive/MyDrive"
@@ -24,10 +24,18 @@ elif [ -d "$HOME/Library/CloudStorage/GoogleDrive-realanemll@gmail.com/My Drive"
     # macOS with Google Drive for Desktop
     GDRIVE_BASE="$HOME/Library/CloudStorage/GoogleDrive-realanemll@gmail.com/My Drive"
     PLATFORM="macos"
+elif [ -n "$TPU_NAME" ] || [ -f "/etc/tpu_name" ] || python -c "import torch_xla" 2>/dev/null; then
+    # TPU VM - use GCS bucket
+    PLATFORM="tpu"
+    GCS_BUCKET="${GCS_BUCKET:-gs://anemll-tpu-data}"
+    GDRIVE_BASE="$GCS_BUCKET"
+    echo "[TPU] Using GCS bucket: $GCS_BUCKET"
+    echo "[TPU] Set GCS_BUCKET env var to override"
 else
-    echo "[ERROR] Google Drive not found"
+    echo "[ERROR] Platform not detected"
     echo "  Colab: Mount with drive.mount('/content/drive')"
     echo "  macOS: Install Google Drive for Desktop"
+    echo "  TPU:   Set GCS_BUCKET=gs://your-bucket"
     return 1
 fi
 
@@ -87,8 +95,24 @@ fast_extract() {
     local src_path="$1"
     local dest_dir="$2"
     local archive_name=$(basename "$src_path")
+    local local_archive="/tmp/$archive_name"
 
-    if [ "$PLATFORM" = "colab" ] && [ -d "$LOCAL_TMP" ]; then
+    if [ "$PLATFORM" = "tpu" ]; then
+        # TPU: download from GCS first
+        echo "  Downloading from GCS..."
+        gsutil -m cp "$src_path" "$local_archive"
+
+        echo "  Extracting..."
+        if [[ "$archive_name" == *.tar.lz4 ]]; then
+            which lz4 >/dev/null || sudo apt-get install -qq lz4
+            tar -I lz4 -xf "$local_archive" -C "$dest_dir/"
+        elif [[ "$archive_name" == *.tgz ]]; then
+            tar -xzf "$local_archive" -C "$dest_dir/"
+        fi
+
+        # Cleanup
+        rm -f "$local_archive"
+    elif [ "$PLATFORM" = "colab" ] && [ -d "$LOCAL_TMP" ]; then
         # Colab: rsync to local SSD first (2-3x faster)
         echo "  Copying to local SSD..."
         rsync -ah --progress "$src_path" "$LOCAL_TMP/"
@@ -147,9 +171,19 @@ pull_cache() {
     [ -d "$cache_dir" ] && rm -rf "$cache_dir"
     mkdir -p "$cache_dir"
 
+# Helper to check if file exists (local or GCS)
+    file_exists() {
+        local path="$1"
+        if [[ "$path" == gs://* ]]; then
+            gsutil -q stat "$path" 2>/dev/null
+        else
+            [ -f "$path" ]
+        fi
+    }
+
     # Prefer .tar.lz4 (fastest)
     local lz4_path="$GDRIVE_CACHES/${cache_name}.tar.lz4"
-    if [ -f "$lz4_path" ]; then
+    if file_exists "$lz4_path"; then
         echo "[CACHE] Extracting $cache_name.tar.lz4 (lz4 + rsync)..."
         fast_extract "$lz4_path" "caches"
         # Verify extraction worked
@@ -177,7 +211,7 @@ pull_cache() {
 
     # Fall back to .tgz
     local tgz_path="$GDRIVE_CACHES/${cache_name}.tgz"
-    if [ -f "$tgz_path" ]; then
+    if file_exists "$tgz_path"; then
         echo "[CACHE] Extracting $cache_name.tgz (rsync + extract)..."
         fast_extract "$tgz_path" "caches"
         local pt_count=$(ls "$cache_dir"/*.pt 2>/dev/null | wc -l)
