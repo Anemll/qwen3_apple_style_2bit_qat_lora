@@ -424,21 +424,51 @@ def find_max_batch_size(
 V2_MODEL_CACHE = "runs/speedrun/v2_benchmark_model.pt"
 
 
-def get_or_create_v2_model(model_id: str, rebuild: bool = False) -> str:
-    """Get cached V2 model path, creating if needed."""
-    os.makedirs(os.path.dirname(V2_MODEL_CACHE), exist_ok=True)
+def get_or_create_v2_model(model_id: str, rebuild: bool = False,
+                           load_from: str = None, save_to: str = None) -> str:
+    """Get cached V2 model path, creating if needed.
 
+    Args:
+        model_id: HuggingFace model ID
+        rebuild: Force rebuild even if cache exists
+        load_from: Load pre-saved model from this path (e.g., GDrive)
+        save_to: Save model to this path after creation (e.g., GDrive)
+    """
+    # Priority 1: Load from specified path (e.g., GDrive)
+    if load_from and os.path.exists(load_from) and not rebuild:
+        print(f"[*] Loading V2 model from: {load_from}")
+        # Copy to local cache for faster subsequent loads
+        if load_from != V2_MODEL_CACHE:
+            os.makedirs(os.path.dirname(V2_MODEL_CACHE), exist_ok=True)
+            import shutil
+            print(f"  Copying to local cache...", end=" ", flush=True)
+            t0 = time.time()
+            shutil.copy(load_from, V2_MODEL_CACHE)
+            print(f"done ({time.time()-t0:.1f}s)")
+        return V2_MODEL_CACHE
+
+    # Priority 2: Use local cache
+    os.makedirs(os.path.dirname(V2_MODEL_CACHE), exist_ok=True)
     if os.path.exists(V2_MODEL_CACHE) and not rebuild:
         print(f"[*] Using cached V2 model: {V2_MODEL_CACHE}")
         return V2_MODEL_CACHE
 
-    print(f"\n[*] Creating V2 model (one-time, will cache to {V2_MODEL_CACHE})...")
+    # Priority 3: Create new model
+    print(f"\n[*] Creating V2 model (one-time)...")
     v2_model = create_v2_model(model_id, verbose=True)
 
     print(f"  Saving to {V2_MODEL_CACHE}...", end=" ", flush=True)
     t0 = time.time()
     torch.save(v2_model, V2_MODEL_CACHE)
     print(f"done ({time.time()-t0:.1f}s)")
+
+    # Also save to GDrive if specified
+    if save_to and save_to != V2_MODEL_CACHE:
+        os.makedirs(os.path.dirname(save_to), exist_ok=True)
+        print(f"  Saving to {save_to}...", end=" ", flush=True)
+        t0 = time.time()
+        torch.save(v2_model, save_to)
+        print(f"done ({time.time()-t0:.1f}s)")
 
     del v2_model
     reset_gpu_memory()
@@ -458,6 +488,10 @@ def main():
                         help='Custom batch sizes to test (comma-separated, e.g., "8,16,32")')
     parser.add_argument('--rebuild-model', action='store_true',
                         help='Rebuild V2 model cache even if it exists')
+    parser.add_argument('--load-model', type=str, default=None,
+                        help='Load pre-saved V2 model from path (e.g., GDrive)')
+    parser.add_argument('--save-model', type=str, default=None,
+                        help='Save V2 model to path after creation (e.g., GDrive)')
     args = parser.parse_args()
 
     assert os.path.exists(args.cache_dir), f"Cache dir not found: {args.cache_dir}"
@@ -469,7 +503,12 @@ def main():
         print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
     # Get or create cached V2 model (reused across all benchmarks)
-    v2_model_path = get_or_create_v2_model(args.model_id, rebuild=args.rebuild_model)
+    v2_model_path = get_or_create_v2_model(
+        args.model_id,
+        rebuild=args.rebuild_model,
+        load_from=args.load_model,
+        save_to=args.save_model,
+    )
 
     # Find max batch mode
     if args.find_max_batch:
