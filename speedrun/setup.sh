@@ -24,18 +24,28 @@ elif [ -d "$HOME/Library/CloudStorage/GoogleDrive-realanemll@gmail.com/My Drive"
     # macOS with Google Drive for Desktop
     GDRIVE_BASE="$HOME/Library/CloudStorage/GoogleDrive-realanemll@gmail.com/My Drive"
     PLATFORM="macos"
-elif [ -n "$TPU_NAME" ] || [ -f "/etc/tpu_name" ] || python -c "import torch_xla" 2>/dev/null; then
+elif [ -n "$GDRIVE_PATH" ] && [ -d "$GDRIVE_PATH" ]; then
+    # Custom GDrive mount (e.g., rclone on TPU VM)
+    GDRIVE_BASE="$GDRIVE_PATH"
+    PLATFORM="custom"
+    echo "[GDRIVE] Using custom mount: $GDRIVE_PATH"
+elif [ -d "$HOME/gdrive/qwen3_caches" ]; then
+    # rclone mount at ~/gdrive (TPU VM default)
+    GDRIVE_BASE="$HOME/gdrive"
+    PLATFORM="rclone"
+    echo "[GDRIVE] Using rclone mount: $HOME/gdrive"
+elif [ -n "$GCS_BUCKET" ]; then
     # TPU VM - use GCS bucket
     PLATFORM="tpu"
-    GCS_BUCKET="${GCS_BUCKET:-gs://anemll-tpu-data}"
     GDRIVE_BASE="$GCS_BUCKET"
     echo "[TPU] Using GCS bucket: $GCS_BUCKET"
-    echo "[TPU] Set GCS_BUCKET env var to override"
 else
-    echo "[ERROR] Platform not detected"
-    echo "  Colab: Mount with drive.mount('/content/drive')"
-    echo "  macOS: Install Google Drive for Desktop"
-    echo "  TPU:   Set GCS_BUCKET=gs://your-bucket"
+    echo "[ERROR] Storage not found. Options:"
+    echo "  Colab:  Mount with drive.mount('/content/drive')"
+    echo "  macOS:  Install Google Drive for Desktop"
+    echo "  TPU:    Mount GDrive with rclone:"
+    echo "          rclone mount gdrive: ~/gdrive --daemon --vfs-cache-mode full"
+    echo "  GCS:    export GCS_BUCKET=gs://your-bucket"
     return 1
 fi
 
