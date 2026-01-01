@@ -354,6 +354,8 @@ def find_max_batch_size(
     rebuild_model: bool = False,
 ) -> int:
     """Find maximum batch size that fits in GPU memory using estimation + binary search."""
+    from qat_lora import freeze_Q_all, train_e2e
+
     seq_len = get_seq_len_from_cache(cache_dir)
     gpu_mem_gb = get_gpu_total_memory_gb()
 
@@ -367,40 +369,112 @@ def find_max_batch_size(
     print(f"Estimated max batch: {estimated}")
     print(f"{'='*60}")
 
-    # Get or create cached V2 model
+    # Get or create cached V2 model path
     v2_model_path = get_or_create_v2_model(model_id, rebuild=rebuild_model)
 
-    print("\n[*] Testing estimated batch size...")
+    # Load model once and keep in memory
+    model_size_mb = os.path.getsize(v2_model_path) / 1024 / 1024
+    print(f"\n[*] Loading model ({model_size_mb:.0f} MB)...", end=" ", flush=True)
+    t0 = time.time()
+    model = torch.load(v2_model_path, map_location='cpu', weights_only=False)
+    model.to(device)
+    if gradient_checkpointing and hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+    freeze_Q_all(model, verbose=False)
+    print(f"done ({time.time()-t0:.1f}s)")
+
+    print("\n[*] Testing batch sizes...")
 
     # Print header
     print_result_header(seq_len)
 
-    # Helper to test a batch size
-    def test_batch(batch: int) -> tuple:
-        print(f"\n  batch={batch}: loading model...", end=" ", flush=True)
+    # Helper to test a batch size (reuses model, only reloads after OOM)
+    def test_batch(batch: int, current_model) -> tuple:
+        """Test batch size. Returns (success, result, model).
+        Model is None after OOM (needs reload)."""
+        print(f"\n  batch={batch}: ", end="", flush=True)
         t0 = time.time()
-        result = run_benchmark(
-            cache_dir=cache_dir,
-            batch_size=batch,
-            steps=steps,
-            gradient_checkpointing=gradient_checkpointing,
-            device=device,
-            model_id=model_id,
-            verbose=False,
-            v2_model_path=v2_model_path,
-            warmup_steps=warmup_steps,
-        )
-        elapsed = time.time() - t0
-        if result.success:
-            print(f"done ({elapsed:.1f}s) -> OK (mem={result.peak_memory_mb:.0f}M, t/s={result.tokens_per_sec:.0f})")
-            print_result_row(result)
-        else:
-            print(f"done ({elapsed:.1f}s) -> OOM")
-            print_result_row(result)
-        return result.success, result
+
+        try:
+            reset_gpu_memory()
+            result = train_e2e(
+                model=current_model,
+                cache_dir=cache_dir,
+                device=device,
+                max_steps=steps,
+                batch_size=batch,
+                lr=5e-5,
+                use_cosine_schedule=True,
+                warmup_steps=warmup_steps,
+                temperature=2.0,
+                train_weights=False,
+                train_scales=True,
+                logging_steps=steps + 1,
+                eval_steps=steps + 1,
+                verbose=False,
+                use_fp16=False,
+            )
+            elapsed = time.time() - t0
+            peak_memory = get_gpu_memory_mb()
+            tokens_per_sec = (batch * seq_len * steps) / elapsed
+            final_loss = result.get('final_loss', 0.0)
+
+            bench_result = BenchmarkResult(
+                name=f"batch={batch}+checkpointing",
+                batch_size=batch,
+                seq_len=seq_len,
+                steps=steps,
+                total_time=elapsed,
+                peak_memory_mb=peak_memory,
+                step_time=elapsed / steps,
+                tokens_per_sec=tokens_per_sec,
+                final_loss=final_loss,
+                success=True,
+            )
+            print(f"OK ({elapsed:.1f}s, mem={peak_memory:.0f}M, t/s={tokens_per_sec:.0f})")
+            print_result_row(bench_result)
+            return True, bench_result, current_model
+
+        except Exception as e:
+            elapsed = time.time() - t0
+            bench_result = BenchmarkResult(
+                name=f"batch={batch}+checkpointing",
+                batch_size=batch,
+                seq_len=seq_len,
+                steps=steps,
+                total_time=0,
+                peak_memory_mb=get_gpu_memory_mb(),
+                step_time=0,
+                tokens_per_sec=0,
+                final_loss=0,
+                success=False,
+                error=str(e)[:50],
+            )
+            print(f"OOM ({elapsed:.1f}s)")
+            print_result_row(bench_result)
+            # Model state corrupted after OOM, need to reload
+            del current_model
+            reset_gpu_memory()
+            return False, bench_result, None
+
+    # Helper to reload model after OOM
+    def reload_model():
+        print("  reloading model...", end=" ", flush=True)
+        t0 = time.time()
+        m = torch.load(v2_model_path, map_location='cpu', weights_only=False)
+        m.to(device)
+        if gradient_checkpointing and hasattr(m, 'gradient_checkpointing_enable'):
+            m.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        freeze_Q_all(m, verbose=False)
+        print(f"done ({time.time()-t0:.1f}s)")
+        return m
 
     # Test estimated batch size
-    success, _ = test_batch(estimated)
+    success, _, model = test_batch(estimated, model)
 
     if success:
         # Estimate worked - search upward
@@ -408,7 +482,8 @@ def find_max_batch_size(
         high = min(512, int(estimated * 1.5))
         high = (high // 8) * 8
     else:
-        # Estimate too high - search downward
+        # Estimate too high - search downward, reload model
+        model = reload_model()
         low = 8
         high = estimated
 
@@ -425,13 +500,21 @@ def find_max_batch_size(
         if mid >= high:
             break
 
-        success, _ = test_batch(mid)
+        if model is None:
+            model = reload_model()
+
+        success, _, model = test_batch(mid, model)
 
         if success:
             low = mid
             max_working = mid
         else:
             high = mid
+
+    # Cleanup
+    if model is not None:
+        del model
+    reset_gpu_memory()
 
     # Final result
     print(f"\n{'='*60}")
