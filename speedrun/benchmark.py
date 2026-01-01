@@ -376,7 +376,16 @@ def find_max_batch_size(
     model_size_mb = os.path.getsize(v2_model_path) / 1024 / 1024
     print(f"\n[*] Loading model ({model_size_mb:.0f} MB)...", end=" ", flush=True)
     t0 = time.time()
-    model = torch.load(v2_model_path, map_location='cpu', weights_only=False)
+    try:
+        model = torch.load(v2_model_path, map_location='cpu', weights_only=False)
+    except RuntimeError as e:
+        if "failed finding central directory" in str(e) or "PytorchStreamReader failed" in str(e):
+            print(f"CORRUPTED!")
+            print(f"  Deleting corrupted cache: {v2_model_path}")
+            os.remove(v2_model_path)
+            print(f"  Please re-run to reload from GDrive or recreate model.")
+            raise RuntimeError(f"Corrupted cache deleted. Please re-run.")
+        raise
     model.to(device)
     if gradient_checkpointing and hasattr(model, 'gradient_checkpointing_enable'):
         model.gradient_checkpointing_enable(
