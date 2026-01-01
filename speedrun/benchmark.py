@@ -51,10 +51,13 @@ def get_device():
     """Get best available device: TPU > CUDA > CPU."""
     # Try TPU first
     try:
-        import torch_xla.core.xla_model as xm
-        return xm.xla_device()
+        import torch_xla
+        return torch_xla.device()
     except ImportError:
         pass
+    except RuntimeError as e:
+        # TPU busy or init failed - fall back to CUDA/CPU
+        print(f"[WARN] TPU init failed: {e}")
     # Fall back to CUDA
     if torch.cuda.is_available():
         return torch.device('cuda')
@@ -94,9 +97,9 @@ def reset_gpu_memory():
 def tpu_mark_step():
     """Mark step for TPU (no-op for CUDA/CPU)."""
     try:
-        import torch_xla.core.xla_model as xm
-        xm.mark_step()
-    except ImportError:
+        import torch_xla
+        torch_xla.sync()
+    except (ImportError, RuntimeError):
         pass
 
 
