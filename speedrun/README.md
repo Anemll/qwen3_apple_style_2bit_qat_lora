@@ -134,8 +134,10 @@ python speedrun/benchmark.py --cache-dir $CACHE_DIR --steps 20
 
 | GPU | VRAM | Max Batch | Best t/s | Memory | Notes |
 |-----|------|-----------|----------|--------|-------|
+| B200 | 180 GB | 512* | 620 | 87 GB | RunPod |
 | A100 | 40 GB | 144 | 173 | 30 GB | Colab |
-| RTX 5090 | 32 GB | TBD | TBD | TBD | RunPod |
+
+*batch cap removed - rerun for true max
 
 **L4 detailed results (22.2 GB):**
 
