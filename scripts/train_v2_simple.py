@@ -213,7 +213,7 @@ def main():
 
         t0 = time.time()
         print(f"  Loading checkpoint ({args.v2_checkpoint})...", end=" ", flush=True)
-        state_dict = torch.load(args.v2_checkpoint, map_location='cpu')
+        state_dict = torch.load(args.v2_checkpoint, map_location='cpu', weights_only=False)
         v2_model.load_state_dict(state_dict, strict=False)
 
         # Manually load _Q buffers (None buffers don't load automatically)
@@ -305,7 +305,7 @@ def main():
             quantize_lm_head=False,
         )
 
-        state_dict = torch.load(args.v1_checkpoint, map_location='cpu')
+        state_dict = torch.load(args.v1_checkpoint, map_location='cpu', weights_only=False)
         v1_model.load_state_dict(state_dict, strict=False)
         v1_model.to(device)
         print("  V1 model loaded")
