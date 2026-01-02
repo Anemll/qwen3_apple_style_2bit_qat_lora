@@ -104,10 +104,14 @@ def main():
     device, device_type = get_device()
     is_tpu = device_type == 'tpu' or args.tpu
 
-    # TPU requires BF16
-    if is_tpu and args.dtype == 'fp32':
+    # TPU: BF16 is native, FP32 is slow
+    if is_tpu and args.dtype == 'fp32' and not args.mixed_precision:
         print("[TPU] Forcing BF16 (FP32 not recommended on TPU)")
         args.dtype = 'bf16'
+
+    # TPU mixed precision: FP32 master weights + BF16 compute via autocast
+    if is_tpu and args.mixed_precision:
+        print("[TPU] Mixed Precision: FP32 master weights + BF16 compute (autocast)")
 
     # Dtype mapping
     dtype_map = {

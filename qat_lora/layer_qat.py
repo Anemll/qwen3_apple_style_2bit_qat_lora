@@ -1485,8 +1485,11 @@ def train_e2e(
                     print(f"[TPU DEBUG] model dtype: {model_dtype}, device: {device}")
 
             # Forward pass with optional autocast for FP16 or mixed precision
+            # Note: TPU/XLA uses 'xla' device type for autocast
+            autocast_device = 'xla' if is_tpu else device.type
+
             if use_fp16:
-                with torch.amp.autocast(device_type=device.type, dtype=torch.float16):
+                with torch.amp.autocast(device_type=autocast_device, dtype=torch.float16):
                     loss = compute_kd_loss_batch(
                         model, batch, device, temperature,
                         no_grad=False,
@@ -1495,7 +1498,7 @@ def train_e2e(
                     )
             elif use_mixed_precision:
                 # Mixed precision: FP32 master weights + BF16 compute
-                with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
+                with torch.amp.autocast(device_type=autocast_device, dtype=torch.bfloat16):
                     loss = compute_kd_loss_batch(
                         model, batch, device, temperature,
                         no_grad=False,
