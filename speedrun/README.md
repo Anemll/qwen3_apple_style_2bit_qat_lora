@@ -120,7 +120,7 @@ python speedrun/benchmark.py --cache-dir $CACHE_DIR --steps 20
 
 **Expected results (L64 cache, seq=64, gradient checkpointing ON):**
 
-**BF16:**
+**GPU - BF16:**
 
 | GPU | VRAM | Max Batch | Best t/s | Memory | Notes |
 |-----|------|-----------|----------|--------|-------|
@@ -130,7 +130,7 @@ python speedrun/benchmark.py --cache-dir $CACHE_DIR --steps 20
 | L4 | 24 GB | 128 | 152 | 16 GB | Colab |
 | T4 | 16 GB | ~32 | ~40 | ~14 GB | Colab |
 
-**FP32:**
+**GPU - FP32:**
 
 | GPU | VRAM | Max Batch | Best t/s | Memory | Notes |
 |-----|------|-----------|----------|--------|-------|
@@ -138,6 +138,28 @@ python speedrun/benchmark.py --cache-dir $CACHE_DIR --steps 20
 | A100 | 40 GB | 144 | 173 | 30 GB | Colab |
 
 *batch cap removed - rerun for true max
+
+**TPU - BF16:**
+
+| TPU | HBM | Max Batch | Best t/s | Notes |
+|-----|-----|-----------|----------|-------|
+| **TPU v6e-1** | **16 GB** | **24** | **972** | Google Cloud |
+
+*TPU requires XLA graph caching - first run compiles (~4 min), subsequent runs use cached graph.*
+
+**GPU vs TPU Comparison (BF16, L64):**
+
+| Device | Memory | Max Batch | t/s (cached) | $/hr* | t/s per $ |
+|--------|--------|-----------|--------------|-------|-----------|
+| L4 | 24 GB | 128 | 152 | ~$0.50 | 304 |
+| **TPU v6e** | **16 GB** | **24** | **972** | ~$1.20 | **810** |
+| A100 | 40 GB | 144 | 173** | ~$2.00 | 87 |
+| H100 | 80 GB | 504 | 1182 | ~$3.00 | 394 |
+| B200 | 180 GB | 512 | 1582 | ~$5.00 | 316 |
+
+*Approximate prices, varies by provider. **A100 tested with FP32.
+
+**Key insight:** TPU v6e offers best value (t/s per $) due to efficient BF16 and XLA compilation. Requires understanding XLA graph caching for optimal performance.
 
 **L4 detailed results (22.2 GB):**
 
