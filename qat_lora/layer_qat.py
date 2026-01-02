@@ -324,52 +324,96 @@ class KDCacheDataset(IterableDataset):
     over individual examples to avoid shape mismatches when collating.
     """
 
-    def __init__(self, cache_dir: str, shuffle: bool = True):
+    def __init__(self, cache_dir: str, shuffle: bool = True, preload: bool = False):
+        """
+        Args:
+            cache_dir: Path to cache directory with .pt files
+            shuffle: Shuffle files (and examples if preloaded) each epoch
+            preload: Load all data into RAM on init (faster training, more RAM)
+        """
         self.cache_dir = Path(cache_dir)
         self.files = sorted(self.cache_dir.glob('*.pt'))
         self.shuffle = shuffle
+        self.preload = preload
+        self._cached_examples = None
+
+        if preload:
+            self._preload_all()
+
+    def _preload_all(self):
+        """Load all examples into memory once."""
+        self._cached_examples = []
+        for f in self.files:
+            data = torch.load(f, map_location='cpu', weights_only=True)
+            examples = self._parse_shard(data)
+            self._cached_examples.extend(examples)
+        # Print once
+        print(f"[KDCache] Preloaded {len(self._cached_examples)} examples into RAM")
+
+    def _parse_shard(self, data: dict) -> list:
+        """Parse a single shard file into list of examples."""
+        # Get tensors and ensure proper dimensions
+        ids = data['input_ids']
+        if ids.dim() == 1:
+            ids = ids.unsqueeze(0)
+
+        topk_idx = data['topk_idx']
+        if topk_idx.dim() == 2:
+            topk_idx = topk_idx.unsqueeze(0)
+
+        topk_logits = data['topk_logits']
+        if topk_logits.dim() == 2:
+            topk_logits = topk_logits.unsqueeze(0)
+
+        attn_mask = data.get('attention_mask')
+        if attn_mask is not None:
+            if attn_mask.dim() == 1:
+                attn_mask = attn_mask.unsqueeze(0)
+        else:
+            attn_mask = torch.ones_like(ids)
+
+        # Build list of examples
+        examples = []
+        num_examples = ids.size(0)
+        for i in range(num_examples):
+            examples.append({
+                'input_ids': ids[i],            # [L]
+                'attention_mask': attn_mask[i], # [L]
+                'topk_idx': topk_idx[i],        # [S, K]
+                'topk_logits': topk_logits[i],  # [S, K]
+            })
+        return examples
 
     def __len__(self) -> int:
-        """Approximate length (number of cache files)."""
+        """Approximate length (number of cache files or preloaded examples)."""
+        if self._cached_examples is not None:
+            return len(self._cached_examples)
         return len(self.files)
 
     def __iter__(self):
+        # Fast path: preloaded data
+        if self._cached_examples is not None:
+            examples = self._cached_examples
+            if self.shuffle:
+                indices = list(range(len(examples)))
+                random.shuffle(indices)
+                for i in indices:
+                    yield examples[i]
+            else:
+                for ex in examples:
+                    yield ex
+            return
+
+        # Slow path: load from disk each epoch
         files = list(self.files)
         if self.shuffle:
             random.shuffle(files)
 
         for f in files:
             data = torch.load(f, map_location='cpu', weights_only=True)
-
-            # Get tensors and ensure proper dimensions
-            ids = data['input_ids']
-            if ids.dim() == 1:
-                ids = ids.unsqueeze(0)
-
-            topk_idx = data['topk_idx']
-            if topk_idx.dim() == 2:
-                topk_idx = topk_idx.unsqueeze(0)
-
-            topk_logits = data['topk_logits']
-            if topk_logits.dim() == 2:
-                topk_logits = topk_logits.unsqueeze(0)
-
-            attn_mask = data.get('attention_mask')
-            if attn_mask is not None:
-                if attn_mask.dim() == 1:
-                    attn_mask = attn_mask.unsqueeze(0)
-            else:
-                attn_mask = torch.ones_like(ids)
-
-            # Yield individual examples from this shard
-            num_examples = ids.size(0)
-            for i in range(num_examples):
-                yield {
-                    'input_ids': ids[i],            # [L]
-                    'attention_mask': attn_mask[i], # [L]
-                    'topk_idx': topk_idx[i],        # [S, K]
-                    'topk_logits': topk_logits[i],  # [S, K]
-                }
+            examples = self._parse_shard(data)
+            for ex in examples:
+                yield ex
 
 
 def collate_fn(batch: List[dict]) -> dict:
@@ -676,12 +720,14 @@ def train_layer(
     num_epochs = 1000 if max_steps > 0 else epochs
     done = False
 
+    # Create dataset ONCE with preload for fast training
+    dataset = KDCacheDataset(cache_dir, shuffle=True, preload=True)
+
     for epoch in range(num_epochs):
         if done:
             break
 
-        # Create fresh dataloader each epoch for proper shuffling
-        dataset = KDCacheDataset(cache_dir, shuffle=True)
+        # Just create new iterator each epoch (data already in RAM)
         dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
 
         for i, batch in enumerate(dataloader):
@@ -1399,8 +1445,12 @@ def train_e2e(
         except ImportError:
             is_tpu = False
 
+    # Create dataset ONCE with preload for fast training
+    # (avoids torch.load I/O every batch)
+    dataset = KDCacheDataset(cache_dir, shuffle=True, preload=True)
+
     while step < max_steps:
-        dataset = KDCacheDataset(cache_dir, shuffle=True)
+        # Just create new iterator each epoch (data already in RAM)
         dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
 
         for batch in dataloader:
