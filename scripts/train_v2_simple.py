@@ -539,14 +539,14 @@ def main():
     print("\n[4/4] Saving model...")
 
     # Save in training dtype first
-    native_path = f"{args.output_dir}/v2_q2a4_{args.dtype}_{timestamp}.pt"
+    native_path = f"{args.output_dir}/v2_{args.config}_{args.dtype}_{timestamp}.pt"
     torch.save(v2_model.state_dict(), native_path)
     print(f"  {args.dtype.upper()}: {native_path}")
 
     # Always save FP16 for ANE export (convert if needed)
     if args.dtype != 'fp16':
         v2_model.half()
-    fp16_path = f"{args.output_dir}/v2_q2a4_fp16_{timestamp}.pt"
+    fp16_path = f"{args.output_dir}/v2_{args.config}_fp16_{timestamp}.pt"
     torch.save(v2_model.state_dict(), fp16_path)
     print(f"  FP16: {fp16_path}")
 
