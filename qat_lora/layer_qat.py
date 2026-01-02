@@ -1439,9 +1439,11 @@ def train_e2e(
     # TPU detection (once, not every step)
     is_tpu = 'xla' in str(device).lower()
     xm = None
+    pl = None  # parallel_loader
     if is_tpu:
         try:
             import torch_xla.core.xla_model as xm
+            import torch_xla.distributed.parallel_loader as pl
         except ImportError:
             is_tpu = False
 
@@ -1451,7 +1453,13 @@ def train_e2e(
 
     while step < max_steps:
         # Just create new iterator each epoch (data already in RAM)
-        dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
+        # drop_last=True for TPU to avoid shape changes on last batch
+        dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn,
+                                drop_last=is_tpu)
+
+        # TPU: Use MpDeviceLoader for async data loading + batched step marking
+        if is_tpu and pl is not None:
+            dataloader = pl.MpDeviceLoader(dataloader, device, batches_per_execution=4)
 
         for batch in dataloader:
             if step >= max_steps:
@@ -1513,16 +1521,15 @@ def train_e2e(
                 # Gradient clipping for FP16 stability
                 if use_fp16:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                # TPU: use xm.optimizer_step() which handles mark_step internally
+                if is_tpu and xm is not None:
+                    xm.optimizer_step(optimizer)
+                else:
+                    optimizer.step()
 
             if scheduler is not None:
                 scheduler.step()
-            optimizer.zero_grad()
-
-            # TPU: mark_step() REQUIRED every step to bound XLA graph
-            # Without it, graph grows unbounded and hangs
-            if is_tpu and xm is not None:
-                xm.mark_step()
+            optimizer.zero_grad(set_to_none=True)  # set_to_none more efficient
 
             # Track loss - TPU: only sync at logging intervals to avoid blocking
             if is_tpu:
