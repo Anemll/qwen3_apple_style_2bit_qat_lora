@@ -1390,6 +1390,15 @@ def train_e2e(
     loss_history = []
     seq_len = None  # Will be set from first batch
 
+    # TPU detection (once, not every step)
+    is_tpu = 'xla' in str(device).lower()
+    xm = None
+    if is_tpu:
+        try:
+            import torch_xla.core.xla_model as xm
+        except ImportError:
+            is_tpu = False
+
     while step < max_steps:
         dataset = KDCacheDataset(cache_dir, shuffle=True)
         dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
@@ -1461,12 +1470,8 @@ def train_e2e(
             optimizer.zero_grad()
 
             # TPU: mark step boundary (non-blocking, allows pipelining)
-            is_tpu = 'xla' in str(device).lower()
-            try:
-                import torch_xla.core.xla_model as xm
+            if is_tpu and xm is not None:
                 xm.mark_step()
-            except (ImportError, RuntimeError):
-                pass
 
             # Track loss - TPU: only sync at logging intervals to avoid blocking
             if is_tpu:
