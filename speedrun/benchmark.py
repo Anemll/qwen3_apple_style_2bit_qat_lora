@@ -793,49 +793,67 @@ def main():
     # Print header once at the start
     print_result_header(seq_len)
 
-    # Benchmark 1: Baseline (batch=8, no checkpointing)
-    if not args.skip_baseline:
-        result = run_benchmark(
-            cache_dir=args.cache_dir,
-            batch_size=8,
-            steps=args.steps,
-            gradient_checkpointing=False,
-            device=device,
-            model_id=args.model_id,
-            v2_model_path=v2_model_path,
-            dtype=train_dtype,
-        )
-        results.append(result)
-        print_result_row(result)
+    # Custom batch sizes mode
+    if args.batch_sizes:
+        batch_sizes = [int(b.strip()) for b in args.batch_sizes.split(',')]
+        for batch_size in batch_sizes:
+            result = run_benchmark(
+                cache_dir=args.cache_dir,
+                batch_size=batch_size,
+                steps=args.steps,
+                gradient_checkpointing=True,  # Always use checkpointing for custom
+                device=device,
+                model_id=args.model_id,
+                v2_model_path=v2_model_path,
+                dtype=train_dtype,
+            )
+            results.append(result)
+            print_result_row(result)
+    else:
+        # Default benchmarks
+        # Benchmark 1: Baseline (batch=8, no checkpointing)
+        if not args.skip_baseline:
+            result = run_benchmark(
+                cache_dir=args.cache_dir,
+                batch_size=8,
+                steps=args.steps,
+                gradient_checkpointing=False,
+                device=device,
+                model_id=args.model_id,
+                v2_model_path=v2_model_path,
+                dtype=train_dtype,
+            )
+            results.append(result)
+            print_result_row(result)
 
-    # Benchmark 2: With checkpointing (batch=8)
-    if not args.skip_checkpointing:
-        result = run_benchmark(
-            cache_dir=args.cache_dir,
-            batch_size=8,
-            steps=args.steps,
-            gradient_checkpointing=True,
-            device=device,
-            model_id=args.model_id,
-            v2_model_path=v2_model_path,
-            dtype=train_dtype,
-        )
-        results.append(result)
-        print_result_row(result)
+        # Benchmark 2: With checkpointing (batch=8)
+        if not args.skip_checkpointing:
+            result = run_benchmark(
+                cache_dir=args.cache_dir,
+                batch_size=8,
+                steps=args.steps,
+                gradient_checkpointing=True,
+                device=device,
+                model_id=args.model_id,
+                v2_model_path=v2_model_path,
+                dtype=train_dtype,
+            )
+            results.append(result)
+            print_result_row(result)
 
-        # Benchmark 3: With checkpointing (batch=16) - to show memory savings
-        result = run_benchmark(
-            cache_dir=args.cache_dir,
-            batch_size=16,
-            steps=args.steps,
-            gradient_checkpointing=True,
-            device=device,
-            model_id=args.model_id,
-            v2_model_path=v2_model_path,
-            dtype=train_dtype,
-        )
-        results.append(result)
-        print_result_row(result)
+            # Benchmark 3: With checkpointing (batch=16) - to show memory savings
+            result = run_benchmark(
+                cache_dir=args.cache_dir,
+                batch_size=16,
+                steps=args.steps,
+                gradient_checkpointing=True,
+                device=device,
+                model_id=args.model_id,
+                v2_model_path=v2_model_path,
+                dtype=train_dtype,
+            )
+            results.append(result)
+            print_result_row(result)
 
     # Print summary
     print_summary(results)
