@@ -1522,24 +1522,18 @@ def train_e2e(
                 # Gradient clipping for FP16 stability
                 if use_fp16:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                # TPU: use xm.optimizer_step() which handles mark_step internally
-                if is_tpu and xm is not None:
-                    xm.optimizer_step(optimizer)
-                else:
-                    optimizer.step()
+                optimizer.step()
 
             if scheduler is not None:
                 scheduler.step()
             optimizer.zero_grad(set_to_none=True)  # set_to_none more efficient
 
-            # Track loss - TPU: only sync at logging intervals to avoid blocking
-            if is_tpu:
-                # Accumulate loss tensor, only call .item() at logging time
-                if step % logging_steps == 0 or step == max_steps - 1:
-                    total_loss += loss.item()  # Sync here
-                # else: skip loss tracking to avoid sync
-            else:
-                total_loss += loss.item()
+            # TPU: mark_step to execute graph (required for progress)
+            if is_tpu and xm is not None:
+                xm.mark_step()
+
+            # Track loss - always sync (simpler, proven to work)
+            total_loss += loss.item()
             step += 1
 
             # Logging
