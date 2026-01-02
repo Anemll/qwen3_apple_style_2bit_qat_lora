@@ -1405,11 +1405,16 @@ def train_e2e(
                 sched_info.append(f"cosine→{min_lr:.2e}")
             print(f"LR Schedule: {', '.join(sched_info)}")
 
-    # Initial evaluation
-    model.eval()
-    initial_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=eval_samples, temperature=temperature)
-    if verbose:
-        print(f"\nInitial KD Loss: {initial_loss:.4f}")
+    # Initial evaluation (skip if eval_samples <= 0, e.g., on TPU)
+    if eval_samples > 0:
+        model.eval()
+        initial_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=eval_samples, temperature=temperature)
+        if verbose:
+            print(f"\nInitial KD Loss: {initial_loss:.4f}")
+    else:
+        initial_loss = 0.0
+        if verbose:
+            print(f"\n[Eval skipped - eval_samples=0]")
 
     # Setup CSV logging
     csv_file = None
@@ -1591,8 +1596,8 @@ def train_e2e(
                 loss_history.append(avg_loss)
                 total_loss = 0.0
 
-            # Evaluation
-            if step % eval_steps == 0:
+            # Evaluation (skip if eval_samples <= 0, e.g., on TPU)
+            if step % eval_steps == 0 and eval_samples > 0:
                 model.eval()
                 eval_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=eval_samples, temperature=temperature)
                 elapsed = time.time() - t_start
@@ -1629,15 +1634,22 @@ def train_e2e(
                 if verbose:
                     print(f"  [Checkpoint saved: {ckpt_path}]")
 
-    # Final evaluation
-    model.eval()
-    final_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=eval_samples, temperature=temperature)
+    # Final evaluation (skip if eval_samples <= 0, e.g., on TPU)
     elapsed = time.time() - t_start
+    if eval_samples > 0:
+        model.eval()
+        final_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=eval_samples, temperature=temperature)
 
-    # Write final eval to CSV
+        # Write final eval to CSV
+        if csv_writer is not None:
+            current_lr = scheduler.get_last_lr()[0] if scheduler is not None else lr
+            csv_writer.writerow([step, '', f'{final_loss:.6f}', f'{current_lr:.2e}', f'{elapsed:.1f}'])
+    else:
+        final_loss = 0.0
+        if verbose:
+            print(f"\n[Final eval skipped - eval_samples=0]")
+
     if csv_writer is not None:
-        current_lr = scheduler.get_last_lr()[0] if scheduler is not None else lr
-        csv_writer.writerow([step, '', f'{final_loss:.6f}', f'{current_lr:.2e}', f'{elapsed:.1f}'])
         csv_file.close()
         if verbose:
             print(f"CSV log saved to: {csv_path}")
@@ -1655,8 +1667,8 @@ def train_e2e(
             'summary/time_sec': elapsed,
         }, step=step)
 
-    # Update best if final is better
-    if final_loss < best_loss:
+    # Update best if final is better (skip if no eval)
+    if eval_samples > 0 and final_loss < best_loss:
         best_loss = final_loss
         best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         if save_dir:
