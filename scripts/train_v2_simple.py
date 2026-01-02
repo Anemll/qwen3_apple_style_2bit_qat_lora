@@ -66,6 +66,10 @@ def main():
     parser.add_argument('--lr', type=float, default=5e-5)  # Lower LR for stability
     parser.add_argument('--hard-top1', type=float, default=0.2, help='Hard label top-1 weight')
     parser.add_argument('--hard-full', type=float, default=0.00005, help='Hard label full vocab weight')
+    parser.add_argument('--temperature', type=float, default=2.0, help='KD temperature (default: 2.0)')
+    parser.add_argument('--warmup-steps', type=int, default=100, help='LR warmup steps (default: 100)')
+    parser.add_argument('--eval-steps', type=int, default=100, help='Eval every N steps (default: 100)')
+    parser.add_argument('--eval-samples', type=int, default=None, help='Eval samples (default: 40, 0=skip)')
     parser.add_argument('--g-only', action='store_true', help='Train only rank_magnitude (G), freeze A and B')
     parser.add_argument('--mlp-only', action='store_true', help='Train only MLP layers, freeze attention')
     parser.add_argument('--save-steps', type=int, default=0, help='Save checkpoint every N steps (0=disabled)')
@@ -485,14 +489,17 @@ def main():
     if is_tpu:
         # Disable full vocab CE on TPU - causes massive XLA graph, slow compilation
         tpu_hard_full = 0.0
-        tpu_eval_samples = 0  # Skip eval to avoid .item() sync spam
         print(f"\n[TPU] Training with optimized parameters:")
         print(f"  hard_full_weight: 0.0 (disabled for XLA)")
-        print(f"  eval_samples: 0 (skip eval for speed)")
         print(f"  Note: First step compiles XLA graph (~4 min)")
     else:
         tpu_hard_full = args.hard_full
-        tpu_eval_samples = None  # Use default
+
+    # Eval samples: CLI > TPU default (0) > train_e2e default (40)
+    eval_samples = args.eval_samples
+    if eval_samples is None and is_tpu:
+        eval_samples = 0  # Skip eval on TPU for speed
+        print(f"  eval_samples: 0 (skip eval for speed)")
 
     result = train_e2e(
         model=v2_model,
@@ -502,8 +509,8 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
         use_cosine_schedule=True,
-        warmup_steps=100,
-        temperature=2.0,
+        warmup_steps=args.warmup_steps,
+        temperature=args.temperature,
         train_weights=False,
         train_scales=True,
         train_g_only=args.g_only,
@@ -511,8 +518,8 @@ def main():
         hard_top1_weight=args.hard_top1,
         hard_full_weight=tpu_hard_full,
         logging_steps=20,
-        eval_steps=100,
-        eval_samples=tpu_eval_samples,
+        eval_steps=args.eval_steps,
+        eval_samples=eval_samples,
         save_dir=args.output_dir,
         save_steps=args.save_steps,
         verbose=True,
