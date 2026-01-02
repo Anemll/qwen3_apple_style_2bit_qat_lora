@@ -474,7 +474,9 @@ def find_max_batch_size(
     per_sample_mb = seq_len * 2.5  # ~160MB for seq=64
     estimated = int(available_mb / per_sample_mb)
     estimated = (estimated // 8) * 8  # Round to multiple of 8
-    estimated = max(8, min(512, estimated))
+    # Scale max batch with GPU memory: 512 for 40GB, 1024 for 80GB, 2048 for 180GB
+    max_batch_cap = max(512, int(gpu_mem_gb * 12))  # ~12 batch per GB
+    estimated = max(8, min(max_batch_cap, estimated))
 
     # TPU: Much more conservative - no gradient checkpointing, XLA compilation overhead
     # Crashes are not catchable, so start low
@@ -612,7 +614,7 @@ def find_max_batch_size(
     if success:
         # Estimate worked - search upward
         low = estimated
-        high = min(512, int(estimated * 1.5))
+        high = min(max_batch_cap, int(estimated * 1.5))
         high = (high // 8) * 8
     else:
         # Estimate too high - search downward, reload model
