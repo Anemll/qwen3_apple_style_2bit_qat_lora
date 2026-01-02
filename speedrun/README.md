@@ -120,11 +120,14 @@ python speedrun/benchmark.py --cache-dir $CACHE_DIR --steps 20
 
 **Expected results (L64 cache, seq=64, BF16, gradient checkpointing ON):**
 
-| GPU | VRAM | Max Batch | Step(s) | Memory | t/s |
-|-----|------|-----------|---------|--------|-----|
-| T4 | 16 GB | 8 | - | - | ~7 |
-| L4 | 22 GB | 128 | ~54 | ~16 GB | ~152 |
-| A100 | 40 GB | 480 | ~49 | ~46 GB | ~628 |
+| GPU | VRAM | Max Batch | Best t/s | Memory | Notes |
+|-----|------|-----------|----------|--------|-------|
+| T4 | 16 GB | ~32 | ~40 | ~14 GB | Colab |
+| L4 | 24 GB | 128 | 152 | 16 GB | Colab |
+| A100 | 40 GB | 144 | 173 | 30 GB | Colab |
+| A100 | 80 GB | ~448 | TBD | ~70 GB | - |
+| **RTX 5090** | **32 GB** | **208** | **367** | 23 GB | RunPod |
+| H100 | 80 GB | TBD | TBD | TBD | RunPod |
 
 **L4 detailed results (22.2 GB):**
 
