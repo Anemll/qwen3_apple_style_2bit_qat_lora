@@ -1461,14 +1461,21 @@ def train_e2e(
             optimizer.zero_grad()
 
             # TPU: mark step boundary (non-blocking, allows pipelining)
+            is_tpu = 'xla' in str(device).lower()
             try:
                 import torch_xla.core.xla_model as xm
                 xm.mark_step()
             except (ImportError, RuntimeError):
                 pass
 
-            # Track loss (item() forces sync, so only call when needed)
-            total_loss += loss.item()
+            # Track loss - TPU: only sync at logging intervals to avoid blocking
+            if is_tpu:
+                # Accumulate loss tensor, only call .item() at logging time
+                if step % logging_steps == 0 or step == max_steps - 1:
+                    total_loss += loss.item()  # Sync here
+                # else: skip loss tracking to avoid sync
+            else:
+                total_loss += loss.item()
             step += 1
 
             # Logging
