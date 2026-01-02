@@ -87,6 +87,8 @@ def main():
     # TPU support
     parser.add_argument('--tpu', action='store_true',
                         help='Force TPU mode (auto-detected if available)')
+    parser.add_argument('--xla-cache-dir', type=str, default=None,
+                        help='XLA compilation cache directory (speeds up TPU restarts)')
     args = parser.parse_args()
 
     # Validate inputs - need v1, v2 checkpoint, or from-scratch
@@ -103,6 +105,18 @@ def main():
     # Device detection (TPU > CUDA > CPU)
     device, device_type = get_device()
     is_tpu = device_type == 'tpu' or args.tpu
+
+    # XLA persistent compilation cache (speeds up TPU restarts)
+    if args.xla_cache_dir:
+        try:
+            import torch_xla.runtime as xr
+            os.makedirs(args.xla_cache_dir, exist_ok=True)
+            xr.initialize_cache(args.xla_cache_dir, readonly=False)
+            print(f"[XLA] Cache initialized: {args.xla_cache_dir}")
+        except ImportError:
+            print("[XLA] Warning: torch_xla.runtime not available, cache disabled")
+        except Exception as e:
+            print(f"[XLA] Warning: Cache init failed: {e}")
 
     # TPU: BF16 is native, FP32 is slow
     if is_tpu and args.dtype == 'fp32' and not args.mixed_precision:
