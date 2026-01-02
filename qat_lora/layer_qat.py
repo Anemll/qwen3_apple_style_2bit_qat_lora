@@ -1659,13 +1659,17 @@ def train_e2e(
                     # Calculate tokens/sec
                     log_elapsed = time.time() - last_log_time
                     tokens_per_sec = (batch_size * seq_len * logging_steps) / max(log_elapsed, 0.001)
-                    wandb.log({
+                    log_dict = {
                         'train/loss': avg_loss,
                         'train/lr': current_lr,
                         'train/step': step,
                         'train/elapsed_sec': elapsed,
                         'train/tokens_per_sec': tokens_per_sec,
-                    }, step=step)
+                    }
+                    # Add best_loss when tracking by training loss (eval disabled)
+                    if eval_samples <= 0:
+                        log_dict['train/best_loss'] = best_loss
+                    wandb.log(log_dict, step=step)
                 last_log_time = time.time()
                 loss_history.append(avg_loss)
                 total_loss = 0.0
