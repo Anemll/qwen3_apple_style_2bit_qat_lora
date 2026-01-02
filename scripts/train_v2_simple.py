@@ -89,6 +89,15 @@ def main():
                         help='Force TPU mode (auto-detected if available)')
     parser.add_argument('--xla-cache-dir', type=str, default=None,
                         help='XLA compilation cache directory (speeds up TPU restarts)')
+    # Quantization config
+    parser.add_argument('--config', type=str, default='q2a4',
+                        choices=['q2a4', 'q4a4', 'q4a4_r32', 'q2a2'],
+                        help='Quantization config preset (default: q2a4)')
+    parser.add_argument('--mlp-lut', type=int, default=None, help='Override MLP LUT size (2-bit=4, 4-bit=16)')
+    parser.add_argument('--mlp-rank', type=int, default=None, help='Override MLP scale rank')
+    parser.add_argument('--attn-lut', type=int, default=None, help='Override Attention LUT size')
+    parser.add_argument('--attn-rank', type=int, default=None, help='Override Attention scale rank')
+    parser.add_argument('--group-size', type=int, default=32, help='Group size for scale init (default: 32)')
     args = parser.parse_args()
 
     # Validate inputs - need v1, v2 checkpoint, or from-scratch
@@ -151,14 +160,28 @@ def main():
         print(f"V1 checkpoint: {args.v1_checkpoint}")
     print(f"Cache dir: {args.cache_dir}")
 
-    # Q2_A4 config (hardcoded for simplicity)
-    MLP_LUT_SIZE = 4
-    MLP_RANK = 32
-    ATTN_LUT_SIZE = 16
-    ATTN_RANK = 8
-    GROUP_SIZE = 32  # For scale initialization (smaller = finer granularity)
+    # Quantization config presets
+    CONFIG_PRESETS = {
+        'q2a4': {'mlp_lut': 4, 'mlp_rank': 32, 'attn_lut': 16, 'attn_rank': 8},   # 2-bit MLP, 4-bit Attn
+        'q4a4': {'mlp_lut': 16, 'mlp_rank': 4, 'attn_lut': 16, 'attn_rank': 4},    # 4-bit both, rank=4
+        'q4a4_r32': {'mlp_lut': 16, 'mlp_rank': 32, 'attn_lut': 16, 'attn_rank': 32},  # 4-bit both, rank=32
+        'q2a2': {'mlp_lut': 4, 'mlp_rank': 32, 'attn_lut': 4, 'attn_rank': 32},    # 2-bit both
+    }
 
-    print(f"\nQ2_A4 Config:")
+    # Load preset and apply overrides
+    preset = CONFIG_PRESETS[args.config]
+    MLP_LUT_SIZE = args.mlp_lut if args.mlp_lut is not None else preset['mlp_lut']
+    MLP_RANK = args.mlp_rank if args.mlp_rank is not None else preset['mlp_rank']
+    ATTN_LUT_SIZE = args.attn_lut if args.attn_lut is not None else preset['attn_lut']
+    ATTN_RANK = args.attn_rank if args.attn_rank is not None else preset['attn_rank']
+    GROUP_SIZE = args.group_size
+
+    # Config name for display
+    config_name = args.config.upper()
+    if args.mlp_lut or args.mlp_rank or args.attn_lut or args.attn_rank:
+        config_name += " (custom)"
+
+    print(f"\n{config_name} Config:")
     print(f"  MLP: lut={MLP_LUT_SIZE}, rank={MLP_RANK}, group={GROUP_SIZE}")
     print(f"  Attn: lut={ATTN_LUT_SIZE}, rank={ATTN_RANK}, group={GROUP_SIZE}")
 
