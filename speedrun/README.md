@@ -124,6 +124,7 @@ python speedrun/benchmark.py --cache-dir $CACHE_DIR --steps 20
 
 | GPU | VRAM | Max Batch | Best t/s | Memory | Notes |
 |-----|------|-----------|----------|--------|-------|
+| **B200** | **180 GB** | **512** | **1582** | 49 GB | RunPod |
 | **H100** | **80 GB** | **504** | **1182** | 48 GB | RunPod |
 | **RTX 5090** | **32 GB** | **208** | **367** | 23 GB | RunPod |
 | L4 | 24 GB | 128 | 152 | 16 GB | Colab |
@@ -134,6 +135,7 @@ python speedrun/benchmark.py --cache-dir $CACHE_DIR --steps 20
 | GPU | VRAM | Max Batch | Best t/s | Memory | Notes |
 |-----|------|-----------|----------|--------|-------|
 | A100 | 40 GB | 144 | 173 | 30 GB | Colab |
+| RTX 5090 | 32 GB | TBD | TBD | TBD | RunPod |
 
 **L4 detailed results (22.2 GB):**
 

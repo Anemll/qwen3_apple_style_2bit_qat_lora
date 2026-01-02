@@ -250,6 +250,7 @@ python speedrun/benchmark.py \
 
 | GPU | VRAM | Max Batch | Best t/s | Notes |
 |-----|------|-----------|----------|-------|
+| B200 | 180GB | 512 | 1582 | RunPod |
 | H100 | 80GB | 504 | 1182 | RunPod |
 | RTX 5090 | 32GB | 208 | 367 | RunPod |
 | L4 | 24GB | 128 | 152 | Colab |
@@ -303,6 +304,42 @@ python speedrun/benchmark.py \
 - **6.8x faster than A100 40GB** (1182 vs 173 t/s)
 - **3.2x faster than RTX 5090** (1182 vs 367 t/s)
 - Model load: 14.2s, copy: 1.5s
+
+---
+
+### 2025-01-01: SR-006 - B200 Benchmark (RunPod)
+
+**Goal**: Benchmark max batch size on B200 180GB via RunPod
+
+**Instance**: RunPod B200 180GB (Blackwell)
+
+**Config**:
+- Cache: L64 (seq_len=64)
+- Gradient checkpointing: enabled
+- dtype: BF16
+- V2 model: downloaded from GDrive (~1.3s copy)
+
+**Command**:
+```bash
+python speedrun/benchmark.py \
+    --cache-dir caches/alpaca_chat_think_both_L64_K64_R128 \
+    --load-model /home/v2_benchmark_model_L64.pt \
+    --find-max-batch --dtype bf16
+```
+
+**Result**: COMPLETE ✓
+
+| Batch | Step(s) | Memory | t/s | Loss | Status |
+|-------|---------|--------|-----|------|--------|
+| **512** | **20.708** | **48,701M** | **1582** | 6.99 | **MAX** |
+
+**Key Findings**:
+- **Max batch size: 512** (with gradient checkpointing, L64, BF16)
+- **Best throughput: 1582 t/s** at batch=512
+- **9.1x faster than A100 40GB** (1582 vs 173 t/s)
+- **1.34x faster than H100** (1582 vs 1182 t/s)
+- Model load: 8.9s, copy: 1.3s
+- Only using 49GB of 180GB - room to scale with L128 or larger batches
 
 ---
 
