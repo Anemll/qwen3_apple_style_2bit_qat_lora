@@ -294,6 +294,9 @@ def run_benchmark(
             print(f"  Running {steps} steps with batch={batch_size}...")
         reset_gpu_memory()
 
+        # TPU-specific settings to reduce compilation time
+        is_tpu = is_tpu_device(device)
+
         start_time = time.time()
         result = train_e2e(
             model=model,
@@ -307,10 +310,14 @@ def run_benchmark(
             temperature=2.0,
             train_weights=False,
             train_scales=True,
-            logging_steps=steps + 1,  # Don't log during benchmark
+            logging_steps=10 if is_tpu else steps + 1,  # TPU: show progress
             eval_steps=steps + 1,  # Don't eval during benchmark
-            verbose=False,
+            eval_samples=0,  # CRITICAL: skip initial/final eval entirely
+            verbose=is_tpu,  # TPU: need output to see progress
             use_fp16=False,
+            # CRITICAL for TPU: disable full vocab CE (huge graph, slow compile)
+            hard_full_weight=0.0,
+            hard_top1_weight=0.0,  # Pure KD loss for benchmark
         )
         total_time = time.time() - start_time
 
