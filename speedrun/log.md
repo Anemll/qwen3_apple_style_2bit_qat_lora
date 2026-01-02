@@ -244,14 +244,21 @@ python speedrun/benchmark.py \
 - Peak at batch=200, slight drop at 208 (memory pressure)
 - Model load from GDrive: 5.2s (vs 2min build time)
 
-**Comparison with Other GPUs** (L64, BF16, gradient checkpointing):
+**Comparison with Other GPUs** (L64, gradient checkpointing):
+
+*BF16:*
 
 | GPU | VRAM | Max Batch | Best t/s | Notes |
 |-----|------|-----------|----------|-------|
 | H100 | 80GB | 504 | 1182 | RunPod |
 | RTX 5090 | 32GB | 208 | 367 | RunPod |
-| A100 | 40GB | 144 | 173 | Colab |
 | L4 | 24GB | 128 | 152 | Colab |
+
+*FP32:*
+
+| GPU | VRAM | Max Batch | Best t/s | Notes |
+|-----|------|-----------|----------|-------|
+| A100 | 40GB | 144 | 173 | Colab |
 
 **Notes**:
 - RTX 5090 achieves **2.1x throughput** vs A100 40GB despite similar batch size

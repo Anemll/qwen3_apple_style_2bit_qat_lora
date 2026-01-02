@@ -118,16 +118,22 @@ python speedrun/benchmark.py --cache-dir $CACHE_DIR --steps 20
 2. Gradient checkpointing (batch=8) - same batch, less memory
 3. Gradient checkpointing (batch=16) - larger batch enabled by memory savings
 
-**Expected results (L64 cache, seq=64, BF16, gradient checkpointing ON):**
+**Expected results (L64 cache, seq=64, gradient checkpointing ON):**
+
+**BF16:**
 
 | GPU | VRAM | Max Batch | Best t/s | Memory | Notes |
 |-----|------|-----------|----------|--------|-------|
-| T4 | 16 GB | ~32 | ~40 | ~14 GB | Colab |
-| L4 | 24 GB | 128 | 152 | 16 GB | Colab |
-| A100 | 40 GB | 144 | 173 | 30 GB | Colab |
-| A100 | 80 GB | ~448 | TBD | ~70 GB | - |
-| **RTX 5090** | **32 GB** | **208** | **367** | 23 GB | RunPod |
 | **H100** | **80 GB** | **504** | **1182** | 48 GB | RunPod |
+| **RTX 5090** | **32 GB** | **208** | **367** | 23 GB | RunPod |
+| L4 | 24 GB | 128 | 152 | 16 GB | Colab |
+| T4 | 16 GB | ~32 | ~40 | ~14 GB | Colab |
+
+**FP32:**
+
+| GPU | VRAM | Max Batch | Best t/s | Memory | Notes |
+|-----|------|-----------|----------|--------|-------|
+| A100 | 40 GB | 144 | 173 | 30 GB | Colab |
 
 **L4 detailed results (22.2 GB):**
 
