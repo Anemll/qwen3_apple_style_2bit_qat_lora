@@ -1440,6 +1440,7 @@ def train_e2e(
     best_state = None
     loss_history = []
     seq_len = None  # Will be set from first batch
+    last_log_time = time.time()  # For tokens/sec calculation
 
     # TPU detection (once, not every step)
     is_tpu = 'xla' in str(device).lower()
@@ -1587,12 +1588,17 @@ def train_e2e(
                 # Log to wandb
                 if use_wandb and wandb_run is not None:
                     import wandb
+                    # Calculate tokens/sec
+                    log_elapsed = time.time() - last_log_time
+                    tokens_per_sec = (batch_size * seq_len * logging_steps) / max(log_elapsed, 0.001)
                     wandb.log({
                         'train/loss': avg_loss,
                         'train/lr': current_lr,
                         'train/step': step,
                         'train/elapsed_sec': elapsed,
+                        'train/tokens_per_sec': tokens_per_sec,
                     }, step=step)
+                last_log_time = time.time()
                 loss_history.append(avg_loss)
                 total_loss = 0.0
 
