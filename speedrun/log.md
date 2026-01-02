@@ -439,6 +439,92 @@ python speedrun/benchmark.py \
 
 ---
 
+### 2026-01-02: SR-007 - TPU v5e Q2A4 MLP Training
+
+**Goal**: Train Q2A4 MLP-only on TPU v5e with BF16
+
+**Instance**: Google Cloud TPU v5e (31GB HBM)
+
+**Config**:
+- Checkpoint: `q2_init` (from Q4→Q2 conversion)
+- Cache: L64 (128 samples, seq_len=64)
+- Config: Q2A4 (MLP: lut=4, rank=32; Attn: lut=16, rank=8)
+- Steps: 2000
+- Batch: 28 (estimated max ~130)
+- LR: 5e-5 (cosine → 5e-6)
+- Dtype: BF16
+
+**Command**:
+```bash
+python scripts/train_v2_simple.py \
+    --v2-checkpoint runs/q2_from_q4/q2_init.pt \
+    --cache-dir caches/alpaca_chat_think_both_L64_K64_R128 \
+    --output-dir runs/SR-007-tpu \
+    --mlp-only --max-steps 2000 \
+    --batch-size 28 --lr 5e-5 \
+    --dtype bf16 \
+    --xla-cache-dir runs/SR-007-tpu/xla_cache \
+    --wandb --wandb-run "SR-007-tpu-b28-mlp"
+```
+
+**Result**: IN PROGRESS
+
+| Metric | Value |
+|--------|-------|
+| Initial Loss | 5.83 |
+| Memory | 5.6/31.2 GB (18%) |
+| Throughput | 0.2k tok/s |
+| XLA Warmup | 61.6s |
+
+**Notes**:
+- Memory readout happens too early (before real training)
+- Batch can be increased to ~96 based on memory headroom
+- Added `--xla-cache-dir` for persistent compilation cache
+
+---
+
+### 2026-01-02: SR-008 - TPU v5e Q4A4_r32 From Scratch
+
+**Goal**: Train Q4A4 (rank=32) from scratch with group initialization on TPU
+
+**Instance**: Google Cloud TPU v5e (31GB HBM)
+
+**Config**:
+- Mode: FROM SCRATCH (group-based weight initialization)
+- Config: Q4A4_r32 (MLP: lut=16, rank=32; Attn: lut=16, rank=32)
+- Cache: L64 (128 samples, seq_len=64)
+- Steps: 4000
+- Batch: 96
+- LR: 5e-5 (cosine → 5e-6)
+- Dtype: BF16
+
+**Command**:
+```bash
+python scripts/train_v2_simple.py \
+    --from-scratch \
+    --config q4a4_r32 \
+    --cache-dir caches/alpaca_chat_think_both_L64_K64_R128 \
+    --output-dir runs/SR-008-q4a4-scratch \
+    --max-steps 4000 \
+    --batch-size 96 --lr 5e-5 \
+    --dtype bf16 \
+    --xla-cache-dir runs/SR-008-q4a4-scratch/xla_cache \
+    --wandb --wandb-run "SR-008-q4a4-r32-scratch"
+```
+
+**Result**: PENDING
+
+**Expected**:
+- Initial loss: ~8-10 (random init)
+- Final loss: ~0.6-0.8
+- Time: ~4-6 hours
+
+**Notes**:
+- Uses group-based SVD initialization for scales
+- Added `--config q4a4_r32` preset
+
+---
+
 ### Template for New Runs
 
 ```markdown
