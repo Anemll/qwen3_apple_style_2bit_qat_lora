@@ -127,7 +127,7 @@ python speedrun/benchmark.py --cache-dir $CACHE_DIR --steps 20
 | A100 | 40 GB | 144 | 173 | 30 GB | Colab |
 | A100 | 80 GB | ~448 | TBD | ~70 GB | - |
 | **RTX 5090** | **32 GB** | **208** | **367** | 23 GB | RunPod |
-| H100 | 80 GB | TBD | TBD | TBD | RunPod |
+| **H100** | **80 GB** | **504** | **1182** | 48 GB | RunPod |
 
 **L4 detailed results (22.2 GB):**
 

@@ -248,15 +248,54 @@ python speedrun/benchmark.py \
 
 | GPU | VRAM | Max Batch | Best t/s | Notes |
 |-----|------|-----------|----------|-------|
+| H100 | 80GB | 504 | 1182 | RunPod |
 | RTX 5090 | 32GB | 208 | 367 | RunPod |
 | A100 | 40GB | 144 | 173 | Colab |
-| A100 | 80GB | ~448 | TBD | - |
 | L4 | 24GB | 128 | 152 | Colab |
 
 **Notes**:
 - RTX 5090 achieves **2.1x throughput** vs A100 40GB despite similar batch size
 - Blackwell architecture efficiency shows in t/s numbers
 - Model download from GDrive worked perfectly (SR-006 workflow)
+
+---
+
+### 2025-01-01: SR-006 - H100 Benchmark (RunPod)
+
+**Goal**: Benchmark max batch size on H100 80GB via RunPod
+
+**Instance**: RunPod H100 80GB HBM3
+
+**Config**:
+- Cache: L64 (seq_len=64)
+- Gradient checkpointing: enabled
+- dtype: BF16
+- V2 model: downloaded from GDrive (~1.5s copy)
+
+**Command**:
+```bash
+python speedrun/benchmark.py \
+    --cache-dir caches/alpaca_chat_think_both_L64_K64_R128 \
+    --load-model /home/v2_benchmark_model_L64.pt \
+    --find-max-batch --dtype bf16
+```
+
+**Result**: COMPLETE ✓
+
+| Batch | Step(s) | Memory | t/s | Loss | Status |
+|-------|---------|--------|-----|------|--------|
+| 440 | 25.268 | 42,778M | 1114 | 7.09 | OK |
+| 472 | 26.250 | 45,488M | 1151 | 6.02 | OK |
+| 488 | 26.672 | 46,844M | 1171 | 5.58 | OK |
+| 496 | 26.923 | 47,520M | 1179 | 5.20 | OK |
+| **504** | **27.298** | **48,200M** | **1182** | 5.01 | **MAX** |
+
+**Key Findings**:
+- **Max batch size: 504** (with gradient checkpointing, L64, BF16)
+- **Best throughput: 1182 t/s** at batch=504
+- **6.8x faster than A100 40GB** (1182 vs 173 t/s)
+- **3.2x faster than RTX 5090** (1182 vs 367 t/s)
+- Model load: 14.2s, copy: 1.5s
 
 ---
 
