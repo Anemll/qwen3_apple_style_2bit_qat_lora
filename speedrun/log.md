@@ -397,11 +397,13 @@ python speedrun/benchmark.py \
 |-------|---------|-------|------|-----|-------|
 | 8 | ~4 min | 100 | 6:10 | 138 | Includes compile |
 | 8 | cached | 100 | 2:30 | **339** | Real throughput |
-| 16 | ~4 min | 50 | 5:06 | 167 | Includes compile |
-| 16 | cached | 50 | 1:17 | **660** | Real throughput |
+| **16** | ~4 min | 50 | 5:06 | 167 | Includes compile |
+| **16** | cached | 50 | 1:17 | **660** | **MAX throughput** |
+| 32 | - | - | - | OOM | "Attempting to reserve 27.33G" |
 
 **Key Findings**:
-- **Max practical throughput: 660 t/s** at batch=16 (cached graph)
+- **Max batch size: 16** (batch=32 OOMs: "Attempting to reserve 27.33G")
+- **Max throughput: 660 t/s** at batch=16 (cached graph)
 - **XLA graph caching is critical** - 4x speedup (167 → 660 t/s)
 - **Compilation overhead** - ~4 min per batch size (one-time cost)
 - **Batch scaling works** - 339 t/s (batch=8) → 660 t/s (batch=16)
