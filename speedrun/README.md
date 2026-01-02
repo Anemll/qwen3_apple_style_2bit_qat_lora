@@ -61,8 +61,9 @@ source speedrun/setup.sh L64 q2_init
 | `SR-001` | Q4→Q2 conversion + upload |
 | `SR-002` | Q2 MLP training |
 | `SR-003` | Performance benchmark (legacy) |
-| `SR-004` | Performance benchmark (GPU) |
+| `SR-004` | Performance benchmark (GPU, Colab) |
 | `SR-005` | Performance benchmark (TPU v6e, BF16) |
+| `SR-006` | Performance benchmark (GPU, RunPod) |
 
 **Note:** Notebooks include a `Rev:` line at the top for version tracking. Format: `Rev: X.Y (YYYY-MM-DD HH:MM) - description`
 

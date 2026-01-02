@@ -208,6 +208,58 @@ python speedrun/benchmark.py --cache-dir $CACHE_DIR --find-max-batch
 
 ---
 
+### 2025-01-01: SR-006 - RTX 5090 Benchmark (RunPod)
+
+**Goal**: Benchmark max batch size on RTX 5090 via RunPod
+
+**Instance**: RunPod RTX 5090 32GB
+
+**Config**:
+- Cache: L64 (seq_len=64)
+- Gradient checkpointing: enabled
+- dtype: BF16
+- V2 model: downloaded from GDrive (~5s)
+
+**Command**:
+```bash
+python speedrun/benchmark.py \
+    --cache-dir caches/alpaca_chat_think_both_L64_K64_R128 \
+    --load-model /home/v2_benchmark_model_L64.pt \
+    --find-max-batch --dtype bf16
+```
+
+**Result**: COMPLETE ✓
+
+| Batch | Step(s) | Memory | t/s | Loss | Status |
+|-------|---------|--------|-----|------|--------|
+| 152 | 43.123 | 18,281M | 226 | 7.17 | OK |
+| 184 | 37.770 | 20,985M | 312 | 6.12 | OK |
+| 200 | 34.856 | 22,337M | 367 | 5.64 | OK |
+| **208** | **41.320** | **23,009M** | **322** | 5.28 | **MAX** |
+| 216 | - | 21,748M | - | - | OOM |
+
+**Key Findings**:
+- **Max batch size: 208** (with gradient checkpointing, L64, BF16)
+- **Best throughput: 367 t/s** at batch=200
+- Peak at batch=200, slight drop at 208 (memory pressure)
+- Model load from GDrive: 5.2s (vs 2min build time)
+
+**Comparison with Other GPUs** (L64, BF16, gradient checkpointing):
+
+| GPU | VRAM | Max Batch | Best t/s | Notes |
+|-----|------|-----------|----------|-------|
+| RTX 5090 | 32GB | 208 | 367 | RunPod |
+| A100 | 40GB | 144 | 173 | Colab |
+| A100 | 80GB | ~448 | TBD | - |
+| L4 | 24GB | 128 | 152 | Colab |
+
+**Notes**:
+- RTX 5090 achieves **2.1x throughput** vs A100 40GB despite similar batch size
+- Blackwell architecture efficiency shows in t/s numbers
+- Model download from GDrive worked perfectly (SR-006 workflow)
+
+---
+
 ### Template for New Runs
 
 ```markdown

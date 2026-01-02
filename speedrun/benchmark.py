@@ -689,18 +689,24 @@ def get_or_create_v2_model(model_id: str, rebuild: bool = False,
     # Priority 3: Load from specified path (e.g., GDrive) and copy to local
     if load_from and os.path.exists(load_from) and not rebuild:
         print(f"[*] Loading V2 model from: {load_from}")
-        # Copy to local cache using rsync (verifies integrity, resumes partial)
+        # Copy to local cache
         if load_from != V2_MODEL_CACHE:
+            import shutil
             import subprocess
-            print(f"  Copying to local cache (rsync)...", end=" ", flush=True)
             t0 = time.time()
-            result = subprocess.run(
-                ["rsync", "-ah", "--checksum", load_from, V2_MODEL_CACHE],
-                capture_output=True, text=True
-            )
-            if result.returncode != 0:
-                print(f"FAILED: {result.stderr}")
-                raise RuntimeError(f"rsync failed: {result.stderr}")
+            # Try rsync first (faster for large files, resumes), fallback to shutil.copy
+            if shutil.which("rsync"):
+                print(f"  Copying to local cache (rsync)...", end=" ", flush=True)
+                result = subprocess.run(
+                    ["rsync", "-ah", "--checksum", load_from, V2_MODEL_CACHE],
+                    capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    print(f"FAILED: {result.stderr}")
+                    raise RuntimeError(f"rsync failed: {result.stderr}")
+            else:
+                print(f"  Copying to local cache (cp)...", end=" ", flush=True)
+                shutil.copy2(load_from, V2_MODEL_CACHE)
             print(f"done ({time.time()-t0:.1f}s)")
         return V2_MODEL_CACHE
 
