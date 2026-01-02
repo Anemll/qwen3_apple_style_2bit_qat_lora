@@ -1494,6 +1494,31 @@ def train_e2e(
 
         warmup_time = time.time() - warmup_t0
         print(f"done ({warmup_time:.1f}s)")
+
+        # Report TPU memory after warmup
+        try:
+            mem = xm.get_memory_info(device)
+            if "kb_total" in mem:
+                total_gb = mem["kb_total"] / 1024 / 1024
+                free_gb = mem["kb_free"] / 1024 / 1024
+                used_gb = total_gb - free_gb
+            elif "bytes_limit" in mem:
+                total_gb = mem["bytes_limit"] / 1024**3
+                used_gb = mem["bytes_used"] / 1024**3
+                free_gb = total_gb - used_gb
+            else:
+                total_gb = used_gb = free_gb = 0
+
+            if total_gb > 0:
+                print(f"[TPU] Memory: {used_gb:.1f}/{total_gb:.1f} GB used ({100*used_gb/total_gb:.0f}%)")
+                # Estimate max batch based on memory usage
+                if used_gb > 0:
+                    headroom = free_gb / used_gb
+                    est_max_batch = int(batch_size * (1 + headroom * 0.8))  # 80% safety margin
+                    print(f"[TPU] Estimated max batch: ~{est_max_batch} (current: {batch_size})")
+        except Exception as e:
+            print(f"[TPU] Memory info not available: {e}")
+
         print(f"[TPU] XLA compilation complete. Training t/s will be accurate.")
 
         # Reset timing for accurate t/s measurement
