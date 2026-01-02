@@ -1457,6 +1457,49 @@ def train_e2e(
     # (avoids torch.load I/O every batch)
     dataset = KDCacheDataset(cache_dir, shuffle=True, preload=True)
 
+    # TPU warmup: precompile XLA graph before timing starts
+    if is_tpu and verbose:
+        print("\n[TPU] Warmup: compiling XLA graph...", end=" ", flush=True)
+        warmup_t0 = time.time()
+
+        # Get one batch for warmup
+        warmup_loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, drop_last=True)
+        warmup_batch = next(iter(warmup_loader))
+        warmup_seq_len = warmup_batch['input_ids'].shape[1]
+
+        # Run one forward+backward pass to trigger compilation
+        model.train()
+        autocast_device = 'xla'
+        if use_mixed_precision:
+            with torch.amp.autocast(device_type=autocast_device, dtype=torch.bfloat16):
+                warmup_loss = compute_kd_loss_batch(
+                    model, warmup_batch, device, temperature,
+                    no_grad=False,
+                    hard_top1_weight=hard_top1_weight,
+                    hard_full_weight=hard_full_weight,
+                )
+        else:
+            warmup_loss = compute_kd_loss_batch(
+                model, warmup_batch, device, temperature,
+                no_grad=False,
+                hard_top1_weight=hard_top1_weight,
+                hard_full_weight=hard_full_weight,
+            )
+        warmup_loss.backward()
+        if xm is not None:
+            xm.mark_step()
+
+        # Clear gradients (don't actually step optimizer)
+        optimizer.zero_grad()
+
+        warmup_time = time.time() - warmup_t0
+        print(f"done ({warmup_time:.1f}s)")
+        print(f"[TPU] XLA compilation complete. Training t/s will be accurate.")
+
+        # Reset timing for accurate t/s measurement
+        t_start = time.time()
+        last_log_time = time.time()
+
     while step < max_steps:
         # Just create new iterator each epoch (data already in RAM)
         # drop_last=True for TPU to avoid shape changes on last batch
