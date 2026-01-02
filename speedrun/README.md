@@ -147,19 +147,22 @@ python speedrun/benchmark.py --cache-dir $CACHE_DIR --steps 20
 
 *TPU requires XLA graph caching - first run compiles (~4 min), subsequent runs use cached graph.*
 
-**GPU vs TPU Comparison (BF16, L64):**
+**Cost Efficiency Comparison (BF16, L64):**
 
-| Device | Memory | Max Batch | t/s (cached) | $/hr* | t/s per $ |
-|--------|--------|-----------|--------------|-------|-----------|
-| L4 | 24 GB | 128 | 152 | ~$0.50 | 304 |
-| **TPU v6e** | **16 GB** | **24** | **972** | ~$1.20 | **810** |
-| A100 | 40 GB | 144 | 173** | ~$2.00 | 87 |
-| H100 | 80 GB | 504 | 1182 | ~$3.00 | 394 |
-| B200 | 180 GB | 512 | 1582 | ~$5.00 | 316 |
+| Device | t/s | $/hr | t/$ | Platform |
+|--------|-----|------|-----|----------|
+| **TPU v6e** | **972** | $0.40 | **2430** | Colab Pro |
+| TPU v6e | 972 | $1.20 | 810 | GCP |
+| RTX 5090 | 367 | $0.70 | 524 | RunPod |
+| H100 | 1182 | $2.50 | 473 | RunPod |
+| A100 | 173* | $0.50 | 346 | Colab Pro |
+| B200 | 1582 | $5.00 | 316 | RunPod |
+| L4 | 152 | $0.50 | 304 | Colab |
+| A100 | 173* | $2.00 | 87 | RunPod |
 
-*Approximate prices, varies by provider. **A100 tested with FP32.
+*A100 tested with FP32 (BF16 would be higher). Prices approximate.
 
-**Key insight:** TPU v6e offers best value (t/s per $) due to efficient BF16 and XLA compilation. Requires understanding XLA graph caching for optimal performance.
+**Key insight:** Colab Pro TPU v6e offers best value at **2430 t/$**. For raw speed, B200 (1582 t/s) or H100 (1182 t/s) are fastest.
 
 **L4 detailed results (22.2 GB):**
 
