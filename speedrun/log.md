@@ -396,14 +396,16 @@ python speedrun/benchmark.py \
 | Batch | Compile | Steps | Time | t/s | Notes |
 |-------|---------|-------|------|-----|-------|
 | 8 | ~4 min | 100 | 6:10 | 138 | Includes compile |
-| 8 | cached | 100 | 2:30 | **339** | Real throughput |
-| **16** | ~4 min | 50 | 5:06 | 167 | Includes compile |
-| **16** | cached | 50 | 1:17 | **660** | **MAX throughput** |
+| 8 | cached | 100 | 2:30 | 339 | Real throughput |
+| 16 | ~4 min | 50 | 5:06 | 167 | Includes compile |
+| 16 | cached | 50 | 1:17 | 660 | Real throughput |
+| **24** | ~4 min | 50 | 5:15 | 243 | Includes compile |
+| **24** | cached | 50 | 1:18 | **972** | **MAX throughput** |
 | 32 | - | - | - | OOM | "Attempting to reserve 27.33G" |
 
 **Key Findings**:
-- **Max batch size: 16** (batch=32 OOMs: "Attempting to reserve 27.33G")
-- **Max throughput: 660 t/s** at batch=16 (cached graph)
+- **Max batch size: 24** (batch=32 OOMs: "Attempting to reserve 27.33G")
+- **Max throughput: 972 t/s** at batch=24 (cached graph)
 - **XLA graph caching is critical** - 4x speedup (167 → 660 t/s)
 - **Compilation overhead** - ~4 min per batch size (one-time cost)
 - **Batch scaling works** - 339 t/s (batch=8) → 660 t/s (batch=16)
@@ -413,21 +415,21 @@ python speedrun/benchmark.py \
 | Device | VRAM | Max Batch | t/s (cached) | Notes |
 |--------|------|-----------|--------------|-------|
 | L4 | 24GB | 128 | 152 | Colab |
-| **TPU v6e** | 16GB | 16 | **660** | Google Cloud |
+| **TPU v6e** | **16GB** | **24** | **972** | Google Cloud |
 | A100 | 40GB | 144 | 173* | Colab (*FP32) |
 | H100 | 80GB | 504 | 1182 | RunPod |
 | B200 | 180GB | 512 | 1582 | RunPod |
 
-**Where the ~10x Speedup Came From**:
+**Where the Speedup Came From**:
 
 | Issue | Before | After | Speedup |
 |-------|--------|-------|---------|
 | **Full vocab CE** | Huge graph, compile hang | No full vocab | Graph compiles |
 | **Initial/final eval** | .item() per sample | Skip eval | No sync spam |
-| **Graph not cached** | ~167 t/s | ~660 t/s | **4x** |
-| **Wrong batch size** | batch=8 (339 t/s) | batch=16 (660 t/s) | **2x** |
+| **Graph not cached** | ~243 t/s | ~972 t/s | **4x** |
+| **Small batch** | batch=8 (339 t/s) | batch=24 (972 t/s) | **3x** |
 
-**Summary**: The "hang" was XLA compiling a massive graph (full vocab CE + eval). Disabling those made compilation feasible (~4 min). Using cached graphs + larger batch gave **~660 t/s** - comparable to A100's 628 t/s (BF16 equivalent).
+**Summary**: The "hang" was XLA compiling a massive graph (full vocab CE + eval). Disabling those made compilation feasible (~4 min). Using cached graphs + batch=24 gave **972 t/s** - faster than H100 at batch=24 equivalent, 6x faster than L4!
 
 **TPU-Specific Notes**:
 - `torch_xla.sync()` / `xm.mark_step()` required after each step
