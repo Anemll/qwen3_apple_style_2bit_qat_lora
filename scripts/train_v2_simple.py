@@ -22,6 +22,34 @@ import torch
 from transformers import AutoModelForCausalLM
 
 # =============================================================================
+# TPU SUPPORT
+# =============================================================================
+
+def get_device():
+    """Get best available device: TPU > CUDA > CPU."""
+    # Try TPU first
+    try:
+        import torch_xla
+        device = torch_xla.device()
+        return device, 'tpu'
+    except ImportError:
+        pass
+    except RuntimeError as e:
+        print(f"[WARN] TPU init failed: {e}")
+
+    # Fallback to CUDA
+    if torch.cuda.is_available():
+        return torch.device('cuda'), 'cuda'
+
+    return torch.device('cpu'), 'cpu'
+
+
+def is_tpu_device(device) -> bool:
+    """Check if device is TPU/XLA."""
+    return 'xla' in str(device).lower()
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -56,6 +84,9 @@ def main():
                         help='Training dtype: fp32 (default, ANE-safe), bf16 (2x faster), fp16 (fastest but risky)')
     parser.add_argument('--mixed-precision', action='store_true',
                         help='Mixed precision: FP32 master weights + BF16 compute (best of both)')
+    # TPU support
+    parser.add_argument('--tpu', action='store_true',
+                        help='Force TPU mode (auto-detected if available)')
     args = parser.parse_args()
 
     # Validate inputs - need v1, v2 checkpoint, or from-scratch
@@ -69,7 +100,14 @@ def main():
         raise ValueError("Must specify --v1-checkpoint, --v2-checkpoint, or --from-scratch")
     assert os.path.exists(args.cache_dir), f"Cache dir not found: {args.cache_dir}"
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Device detection (TPU > CUDA > CPU)
+    device, device_type = get_device()
+    is_tpu = device_type == 'tpu' or args.tpu
+
+    # TPU requires BF16
+    if is_tpu and args.dtype == 'fp32':
+        print("[TPU] Forcing BF16 (FP32 not recommended on TPU)")
+        args.dtype = 'bf16'
 
     # Dtype mapping
     dtype_map = {
@@ -81,11 +119,11 @@ def main():
     # Mixed precision: FP32 master weights + BF16 compute
     if args.mixed_precision:
         train_dtype = torch.float32  # Always FP32 for master weights
-        print(f"Device: {device}")
+        print(f"Device: {device_type.upper()}" + (f" ({device})" if is_tpu else ""))
         print(f"Training: Mixed Precision (FP32 weights + BF16 compute)")
     else:
         train_dtype = dtype_map[args.dtype]
-        print(f"Device: {device}")
+        print(f"Device: {device_type.upper()}" + (f" ({device})" if is_tpu else ""))
         print(f"Training dtype: {args.dtype}")
     if args.v2_checkpoint:
         print(f"V2 checkpoint: {args.v2_checkpoint}")
@@ -187,7 +225,7 @@ def main():
             print(f"  Manually loaded {q_loaded} _Q buffers")
 
         t0 = time.time()
-        print(f"  Moving to GPU ({args.dtype})...", end=" ", flush=True)
+        print(f"  Moving to {device_type.upper()} ({args.dtype})...", end=" ", flush=True)
         v2_model.to(device=device, dtype=train_dtype)
         print(f"done ({time.time()-t0:.1f}s)")
 
@@ -233,7 +271,7 @@ def main():
         print(f"done ({time.time()-t0:.1f}s)")
 
         t0 = time.time()
-        print(f"  Moving to GPU ({args.dtype})...", end=" ", flush=True)
+        print(f"  Moving to {device_type.upper()} ({args.dtype})...", end=" ", flush=True)
         v2_model.to(device=device, dtype=train_dtype)
         print(f"done ({time.time()-t0:.1f}s)")
 
@@ -334,9 +372,10 @@ def main():
         # Free V1
         del v1_model
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        print(f"  Moving to GPU ({args.dtype})...", end=" ", flush=True)
+        print(f"  Moving to {device_type.upper()} ({args.dtype})...", end=" ", flush=True)
         v2_model.to(device=device, dtype=train_dtype)
         print("done")
 
@@ -349,7 +388,10 @@ def main():
     # GRADIENT CHECKPOINTING (optional memory optimization)
     # =========================================================================
     if args.gradient_checkpointing:
-        if hasattr(v2_model, 'gradient_checkpointing_enable'):
+        # Skip on TPU - transformers uses torch.xla which conflicts with torch_xla
+        if is_tpu:
+            print("\n[*] Gradient checkpointing: SKIPPED (TPU incompatible with transformers)")
+        elif hasattr(v2_model, 'gradient_checkpointing_enable'):
             # use_reentrant=False is required when inputs don't have requires_grad
             v2_model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -394,7 +436,22 @@ def main():
         'dtype': args.dtype,
         'use_ste_fp16': use_ste,
         'mixed_precision': args.mixed_precision,
+        'device_type': device_type,
+        'is_tpu': is_tpu,
     }
+
+    # TPU-specific parameters
+    if is_tpu:
+        # Disable full vocab CE on TPU - causes massive XLA graph, slow compilation
+        tpu_hard_full = 0.0
+        tpu_eval_samples = 0  # Skip eval to avoid .item() sync spam
+        print(f"\n[TPU] Training with optimized parameters:")
+        print(f"  hard_full_weight: 0.0 (disabled for XLA)")
+        print(f"  eval_samples: 0 (skip eval for speed)")
+        print(f"  Note: First step compiles XLA graph (~4 min)")
+    else:
+        tpu_hard_full = args.hard_full
+        tpu_eval_samples = None  # Use default
 
     result = train_e2e(
         model=v2_model,
@@ -411,9 +468,10 @@ def main():
         train_g_only=args.g_only,
         train_mlp_only=args.mlp_only,
         hard_top1_weight=args.hard_top1,
-        hard_full_weight=args.hard_full,
+        hard_full_weight=tpu_hard_full,
         logging_steps=20,
         eval_steps=100,
+        eval_samples=tpu_eval_samples,
         save_dir=args.output_dir,
         save_steps=args.save_steps,
         verbose=True,
