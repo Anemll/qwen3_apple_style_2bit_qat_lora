@@ -1670,6 +1670,17 @@ def train_e2e(
                 loss_history.append(avg_loss)
                 total_loss = 0.0
 
+                # Track best by training loss when eval is disabled (e.g., TPU)
+                if eval_samples <= 0 and avg_loss < best_loss:
+                    best_loss = avg_loss
+                    # Save best state
+                    if save_dir:
+                        os.makedirs(save_dir, exist_ok=True)
+                        best_path = os.path.join(save_dir, "best_state_dict.pt")
+                        torch.save(model.state_dict(), best_path)
+                        if verbose:
+                            print(f"  [Saved best (train): {best_loss:.4f}]")
+
             # Evaluation (skip if eval_samples <= 0, e.g., on TPU)
             if step % eval_steps == 0 and eval_samples > 0:
                 model.eval()
@@ -1754,9 +1765,14 @@ def train_e2e(
     if verbose:
         print(f"\n=== Results ===")
         print(f"Initial: {initial_loss:.4f}")
-        print(f"Final:   {final_loss:.4f}")
-        print(f"Best:    {best_loss:.4f}")
-        print(f"Improvement: {initial_loss - final_loss:.4f}")
+        if eval_samples > 0:
+            print(f"Final:   {final_loss:.4f}")
+            print(f"Best:    {best_loss:.4f} (eval)")
+            print(f"Improvement: {initial_loss - final_loss:.4f}")
+        else:
+            print(f"Final:   {loss_history[-1]:.4f}" if loss_history else "Final:   N/A")
+            print(f"Best:    {best_loss:.4f} (train)")
+            print(f"Improvement: {initial_loss - best_loss:.4f}")
         # Total tokens processed
         if seq_len is not None:
             total_tokens = batch_size * seq_len * step
