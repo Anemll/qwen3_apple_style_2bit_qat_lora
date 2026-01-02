@@ -1469,8 +1469,8 @@ def train_e2e(
                 scheduler.step()
             optimizer.zero_grad()
 
-            # TPU: mark step boundary (non-blocking, allows pipelining)
-            if is_tpu and xm is not None:
+            # TPU: mark step at logging intervals only (every step is too frequent)
+            if is_tpu and xm is not None and step % logging_steps == 0:
                 xm.mark_step()
 
             # Track loss - TPU: only sync at logging intervals to avoid blocking
