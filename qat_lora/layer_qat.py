@@ -1567,6 +1567,20 @@ def train_e2e(
                 if csv_writer is not None:
                     csv_writer.writerow([step, f'{avg_loss:.6f}', '', f'{current_lr:.2e}', f'{elapsed:.1f}'])
                     csv_file.flush()
+
+                # TPU: Print metrics report at first logging step (debug recompilation)
+                if is_tpu and step == logging_steps and verbose:
+                    try:
+                        import torch_xla.debug.metrics as met
+                        print("\n[TPU METRICS] (look for 'CompileTime' frequency)")
+                        report = met.metrics_report()
+                        # Only print key lines
+                        for line in report.split('\n'):
+                            if 'Compile' in line or 'Transfer' in line or 'Execute' in line:
+                                print(f"  {line}")
+                        print()
+                    except Exception:
+                        pass
                 # Log to wandb
                 if use_wandb and wandb_run is not None:
                     import wandb
