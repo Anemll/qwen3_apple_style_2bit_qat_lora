@@ -1457,9 +1457,10 @@ def train_e2e(
         dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn,
                                 drop_last=is_tpu)
 
-        # TPU: Use MpDeviceLoader for async data loading + batched step marking
-        if is_tpu and pl is not None:
-            dataloader = pl.MpDeviceLoader(dataloader, device, batches_per_execution=4)
+        # NOTE: MpDeviceLoader disabled - causes hangs with our setup
+        # Just use regular DataLoader with xm.optimizer_step()
+        # if is_tpu and pl is not None:
+        #     dataloader = pl.MpDeviceLoader(dataloader, device, batches_per_execution=4)
 
         for batch in dataloader:
             if step >= max_steps:
