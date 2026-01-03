@@ -1203,6 +1203,7 @@ def train_e2e(
     wandb_config: dict = None,
     weight_decay: float = 0.0,
     dropout: float = 0.0,
+    accumulation_steps: int = 1,
 ) -> dict:
     """End-to-end KD-QAT training (all layers unfrozen).
 
@@ -1236,6 +1237,10 @@ def train_e2e(
         wandb_project: W&B project name (default: "qwen3-qat")
         wandb_run_name: W&B run name (default: auto-generated)
         wandb_config: Additional config dict to log to W&B
+        weight_decay: AdamW weight decay (default 0.0, try 0.01 for regularization)
+        dropout: Dropout rate (default 0.0, try 0.1 for regularization)
+        accumulation_steps: Gradient accumulation steps (default 1 = no accumulation)
+                           Effective batch = batch_size * accumulation_steps
 
     Returns:
         Dict with 'initial_loss', 'final_loss', 'best_loss', 'steps', 'time_sec'
@@ -1369,7 +1374,11 @@ def train_e2e(
         print(f"Trainable params: {trainable:,}")
         if train_mlp_only:
             print(f"Frozen attention params: {attn_frozen:,}")
-        print(f"Steps: {max_steps}, LR: {lr}, Batch: {batch_size}")
+        if accumulation_steps > 1:
+            eff_batch = batch_size * accumulation_steps
+            print(f"Steps: {max_steps}, LR: {lr}, Batch: {batch_size}x{accumulation_steps}={eff_batch}")
+        else:
+            print(f"Steps: {max_steps}, LR: {lr}, Batch: {batch_size}")
         if hard_top1_weight > 0 or hard_full_weight > 0:
             print(f"Hard label: top1={hard_top1_weight}, full={hard_full_weight}")
 
@@ -1544,6 +1553,9 @@ def train_e2e(
         t_start = time.time()
         last_log_time = time.time()
 
+    # Initialize gradients before training loop
+    optimizer.zero_grad(set_to_none=True)
+
     while step < max_steps:
         # Just create new iterator each epoch (data already in RAM)
         # drop_last=True for TPU to avoid shape changes on last batch
@@ -1606,30 +1618,41 @@ def train_e2e(
                     hard_full_weight=hard_full_weight,
                 )
 
+            # Scale loss for gradient accumulation
+            if accumulation_steps > 1:
+                loss = loss / accumulation_steps
+
             # Backward pass with optional scaler for FP16
             if scaler is not None:
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
             else:
                 loss.backward()
-                # Gradient clipping for FP16 stability
-                if use_fp16:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
 
-            if scheduler is not None:
-                scheduler.step()
-            optimizer.zero_grad(set_to_none=True)  # set_to_none more efficient
+            # Optimizer step only every accumulation_steps
+            if (step + 1) % accumulation_steps == 0:
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    # Gradient clipping for FP16 stability
+                    if use_fp16:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+
+                if scheduler is not None:
+                    scheduler.step()
+                optimizer.zero_grad(set_to_none=True)  # set_to_none more efficient
 
             # TPU: mark_step to execute graph (required for progress)
             if is_tpu and xm is not None:
                 xm.mark_step()
 
             # Track loss - always sync (simpler, proven to work)
-            total_loss += loss.item()
+            # Note: loss was scaled for accumulation, so multiply back for logging
+            loss_val = loss.item() * accumulation_steps if accumulation_steps > 1 else loss.item()
+            total_loss += loss_val
             step += 1
 
             # Logging

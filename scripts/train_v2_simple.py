@@ -76,6 +76,8 @@ def main():
     # Regularization
     parser.add_argument('--weight-decay', type=float, default=0.0, help='Weight decay for AdamW (default: 0.0, try 0.01)')
     parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate (default: 0.0, try 0.1)')
+    parser.add_argument('--accumulation-steps', type=int, default=1,
+                        help='Gradient accumulation steps (default: 1). Effective batch = batch_size * accumulation_steps')
     # Wandb logging
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
     parser.add_argument('--wandb-project', type=str, default='qwen3-qat', help='W&B project name')
@@ -488,6 +490,7 @@ def main():
         'is_tpu': is_tpu,
         'weight_decay': args.weight_decay,
         'dropout': args.dropout,
+        'accumulation_steps': args.accumulation_steps,
     }
 
     # TPU-specific parameters
@@ -536,6 +539,7 @@ def main():
         wandb_config=wandb_config,
         weight_decay=args.weight_decay,
         dropout=args.dropout,
+        accumulation_steps=args.accumulation_steps,
     )
 
     print(f"\n  Final loss: {result.get('final_loss', 'N/A')}")

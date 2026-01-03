@@ -3,6 +3,9 @@ Dataset utilities: convert instruction datasets into Qwen3 chat-template format.
 
 We support:
 - Alpaca-style (instruction, input, output)
+- OpenHermes-style (conversations with from/value)
+- ShareGPT-style (conversations or messages)
+- Dolly-style (instruction, context, response)
 
 We produce:
 - input_ids
@@ -37,6 +40,123 @@ def build_alpaca_messages(example: Dict[str, Any]) -> List[Dict[str, str]]:
         {"role": "assistant", "content": out.strip()},
     ]
     return messages
+
+
+def build_openhermes_messages(example: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    Convert OpenHermes-2.5 sample to chat messages.
+
+    OpenHermes format has 'conversations' field with list of:
+    [{"from": "human", "value": "..."}, {"from": "gpt", "value": "..."}]
+
+    Dataset: teknium/OpenHermes-2.5
+    """
+    conversations = example.get("conversations", [])
+    if not conversations:
+        return []
+
+    messages = []
+    for turn in conversations:
+        role_map = {"human": "user", "gpt": "assistant", "system": "system"}
+        role = role_map.get(turn.get("from", ""), "user")
+        content = turn.get("value", "").strip()
+        if content:
+            messages.append({"role": role, "content": content})
+
+    return messages
+
+
+def build_sharegpt_messages(example: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    Convert ShareGPT-style sample to chat messages.
+
+    ShareGPT format has 'conversations' field with list of:
+    [{"from": "human", "value": "..."}, {"from": "gpt", "value": "..."}]
+    Same as OpenHermes but may have different field names.
+    """
+    # Try different field names
+    conversations = (
+        example.get("conversations", []) or
+        example.get("messages", []) or
+        example.get("dialog", [])
+    )
+    if not conversations:
+        return []
+
+    messages = []
+    for turn in conversations:
+        # Handle different role naming conventions
+        role_from = turn.get("from", turn.get("role", ""))
+        role_map = {
+            "human": "user", "user": "user",
+            "gpt": "assistant", "assistant": "assistant", "bot": "assistant",
+            "system": "system"
+        }
+        role = role_map.get(role_from.lower(), "user")
+        content = turn.get("value", turn.get("content", "")).strip()
+        if content:
+            messages.append({"role": role, "content": content})
+
+    return messages
+
+
+def build_dolly_messages(example: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    Convert Dolly-15k sample to chat messages.
+
+    Dolly format: instruction, context (optional), response
+
+    Dataset: databricks/databricks-dolly-15k
+    """
+    instruction = example.get("instruction", "")
+    context = example.get("context", "")
+    response = example.get("response", "")
+
+    user_content = instruction.strip()
+    if context and context.strip():
+        user_content = user_content + "\n\nContext:\n" + context.strip()
+
+    messages = [
+        {"role": "user", "content": user_content},
+        {"role": "assistant", "content": response.strip()},
+    ]
+    return messages
+
+
+def build_messages_auto(example: Dict[str, Any], dataset_format: str) -> List[Dict[str, str]]:
+    """
+    Auto-detect and convert dataset format to chat messages.
+
+    Supported formats:
+    - alpaca: instruction/input/output (tatsu-lab/alpaca)
+    - openhermes: conversations with from/value (teknium/OpenHermes-2.5)
+    - sharegpt: conversations or messages (various)
+    - dolly: instruction/context/response (databricks/databricks-dolly-15k)
+    """
+    format_map = {
+        "alpaca": build_alpaca_messages,
+        "alpaca_chat": build_alpaca_messages,
+        "openhermes": build_openhermes_messages,
+        "sharegpt": build_sharegpt_messages,
+        "dolly": build_dolly_messages,
+    }
+
+    builder = format_map.get(dataset_format)
+    if builder is None:
+        raise ValueError(f"Unknown dataset format: {dataset_format}. "
+                        f"Supported: {list(format_map.keys())}")
+
+    return builder(example)
+
+
+# Mapping of HuggingFace dataset names to their formats
+DATASET_FORMAT_MAP = {
+    "tatsu-lab/alpaca": "alpaca",
+    "teknium/OpenHermes-2.5": "openhermes",
+    "Open-Orca/SlimOrca": "sharegpt",
+    "databricks/databricks-dolly-15k": "dolly",
+    "HuggingFaceH4/ultrachat_200k": "sharegpt",
+}
 
 
 def tokenize_chat_sft(

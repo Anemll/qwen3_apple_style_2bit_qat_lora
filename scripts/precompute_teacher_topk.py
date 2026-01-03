@@ -86,9 +86,21 @@ except Exception:
     resolve_param_dtype = None
 
 try:
-    from qat_lora.data import build_alpaca_messages
+    from qat_lora.data import (
+        build_alpaca_messages,
+        build_openhermes_messages,
+        build_sharegpt_messages,
+        build_dolly_messages,
+        build_messages_auto,
+        DATASET_FORMAT_MAP,
+    )
 except Exception:
     build_alpaca_messages = None
+    build_openhermes_messages = None
+    build_sharegpt_messages = None
+    build_dolly_messages = None
+    build_messages_auto = None
+    DATASET_FORMAT_MAP = {}
 
 
 def _call_from_pretrained(fn, model_name_or_path: str, **kwargs):
@@ -186,6 +198,7 @@ def _chat_text_variants(tokenizer, messages: List[dict], thinking_mode: str) -> 
 
 def _iter_text_samples(dataset_iter: Iterator[dict], args, tokenizer) -> Iterator[str]:
     fmt = args.dataset_format
+
     if fmt == "plain":
         field = args.dataset_text_field
         for ex in dataset_iter:
@@ -196,6 +209,7 @@ def _iter_text_samples(dataset_iter: Iterator[dict], args, tokenizer) -> Iterato
             if not txt:
                 continue
             yield txt
+
     elif fmt in ("alpaca", "alpaca_chat"):
         if build_alpaca_messages is None:
             raise RuntimeError("dataset_format=alpaca requires qat_lora.data to be importable.")
@@ -206,8 +220,43 @@ def _iter_text_samples(dataset_iter: Iterator[dict], args, tokenizer) -> Iterato
             for rendered in _chat_text_variants(tokenizer, messages, args.enable_thinking):
                 if rendered:
                     yield rendered
+
+    elif fmt == "openhermes":
+        if build_openhermes_messages is None:
+            raise RuntimeError("dataset_format=openhermes requires qat_lora.data to be importable.")
+        for ex in dataset_iter:
+            messages = build_openhermes_messages(ex)
+            if not messages or len(messages) < 2:
+                continue
+            for rendered in _chat_text_variants(tokenizer, messages, args.enable_thinking):
+                if rendered:
+                    yield rendered
+
+    elif fmt == "sharegpt":
+        if build_sharegpt_messages is None:
+            raise RuntimeError("dataset_format=sharegpt requires qat_lora.data to be importable.")
+        for ex in dataset_iter:
+            messages = build_sharegpt_messages(ex)
+            if not messages or len(messages) < 2:
+                continue
+            for rendered in _chat_text_variants(tokenizer, messages, args.enable_thinking):
+                if rendered:
+                    yield rendered
+
+    elif fmt == "dolly":
+        if build_dolly_messages is None:
+            raise RuntimeError("dataset_format=dolly requires qat_lora.data to be importable.")
+        for ex in dataset_iter:
+            messages = build_dolly_messages(ex)
+            if not messages:
+                continue
+            for rendered in _chat_text_variants(tokenizer, messages, args.enable_thinking):
+                if rendered:
+                    yield rendered
+
     else:
-        raise ValueError(f"Unknown dataset_format={fmt}")
+        raise ValueError(f"Unknown dataset_format={fmt}. "
+                        f"Supported: plain, alpaca, alpaca_chat, openhermes, sharegpt, dolly")
 
 
 class PackedTokenStream:
@@ -268,8 +317,10 @@ def parse_args():
         "--dataset_format",
         type=str,
         default="plain",
-        choices=["plain", "alpaca", "alpaca_chat"],
-        help="plain=use dataset_text_field contents. alpaca/alpaca_chat render a chat template.",
+        choices=["plain", "alpaca", "alpaca_chat", "openhermes", "sharegpt", "dolly"],
+        help="Dataset format: plain=raw text, alpaca=instruction/output, "
+             "openhermes=conversations (teknium/OpenHermes-2.5), "
+             "sharegpt=conversations (SlimOrca), dolly=instruction/response.",
     )
     p.add_argument("--dataset_text_field", type=str, default="text", help="Used when dataset_format=plain.")
     p.add_argument("--streaming", action="store_true")
