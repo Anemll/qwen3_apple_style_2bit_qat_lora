@@ -1201,6 +1201,8 @@ def train_e2e(
     wandb_project: str = "qwen3-qat",
     wandb_run_name: str = None,
     wandb_config: dict = None,
+    weight_decay: float = 0.0,
+    dropout: float = 0.0,
 ) -> dict:
     """End-to-end KD-QAT training (all layers unfrozen).
 
@@ -1371,11 +1373,28 @@ def train_e2e(
         if hard_top1_weight > 0 or hard_full_weight > 0:
             print(f"Hard label: top1={hard_top1_weight}, full={hard_full_weight}")
 
+    # Apply dropout to model if specified
+    if dropout > 0:
+        # Try to set dropout on model config (works for HuggingFace models)
+        if hasattr(model, 'config'):
+            if hasattr(model.config, 'attention_probs_dropout_prob'):
+                model.config.attention_probs_dropout_prob = dropout
+            if hasattr(model.config, 'hidden_dropout_prob'):
+                model.config.hidden_dropout_prob = dropout
+            if hasattr(model.config, 'attention_dropout'):
+                model.config.attention_dropout = dropout
+            if hasattr(model.config, 'hidden_dropout'):
+                model.config.hidden_dropout = dropout
+        if verbose:
+            print(f"Dropout: {dropout}")
+
     # Optimizer
     params = [p for p in model.parameters() if p.requires_grad]
     if not params:
         raise ValueError("No trainable parameters! Check train_weights/train_scales flags.")
-    optimizer = AdamW(params, lr=lr)
+    optimizer = AdamW(params, lr=lr, weight_decay=weight_decay)
+    if verbose and weight_decay > 0:
+        print(f"Weight decay: {weight_decay}")
 
     # LR Scheduler (cosine with warmup)
     scheduler = None

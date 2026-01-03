@@ -73,6 +73,9 @@ def main():
     parser.add_argument('--g-only', action='store_true', help='Train only rank_magnitude (G), freeze A and B')
     parser.add_argument('--mlp-only', action='store_true', help='Train only MLP layers, freeze attention')
     parser.add_argument('--save-steps', type=int, default=0, help='Save checkpoint every N steps (0=disabled)')
+    # Regularization
+    parser.add_argument('--weight-decay', type=float, default=0.0, help='Weight decay for AdamW (default: 0.0, try 0.01)')
+    parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate (default: 0.0, try 0.1)')
     # Wandb logging
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
     parser.add_argument('--wandb-project', type=str, default='qwen3-qat', help='W&B project name')
@@ -483,6 +486,8 @@ def main():
         'mixed_precision': args.mixed_precision,
         'device_type': device_type,
         'is_tpu': is_tpu,
+        'weight_decay': args.weight_decay,
+        'dropout': args.dropout,
     }
 
     # TPU-specific parameters
@@ -529,6 +534,8 @@ def main():
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run,
         wandb_config=wandb_config,
+        weight_decay=args.weight_decay,
+        dropout=args.dropout,
     )
 
     print(f"\n  Final loss: {result.get('final_loss', 'N/A')}")
