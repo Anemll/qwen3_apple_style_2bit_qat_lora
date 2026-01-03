@@ -46,7 +46,9 @@ def main():
     parser.add_argument('--debug', action='store_true',
                         help='Print debug information')
     parser.add_argument('--fp16', '--ane', action='store_true',
-                        help='Snap for ANE export (FP16 precision, recompute indices)')
+                        help='Snap for ANE export (FP16 precision)')
+    parser.add_argument('--recompute-indices', action='store_true',
+                        help='Recompute quantization indices in FP16 (not recommended, use existing _Q)')
     args = parser.parse_args()
 
     # Set attn defaults to MLP values if not specified
@@ -89,13 +91,13 @@ def main():
     mlp_config = AnemllQuantConfigV2(
         lut_size=2**args.lut_bits,
         scale_rank=args.scale_rank,
-        force_positive_scales=False,  # Match training config
+        force_positive_scales=False,  # Match training config (train_v2_simple.py)
         magnitude_activation='identity',
     )
     attn_config = AnemllQuantConfigV2(
         lut_size=2**args.attn_lut_bits,
         scale_rank=args.attn_scale_rank,
-        force_positive_scales=False,  # Match training config
+        force_positive_scales=False,  # Match training config (train_v2_simple.py)
         magnitude_activation='identity',
     )
     count = replace_linear_with_anemll_v2(
@@ -209,9 +211,10 @@ def main():
 
     # Snap for inference
     if args.fp16:
-        # FP16 snap for ANE export - recompute indices in FP16 precision
-        print("\nSnapping for ANE (FP16 precision)...")
-        snapped = snap_model_for_ane_v2(model, recompute_indices=True, verbose=True)
+        # FP16 snap for ANE export
+        recompute = getattr(args, 'recompute_indices', False)
+        print(f"\nSnapping for ANE (FP16 precision, recompute_indices={recompute})...")
+        snapped = snap_model_for_ane_v2(model, recompute_indices=recompute, verbose=True)
         print(f"  Snapped {snapped} layers to FP16")
     else:
         # DON'T call snap_for_export() - it modifies scale params and might recompute Q

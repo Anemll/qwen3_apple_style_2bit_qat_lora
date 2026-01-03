@@ -129,13 +129,13 @@ def load_model(args):
         mlp_config = AnemllQuantConfigV2(
             lut_size=2**lut_bits,
             scale_rank=scale_rank,
-            force_positive_scales=False,  # Match training config
+            force_positive_scales=False,  # Match training config (train_v2_simple.py)
             magnitude_activation='identity',
         )
         attn_config = AnemllQuantConfigV2(
             lut_size=2**attn_lut_bits,
             scale_rank=attn_scale_rank,
-            force_positive_scales=False,  # Match training config
+            force_positive_scales=False,  # Match training config (train_v2_simple.py)
             magnitude_activation='identity',
         )
 
@@ -191,6 +191,7 @@ def load_model(args):
     # V2: Manually load _Q buffers if they weren't loaded (None buffers issue)
     if version == 'v2':
         q_loaded = 0
+        baked_detected = 0
         for name, m in model.named_modules():
             if type(m).__name__ == 'AnemllQATLinearV2':
                 q_key = f"{name}._Q"
@@ -198,8 +199,19 @@ def load_model(args):
                     # Re-register as buffer so it moves with model.to(device)
                     m.register_buffer("_Q", state_dict[q_key])
                     q_loaded += 1
+
+                # Detect baked scales: all rank_magnitude == 1
+                g_key = f"{name}.rank_magnitude"
+                if g_key in state_dict:
+                    g = state_dict[g_key]
+                    if torch.allclose(g, torch.ones_like(g)):
+                        m._scales_baked = True
+                        baked_detected += 1
+
         if q_loaded > 0:
             print(f"  Manually loaded {q_loaded} _Q buffers")
+        if baked_detected > 0:
+            print(f"  Detected {baked_detected} layers with baked scales (FP16 snap)")
 
     # Move to device
     model.to(device)

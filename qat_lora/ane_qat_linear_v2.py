@@ -56,9 +56,24 @@ class AnemllQuantConfigV2:
     # STE-FP16: Apply FP16 rounding in forward with FP32 gradients (for ANE matching)
     use_ste_fp16: bool = False
 
+    # === QRANKLUT: Quantize A_dir/B_dir with k-means LUT ===
+    # When enabled, A_dir and B_dir are quantized using per-layer k-means LUTs.
+    # Values are in [-1, 1] since A_dir/B_dir are unit-normalized.
+    rank_lut_size: int = 0  # 0 = disabled, 64 = 6-bit, 256 = 8-bit
+    rank_lut_learnable: bool = True  # LUT values are trainable
+    rank_lut_frozen_idx: bool = True  # Indices frozen (start frozen, can unfreeze)
+    rank_lut_signed: bool = True  # Codebook in [-1, 1] (vs [0, 1])
+
     @property
     def lut_bits(self) -> int:
         return int(math.ceil(math.log2(self.lut_size)))
+
+    @property
+    def rank_lut_bits(self) -> int:
+        """Bits for rank LUT (0 if disabled)."""
+        if self.rank_lut_size <= 0:
+            return 0
+        return int(math.ceil(math.log2(self.rank_lut_size)))
 
 
 # =============================================================================
@@ -105,6 +120,129 @@ def quantize_to_lut_indices(
     y_pos = (x / step_pos) + half
     y = torch.where(x < 0, y_neg, y_pos)
     return torch.round(y).long().clamp(0, lut_size - 1)
+
+
+# =============================================================================
+# QRANKLUT: K-MEANS LUT FOR A_dir/B_dir QUANTIZATION
+# =============================================================================
+
+def kmeans_1d(
+    data: torch.Tensor,
+    k: int,
+    max_iters: int = 100,
+    tol: float = 1e-6,
+) -> torch.Tensor:
+    """1D k-means clustering (Lloyd-Max algorithm).
+
+    Clusters 1D data into k centroids. Much faster than sklearn for 1D case.
+
+    Args:
+        data: 1D tensor of values to cluster
+        k: Number of centroids (LUT size)
+        max_iters: Maximum iterations
+        tol: Convergence tolerance
+
+    Returns:
+        Sorted centroids tensor of shape [k]
+    """
+    data = data.flatten().float()
+    n = data.numel()
+
+    if n == 0:
+        return torch.linspace(-1.0, 1.0, k, device=data.device, dtype=data.dtype)
+
+    # Initialize centroids with quantile-based spacing
+    # This is faster and more stable than random init for 1D
+    quantiles = torch.linspace(0, 1, k, device=data.device)
+    sorted_data = data.sort().values
+    indices = (quantiles * (n - 1)).long().clamp(0, n - 1)
+    centroids = sorted_data[indices].clone()
+
+    for _ in range(max_iters):
+        # Assignment: find nearest centroid for each point
+        # distances: [n, k]
+        distances = (data.unsqueeze(1) - centroids.unsqueeze(0)).abs()
+        assignments = distances.argmin(dim=1)
+
+        # Update: compute mean of each cluster
+        new_centroids = torch.zeros_like(centroids)
+        counts = torch.zeros(k, device=data.device)
+
+        for j in range(k):
+            mask = (assignments == j)
+            count = mask.sum()
+            if count > 0:
+                new_centroids[j] = data[mask].mean()
+                counts[j] = count
+            else:
+                # Empty cluster: keep old centroid
+                new_centroids[j] = centroids[j]
+
+        # Check convergence
+        if (new_centroids - centroids).abs().max() < tol:
+            centroids = new_centroids
+            break
+
+        centroids = new_centroids
+
+    # Sort centroids (monotonic for fast bucketize)
+    return centroids.sort().values
+
+
+def assign_to_lut(
+    data: torch.Tensor,
+    lut: torch.Tensor,
+) -> torch.Tensor:
+    """Assign values to nearest LUT entry (for k-means LUT).
+
+    Uses bucketize for sorted LUT (fast O(n log k)).
+
+    Args:
+        data: Tensor of values to quantize
+        lut: Sorted 1D LUT tensor of shape [k]
+
+    Returns:
+        Index tensor of same shape as data
+    """
+    k = lut.numel()
+    if k <= 1:
+        return torch.zeros_like(data, dtype=torch.long)
+
+    # Compute midpoints between consecutive centroids
+    # boundaries[j] = (lut[j] + lut[j+1]) / 2
+    boundaries = (lut[:-1] + lut[1:]) / 2  # [k-1]
+
+    # bucketize: find which bucket each value falls into
+    # Returns index i such that boundaries[i-1] < x <= boundaries[i]
+    indices = torch.bucketize(data, boundaries)  # [0, k-1]
+
+    return indices.clamp(0, k - 1)
+
+
+def qranklut_fake_quant(
+    x: torch.Tensor,
+    lut: torch.Tensor,
+    frozen_idx: bool = True,
+) -> torch.Tensor:
+    """Apply qranklut fake quantization with STE.
+
+    Args:
+        x: Input tensor (any shape)
+        lut: Sorted 1D LUT tensor [k]
+        frozen_idx: If True, indices are frozen (gradients only to LUT values)
+                   If False, use STE for index selection
+
+    Returns:
+        Quantized tensor with same shape as x, gradients flow through STE
+    """
+    # Assign to nearest LUT entry
+    idx = assign_to_lut(x, lut)
+
+    # Dequantize
+    x_q = lut[idx]
+
+    # STE: forward uses quantized, backward passes through unchanged
+    return x + (x_q - x).detach()
 
 
 # =============================================================================
@@ -209,6 +347,32 @@ class AnemllQATLinearV2(nn.Module):
 
         # Store lut_bits for conversion pipeline
         self.lut_bits = self.config.lut_bits
+
+        # === QRANKLUT: Per-layer LUTs for A_dir/B_dir quantization ===
+        # A_lut: [rank_lut_size] - LUT for A_dir quantization
+        # B_lut: [rank_lut_size] - LUT for B_dir quantization
+        # _A_idx: [out, rank] - quantization indices for A_dir
+        # _B_idx: [rank, in] - quantization indices for B_dir
+        self._rank_lut_enabled = False  # Enabled after init_rank_lut()
+        rank_lut_size = self.config.rank_lut_size
+
+        if rank_lut_size > 0:
+            # Initialize with uniform LUT (will be replaced by k-means)
+            init_lut = torch.linspace(-1.0, 1.0, rank_lut_size)
+            if self.config.rank_lut_learnable:
+                self.A_lut = nn.Parameter(init_lut.clone())
+                self.B_lut = nn.Parameter(init_lut.clone())
+            else:
+                self.register_buffer("A_lut", init_lut.clone())
+                self.register_buffer("B_lut", init_lut.clone())
+            # Index buffers (computed by init_rank_lut)
+            self.register_buffer("_A_idx", None)
+            self.register_buffer("_B_idx", None)
+        else:
+            self.A_lut = None
+            self.B_lut = None
+            self._A_idx = None
+            self._B_idx = None
 
         # LoRA (kept for compatibility)
         self.lora_r = int(lora_r)
@@ -346,6 +510,18 @@ class AnemllQATLinearV2(nn.Module):
         B_norms = B.norm(dim=1, keepdim=True).clamp(min=eps)
         B_dir = B / B_norms
 
+        # === QRANKLUT: Apply LUT quantization to A_dir/B_dir ===
+        if getattr(self, '_rank_lut_enabled', False) and self.A_lut is not None:
+            if self._A_idx is not None and self._B_idx is not None:
+                # Frozen mode: use cached indices (fast lookup)
+                A_dir = self.A_lut[self._A_idx]
+                B_dir = self.B_lut[self._B_idx]
+            else:
+                # STE mode: compute indices on-the-fly with gradient passthrough
+                frozen = getattr(self.config, 'rank_lut_frozen_idx', True)
+                A_dir = qranklut_fake_quant(A_dir, self.A_lut, frozen_idx=frozen)
+                B_dir = qranklut_fake_quant(B_dir, self.B_lut, frozen_idx=frozen)
+
         # Per-rank magnitude (optionally forced nonnegative)
         g = self.rank_magnitude
         act = getattr(self.config, "magnitude_activation", "identity")
@@ -406,6 +582,109 @@ class AnemllQATLinearV2(nn.Module):
 
         # Freeze weight (we're training scales only)
         self.weight.requires_grad = False
+
+    @torch.no_grad()
+    def init_rank_lut(self, verbose: bool = False):
+        """Initialize qranklut with k-means clustering from current A_dir/B_dir.
+
+        This method:
+        1. Computes normalized A_dir, B_dir from current scale_A, scale_B
+        2. Runs k-means to find optimal LUT values for each
+        3. Assigns indices to each element
+        4. Enables qranklut mode (_rank_lut_enabled = True)
+
+        Call this after loading a trained checkpoint to add qranklut compression.
+        """
+        if self.A_lut is None or self.config.rank_lut_size <= 0:
+            if verbose:
+                print(f"  [skip] rank_lut_size = {self.config.rank_lut_size}")
+            return
+
+        device = self.weight.device
+        k = self.config.rank_lut_size
+
+        # Get normalized directions (without qranklut applied)
+        # Temporarily disable qranklut to get raw normalized values
+        was_enabled = self._rank_lut_enabled
+        self._rank_lut_enabled = False
+
+        eps = getattr(self.config, 'norm_eps', 1e-6)
+        A = self.scale_A
+        B = self.scale_B
+
+        # Apply positivity if configured
+        if getattr(self.config, "force_positive_scales", False):
+            method = getattr(self.config, "positive_scale_method", "abs")
+            if method == "softplus":
+                A = F.softplus(A)
+                B = F.softplus(B)
+            elif method == "abs":
+                A = A.abs()
+                B = B.abs()
+
+        # Normalize
+        A_norms = A.norm(dim=0, keepdim=True).clamp(min=eps)
+        A_dir = (A / A_norms).float()
+
+        B_norms = B.norm(dim=1, keepdim=True).clamp(min=eps)
+        B_dir = (B / B_norms).float()
+
+        # Run k-means on A_dir
+        A_lut = kmeans_1d(A_dir.flatten(), k)
+        A_idx = assign_to_lut(A_dir, A_lut)
+
+        # Run k-means on B_dir
+        B_lut = kmeans_1d(B_dir.flatten(), k)
+        B_idx = assign_to_lut(B_dir, B_lut)
+
+        # Store LUT values
+        if isinstance(self.A_lut, nn.Parameter):
+            self.A_lut.data = A_lut.to(device)
+            self.B_lut.data = B_lut.to(device)
+        else:
+            self.A_lut = A_lut.to(device)
+            self.B_lut = B_lut.to(device)
+
+        # Store indices
+        self._A_idx = A_idx.to(device)
+        self._B_idx = B_idx.to(device)
+
+        # Enable qranklut
+        self._rank_lut_enabled = True
+
+        if verbose:
+            # Compute reconstruction error
+            A_recon = A_lut[A_idx]
+            B_recon = B_lut[B_idx]
+            A_err = (A_dir - A_recon).abs().mean().item()
+            B_err = (B_dir - B_recon).abs().mean().item()
+            print(f"  A_lut range: [{A_lut.min():.4f}, {A_lut.max():.4f}]")
+            print(f"  B_lut range: [{B_lut.min():.4f}, {B_lut.max():.4f}]")
+            print(f"  Reconstruction MAE: A={A_err:.6f}, B={B_err:.6f}")
+
+    @torch.no_grad()
+    def freeze_rank_lut(self):
+        """Freeze rank LUT indices (keep LUT values trainable).
+
+        After calling this:
+        - _A_idx, _B_idx are frozen (no gradient)
+        - A_lut, B_lut can still be trained (if rank_lut_learnable=True)
+        """
+        if self._A_idx is not None:
+            self._A_idx = self._A_idx.detach()
+        if self._B_idx is not None:
+            self._B_idx = self._B_idx.detach()
+
+    @torch.no_grad()
+    def unfreeze_rank_lut_for_training(self):
+        """Clear cached indices to enable STE-based training.
+
+        After calling this:
+        - Indices are recomputed on-the-fly in forward pass
+        - Gradients flow through STE to A_lut, B_lut, and potentially scale_A/scale_B
+        """
+        self._A_idx = None
+        self._B_idx = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Rank-by-rank forward: y = Σₖ gₖ · (aₖ ⊙ (Q (bₖ ⊙ x)))
@@ -603,13 +882,17 @@ class AnemllQATLinearV2(nn.Module):
         device = self.weight.device
         fp16 = torch.float16
 
-        # 1. Recompute LUT in FP16
-        lut_fp16 = make_lut(
-            self.config.lut_size,
-            device=device,
-            dtype=fp16,
-            include_zero=self.config.lut_include_zero,
-        )
+        # 1. Use existing LUT, just convert to FP16 (don't recreate!)
+        if hasattr(self, 'lut') and self.lut is not None:
+            lut_fp16 = self.lut.to(fp16)
+        else:
+            # Fallback: create new LUT (shouldn't happen in trained model)
+            lut_fp16 = make_lut(
+                self.config.lut_size,
+                device=device,
+                dtype=fp16,
+                include_zero=self.config.lut_include_zero,
+            )
 
         if recompute_indices:
             # 2. Compute scales in FP16
@@ -618,13 +901,9 @@ class AnemllQATLinearV2(nn.Module):
             B_dir = B_dir.to(fp16)
             g = g.to(fp16)
 
-            # Compute full scales in FP16
+            # Compute full scales in FP16 (no clamping for V2)
             A_scaled = A_dir * g
             scales_fp16 = (A_scaled @ B_dir)
-            if getattr(self.config, "force_positive_scales", False):
-                scales_fp16 = scales_fp16  # Already >= 0
-            else:
-                scales_fp16 = scales_fp16.clamp(min=1e-8)
 
             # 3. Recompute indices in FP16
             weight_fp16 = self.weight.to(fp16)
@@ -646,12 +925,25 @@ class AnemllQATLinearV2(nn.Module):
 
             # Mark scales as baked (skip normalization in forward)
             self._scales_baked = True
-        else:
-            # Just convert existing indices
-            indices_fp16 = self._indices
 
-        # 4. Compute Q = lut[indices] in FP16
-        self._Q = lut_fp16[indices_fp16]
+            # Compute Q = lut[indices] in FP16
+            self._Q = lut_fp16[indices_fp16]
+        else:
+            # No recompute - just convert existing _Q to FP16
+            if self._Q is not None:
+                self._Q = self._Q.to(fp16)
+            elif self._indices is not None:
+                # Have indices but no _Q - compute from indices
+                self._Q = lut_fp16[self._indices]
+            else:
+                # Neither _Q nor _indices - need to compute (fallback)
+                self.freeze_Q()
+                self._Q = self._Q.to(fp16)
+
+            # Convert scales to FP16 (don't bake)
+            self.scale_A.data = self.scale_A.data.to(fp16)
+            self.scale_B.data = self.scale_B.data.to(fp16)
+            self.rank_magnitude.data = self.rank_magnitude.data.to(fp16)
 
         # Update LUT buffer
         if hasattr(self, 'lut') and isinstance(self.lut, torch.Tensor):
@@ -1111,3 +1403,204 @@ def load_v2_checkpoint(
             print(f"  Call freeze_Q_all() before inference")
 
     return stats
+
+
+# =============================================================================
+# QRANKLUT MODEL-LEVEL HELPERS
+# =============================================================================
+
+def init_rank_lut_all(
+    model: nn.Module,
+    verbose: bool = True,
+) -> dict:
+    """Initialize qranklut (k-means LUT) for all V2 layers.
+
+    This function:
+    1. Iterates through all AnemllQATLinearV2 layers
+    2. Runs k-means on A_dir and B_dir to find optimal LUT values
+    3. Assigns indices and enables qranklut mode
+
+    Call this after loading a trained checkpoint to add qranklut compression.
+
+    Args:
+        model: Model with V2 layers
+        verbose: Print initialization statistics
+
+    Returns:
+        Dictionary with statistics
+    """
+    count = 0
+    total_A_err = 0.0
+    total_B_err = 0.0
+
+    for name, module in model.named_modules():
+        if isinstance(module, AnemllQATLinearV2):
+            if module.A_lut is None or module.config.rank_lut_size <= 0:
+                continue
+
+            module.init_rank_lut(verbose=False)
+            count += 1
+
+            if verbose:
+                # Compute reconstruction error for summary
+                if module._A_idx is not None:
+                    A_dir = module.scale_A.abs() if module.config.force_positive_scales else module.scale_A
+                    A_norms = A_dir.norm(dim=0, keepdim=True).clamp(min=1e-6)
+                    A_dir_norm = (A_dir / A_norms).float()
+                    A_recon = module.A_lut[module._A_idx]
+                    A_err = (A_dir_norm - A_recon).abs().mean().item()
+                    total_A_err += A_err
+
+                    B_dir = module.scale_B.abs() if module.config.force_positive_scales else module.scale_B
+                    B_norms = B_dir.norm(dim=1, keepdim=True).clamp(min=1e-6)
+                    B_dir_norm = (B_dir / B_norms).float()
+                    B_recon = module.B_lut[module._B_idx]
+                    B_err = (B_dir_norm - B_recon).abs().mean().item()
+                    total_B_err += B_err
+
+    stats = {
+        'layers_initialized': count,
+        'avg_A_mae': total_A_err / max(count, 1),
+        'avg_B_mae': total_B_err / max(count, 1),
+    }
+
+    if verbose:
+        print(f"\n[QRANKLUT Initialized]")
+        print(f"  Layers: {count}")
+        if count > 0:
+            lut_size = model.modules().__next__().config.rank_lut_size if hasattr(model, 'modules') else 0
+            # Find first V2 layer to get config
+            for m in model.modules():
+                if isinstance(m, AnemllQATLinearV2) and m.A_lut is not None:
+                    lut_size = m.config.rank_lut_size
+                    break
+            print(f"  LUT size: {lut_size} ({int(math.log2(lut_size))}-bit)")
+            print(f"  Avg MAE: A={stats['avg_A_mae']:.6f}, B={stats['avg_B_mae']:.6f}")
+
+    return stats
+
+
+def freeze_rank_lut_all(model: nn.Module, verbose: bool = True) -> int:
+    """Freeze rank LUT indices for all V2 layers.
+
+    After calling this:
+    - Indices (_A_idx, _B_idx) are frozen
+    - LUT values (A_lut, B_lut) can still be trained
+
+    Args:
+        model: Model with V2 layers
+        verbose: Print summary
+
+    Returns:
+        Number of layers frozen
+    """
+    count = 0
+    for module in model.modules():
+        if isinstance(module, AnemllQATLinearV2):
+            if module._A_idx is not None:
+                module.freeze_rank_lut()
+                count += 1
+
+    if verbose:
+        print(f"[QRANKLUT] Froze indices for {count} layers")
+
+    return count
+
+
+def enable_rank_lut_training_all(
+    model: nn.Module,
+    train_lut: bool = True,
+    train_g: bool = True,
+    train_scales: bool = False,
+    freeze_base_q: bool = True,
+    verbose: bool = True,
+) -> dict:
+    """Enable qranklut training mode for all V2 layers.
+
+    This sets up the model for training LUT values and/or magnitudes.
+
+    Args:
+        model: Model with V2 layers
+        train_lut: If True, A_lut and B_lut are trainable
+        train_g: If True, rank_magnitude is trainable
+        train_scales: If True, scale_A and scale_B are trainable
+        freeze_base_q: If True, freeze base Q (weight indices)
+        verbose: Print summary
+
+    Returns:
+        Dictionary with training configuration
+    """
+    lut_count = 0
+    g_count = 0
+    scales_count = 0
+
+    for module in model.modules():
+        if isinstance(module, AnemllQATLinearV2):
+            # LUT training
+            if module.A_lut is not None:
+                if isinstance(module.A_lut, nn.Parameter):
+                    module.A_lut.requires_grad = train_lut
+                    module.B_lut.requires_grad = train_lut
+                    if train_lut:
+                        lut_count += 1
+
+            # Magnitude training
+            module.rank_magnitude.requires_grad = train_g
+            if train_g:
+                g_count += 1
+
+            # Scale training
+            module.scale_A.requires_grad = train_scales
+            module.scale_B.requires_grad = train_scales
+            if train_scales:
+                scales_count += 1
+
+            # Base Q freezing
+            if freeze_base_q:
+                module.weight.requires_grad = False
+
+    stats = {
+        'lut_trainable': lut_count,
+        'g_trainable': g_count,
+        'scales_trainable': scales_count,
+    }
+
+    if verbose:
+        print(f"\n[QRANKLUT Training Mode]")
+        print(f"  LUT trainable: {lut_count} layers")
+        print(f"  Magnitude (g) trainable: {g_count} layers")
+        print(f"  Scales trainable: {scales_count} layers")
+        print(f"  Base Q frozen: {freeze_base_q}")
+
+    return stats
+
+
+def get_rank_lut_stats(model: nn.Module) -> dict:
+    """Get qranklut statistics for all V2 layers.
+
+    Returns:
+        Dictionary with qranklut statistics
+    """
+    enabled = 0
+    has_indices = 0
+    total_lut_params = 0
+    total_idx_elements = 0
+
+    for module in model.modules():
+        if isinstance(module, AnemllQATLinearV2):
+            if getattr(module, '_rank_lut_enabled', False):
+                enabled += 1
+            if module._A_idx is not None:
+                has_indices += 1
+                total_idx_elements += module._A_idx.numel() + module._B_idx.numel()
+            if module.A_lut is not None:
+                total_lut_params += module.A_lut.numel() + module.B_lut.numel()
+
+    return {
+        'enabled': enabled,
+        'has_indices': has_indices,
+        'total_lut_params': total_lut_params,
+        'total_idx_elements': total_idx_elements,
+        'lut_memory_kb': total_lut_params * 4 / 1024,  # FP32
+        'idx_memory_kb': total_idx_elements * 1 / 1024,  # uint8
+    }
