@@ -551,7 +551,18 @@ def main():
             obj["rand_idx"] = torch.stack(shard_rand_idx, dim=0).to(torch.int32)
             obj["rand_logits"] = torch.stack(shard_rand_logits, dim=0).to(torch.float16)
         torch.save(obj, shard_path)
-        print(f"[write] {shard_path.name} | N={input_ids.shape[0]}")
+
+        # Calculate timing and ETA
+        elapsed = time.time() - start_time
+        elapsed_min = elapsed / 60
+        shards_done = shard_id + 1
+        if shards_done > 0:
+            secs_per_shard = elapsed / shards_done
+            remaining_shards = total_shards - shards_done
+            eta_min = (secs_per_shard * remaining_shards) / 60
+            print(f"[write] {shard_path.name} | N={input_ids.shape[0]} | {elapsed_min:.1f}min elapsed | ETA: {eta_min:.1f}min ({shards_done}/{total_shards})")
+        else:
+            print(f"[write] {shard_path.name} | N={input_ids.shape[0]}")
         with open(progress_path, "w") as f:
             json.dump({"n_written": int(n_written), "next_shard_id": int(shard_id) + 1}, f, indent=2)
         shard_inputs.clear()
@@ -561,9 +572,11 @@ def main():
         shard_rand_idx.clear()
         shard_rand_logits.clear()
 
-    # Main loop
+    # Main loop with timing
     shard_id = 0
     n_written = 0
+    start_time = time.time()
+    total_shards = math.ceil(args.num_sequences / args.shard_size)
     if args.resume and progress_path.exists():
         try:
             prog = json.loads(progress_path.read_text())
