@@ -614,6 +614,11 @@ def main():
                     )
                     rand_vals = logits.gather(dim=-1, index=rand_idx)
 
+                # TPU: sync before CPU transfer
+                if is_xla:
+                    import torch_xla.core.xla_model as xm
+                    xm.mark_step()
+
                 # Move to CPU + compact dtypes
                 input_ids_cpu = input_ids.detach().to("cpu", dtype=torch.int32)
                 attn_cpu = attn.detach().to("cpu", dtype=torch.uint8)
@@ -640,11 +645,7 @@ def main():
                 n_written += bsz
                 batch.clear()
 
-                # TPU: sync after each batch
-                if str(device).startswith("xla"):
-                    import torch_xla.core.xla_model as xm
-                    xm.mark_step()
-
+                # TPU: sync only when shard is ready (not every batch - too slow!)
                 if len(shard_inputs) >= args.shard_size:
                     flush_shard(shard_id)
                     shard_id += 1
