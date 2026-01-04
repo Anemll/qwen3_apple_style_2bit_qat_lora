@@ -68,6 +68,8 @@ import math
 import os
 import sys
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterator, List, Optional
 
@@ -524,7 +526,7 @@ def main():
             if k in prev and prev.get(k) != v:
                 raise RuntimeError(f"--resume but meta.json mismatch for {k}: {prev.get(k)} != {v}")
 
-    # Accumulators for current shard
+    # Accumulators for current shard (CPU tensors, already transferred)
     shard_inputs: List[torch.Tensor] = []
     shard_attn: List[torch.Tensor] = []
     shard_topk_idx: List[torch.Tensor] = []
@@ -532,9 +534,37 @@ def main():
     shard_rand_idx: List[torch.Tensor] = []
     shard_rand_logits: List[torch.Tensor] = []
 
-    def flush_shard(shard_id: int):
+    # Background writer for async I/O
+    write_executor = ThreadPoolExecutor(max_workers=1)
+    pending_write = None
+
+    def _write_shard_sync(shard_path, obj, shard_id, n_seqs, start_time, total_shards, n_written_snapshot):
+        """Blocking shard write (runs in background thread)."""
+        torch.save(obj, shard_path)
+        # Calculate timing and ETA
+        elapsed = time.time() - start_time
+        elapsed_min = elapsed / 60
+        shards_done = shard_id + 1
+        if shards_done > 0:
+            secs_per_shard = elapsed / shards_done
+            remaining_shards = total_shards - shards_done
+            eta_min = (secs_per_shard * remaining_shards) / 60
+            print(f"[write] {shard_path.name} | N={n_seqs} | {elapsed_min:.1f}min elapsed | ETA: {eta_min:.1f}min ({shards_done}/{total_shards})")
+        else:
+            print(f"[write] {shard_path.name} | N={n_seqs}")
+        with open(progress_path, "w") as f:
+            json.dump({"n_written": int(n_written_snapshot), "next_shard_id": int(shard_id) + 1}, f, indent=2)
+
+    def flush_shard(shard_id: int, async_write: bool = False):
+        nonlocal pending_write
         if not shard_inputs:
             return
+
+        # Wait for any pending write to complete
+        if pending_write is not None:
+            pending_write.result()
+            pending_write = None
+
         input_ids = torch.stack(shard_inputs, dim=0).to(torch.int32)
         attention_mask = torch.stack(shard_attn, dim=0).to(torch.uint8)
         topk_idx = torch.stack(shard_topk_idx, dim=0).to(torch.int32)
@@ -550,21 +580,20 @@ def main():
         if shard_rand_idx:
             obj["rand_idx"] = torch.stack(shard_rand_idx, dim=0).to(torch.int32)
             obj["rand_logits"] = torch.stack(shard_rand_logits, dim=0).to(torch.float16)
-        torch.save(obj, shard_path)
 
-        # Calculate timing and ETA
-        elapsed = time.time() - start_time
-        elapsed_min = elapsed / 60
-        shards_done = shard_id + 1
-        if shards_done > 0:
-            secs_per_shard = elapsed / shards_done
-            remaining_shards = total_shards - shards_done
-            eta_min = (secs_per_shard * remaining_shards) / 60
-            print(f"[write] {shard_path.name} | N={input_ids.shape[0]} | {elapsed_min:.1f}min elapsed | ETA: {eta_min:.1f}min ({shards_done}/{total_shards})")
+        n_seqs = input_ids.shape[0]
+        n_written_snapshot = n_written
+
+        if async_write:
+            # Submit to background thread
+            pending_write = write_executor.submit(
+                _write_shard_sync, shard_path, obj, shard_id, n_seqs,
+                start_time, total_shards, n_written_snapshot
+            )
         else:
-            print(f"[write] {shard_path.name} | N={input_ids.shape[0]}")
-        with open(progress_path, "w") as f:
-            json.dump({"n_written": int(n_written), "next_shard_id": int(shard_id) + 1}, f, indent=2)
+            # Synchronous write
+            _write_shard_sync(shard_path, obj, shard_id, n_seqs, start_time, total_shards, n_written_snapshot)
+
         shard_inputs.clear()
         shard_attn.clear()
         shard_topk_idx.clear()
@@ -594,6 +623,54 @@ def main():
     is_xla = str(device).startswith("xla")
     grad_context = torch.no_grad() if is_xla else torch.inference_mode()
 
+    # For TPU: accumulate on device, only sync at shard boundary
+    # This reduces the number of TPU<->CPU syncs dramatically
+    device_inputs: List[torch.Tensor] = []
+    device_topk_idx: List[torch.Tensor] = []
+    device_topk_vals: List[torch.Tensor] = []
+    device_rand_idx: List[torch.Tensor] = []
+    device_rand_vals: List[torch.Tensor] = []
+
+    def transfer_device_to_cpu():
+        """Bulk transfer accumulated device tensors to CPU shard buffers."""
+        if not device_inputs:
+            return
+        # Single sync for all accumulated batches
+        if is_xla:
+            try:
+                import torch_xla
+                torch_xla.sync()
+            except (ImportError, AttributeError):
+                import torch_xla.core.xla_model as xm
+                xm.mark_step()
+
+        for i, (inp, tk_idx, tk_val) in enumerate(zip(device_inputs, device_topk_idx, device_topk_vals)):
+            inp_cpu = inp.detach().to("cpu", dtype=torch.int32)
+            attn_cpu = torch.ones(inp_cpu.shape[0], inp_cpu.shape[1], dtype=torch.uint8)
+            tk_idx_cpu = tk_idx.detach().to("cpu", dtype=torch.int32)
+            tk_val_cpu = tk_val.detach().to("cpu", dtype=torch.float16)
+
+            # Unbatch and append
+            for j in range(inp_cpu.shape[0]):
+                shard_inputs.append(inp_cpu[j])
+                shard_attn.append(attn_cpu[j])
+                shard_topk_idx.append(tk_idx_cpu[j])
+                shard_topk_logits.append(tk_val_cpu[j])
+
+        if device_rand_idx:
+            for r_idx, r_val in zip(device_rand_idx, device_rand_vals):
+                r_idx_cpu = r_idx.detach().to("cpu", dtype=torch.int32)
+                r_val_cpu = r_val.detach().to("cpu", dtype=torch.float16)
+                for j in range(r_idx_cpu.shape[0]):
+                    shard_rand_idx.append(r_idx_cpu[j])
+                    shard_rand_logits.append(r_val_cpu[j])
+
+        device_inputs.clear()
+        device_topk_idx.clear()
+        device_topk_vals.clear()
+        device_rand_idx.clear()
+        device_rand_vals.clear()
+
     try:
         with grad_context:
             for block in packed:
@@ -603,21 +680,22 @@ def main():
 
                 # [B, L]
                 input_ids = torch.tensor(batch, dtype=torch.long, device=device)
-                attn = torch.ones_like(input_ids, dtype=torch.long, device=device)
 
                 # Teacher forward (full vocab logits; we do this only ONCE in cache build)
-                out_obj = teacher(input_ids=input_ids, attention_mask=attn, use_cache=False, return_dict=True)
+                out_obj = teacher(input_ids=input_ids, use_cache=False, return_dict=True)
                 logits = out_obj.logits  # [B, L, V]
                 logits = logits[:, :-1, :]  # [B, L-1, V]
 
                 # Extract top-k
                 topk_vals, topk_idx = torch.topk(logits, k=args.topk, dim=-1)
 
-                rand_idx = None
-                rand_vals = None
+                # Accumulate on device (no CPU transfer yet!)
+                device_inputs.append(input_ids)
+                device_topk_idx.append(topk_idx)
+                device_topk_vals.append(topk_vals)
+
                 if args.rand_neg and args.rand_neg > 0:
                     V = logits.shape[-1]
-                    # Random token ids per position (uniform). Duplicates are extremely unlikely at typical vocab sizes.
                     rand_idx = torch.randint(
                         low=0,
                         high=V,
@@ -626,53 +704,38 @@ def main():
                         dtype=torch.long,
                     )
                     rand_vals = logits.gather(dim=-1, index=rand_idx)
+                    device_rand_idx.append(rand_idx)
+                    device_rand_vals.append(rand_vals)
 
-                # TPU: sync before CPU transfer
-                if is_xla:
-                    import torch_xla.core.xla_model as xm
-                    xm.mark_step()
-
-                # Move to CPU + compact dtypes
-                input_ids_cpu = input_ids.detach().to("cpu", dtype=torch.int32)
-                attn_cpu = attn.detach().to("cpu", dtype=torch.uint8)
-                topk_idx_cpu = topk_idx.detach().to("cpu", dtype=torch.int32)
-                topk_vals_cpu = topk_vals.detach().to("cpu", dtype=torch.float16)
-
-                rand_idx_cpu = None
-                rand_vals_cpu = None
-                if rand_idx is not None:
-                    rand_idx_cpu = rand_idx.detach().to("cpu", dtype=torch.int32)
-                    rand_vals_cpu = rand_vals.detach().to("cpu", dtype=torch.float16)
-
-                # Append each sequence in batch to shard buffers
-                bsz = input_ids_cpu.shape[0]
-                for i in range(bsz):
-                    shard_inputs.append(input_ids_cpu[i])
-                    shard_attn.append(attn_cpu[i])
-                    shard_topk_idx.append(topk_idx_cpu[i])
-                    shard_topk_logits.append(topk_vals_cpu[i])
-                    if rand_idx_cpu is not None:
-                        shard_rand_idx.append(rand_idx_cpu[i])
-                        shard_rand_logits.append(rand_vals_cpu[i])
-
-                n_written += bsz
+                n_written += len(batch)
                 batch.clear()
 
-                # TPU: sync only when shard is ready (not every batch - too slow!)
-                if len(shard_inputs) >= args.shard_size:
-                    flush_shard(shard_id)
+                # Check if we have enough for a shard (count accumulated sequences)
+                accumulated_seqs = sum(t.shape[0] for t in device_inputs)
+                if accumulated_seqs >= args.shard_size:
+                    # Bulk transfer to CPU
+                    transfer_device_to_cpu()
+                    # Write shard asynchronously
+                    flush_shard(shard_id, async_write=is_xla)
                     shard_id += 1
 
                 if n_written >= args.num_sequences:
                     break
     except KeyboardInterrupt:
-        # Save whatever we've accumulated so far, then exit cleanly.
+        # Transfer any remaining and save
+        transfer_device_to_cpu()
         flush_shard(shard_id)
         print(f"[interrupt] stopping early; cached sequences={n_written} | out_dir={out}")
         raise
 
-    # Flush remainder
+    # Transfer and flush remainder
+    transfer_device_to_cpu()
     flush_shard(shard_id)
+
+    # Wait for any pending async write
+    if pending_write is not None:
+        pending_write.result()
+    write_executor.shutdown(wait=True)
     with open(progress_path, "w") as f:
         json.dump({"n_written": int(n_written), "next_shard_id": int(shard_id) + 1, "done": True}, f, indent=2)
 
