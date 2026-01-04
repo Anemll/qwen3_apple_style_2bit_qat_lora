@@ -52,9 +52,26 @@ class MPConfig:
     param_dtype: str = "auto"
 
 
+def _is_tpu_available() -> bool:
+    """Check if TPU is available via torch_xla."""
+    try:
+        import torch_xla
+        import torch_xla.core.xla_model as xm
+        _ = xm.xla_device()
+        return True
+    except Exception:
+        return False
+
+
+def _get_tpu_device():
+    """Get TPU device via torch_xla."""
+    import torch_xla
+    return torch_xla.device()
+
+
 def pick_device(device_str: str = "auto") -> torch.device:
     """
-    device_str: "auto" | "cuda" | "mps" | "cpu"
+    device_str: "auto" | "cuda" | "mps" | "cpu" | "tpu" | "xla"
     """
     device_str = device_str.lower()
     if device_str == "cuda":
@@ -65,11 +82,18 @@ def pick_device(device_str: str = "auto") -> torch.device:
         if not torch.backends.mps.is_available():
             raise RuntimeError("Requested --device mps but torch.backends.mps.is_available() is False.")
         return torch.device("mps")
+    if device_str in ("tpu", "xla"):
+        if not _is_tpu_available():
+            raise RuntimeError("Requested --device tpu/xla but torch_xla is not available.")
+        return _get_tpu_device()
     if device_str == "cpu":
         return torch.device("cpu")
     if device_str == "auto":
+        # Priority: CUDA > TPU > MPS > CPU
         if torch.cuda.is_available():
             return torch.device("cuda")
+        if _is_tpu_available():
+            return _get_tpu_device()
         if torch.backends.mps.is_available():
             return torch.device("mps")
         return torch.device("cpu")
@@ -96,12 +120,16 @@ def resolve_param_dtype(requested: str, device: torch.device) -> torch.dtype:
     if requested == "bf16":
         return torch.bfloat16
     if requested == "auto":
+        device_type = str(device).split(":")[0]  # Handle "xla:0" -> "xla"
         # CUDA: prefer bf16 if available, else fp16
-        if device.type == "cuda":
+        if device_type == "cuda":
             # On most modern NVIDIA GPUs, bf16 is available. We'll just pick bf16.
             return torch.bfloat16
+        # TPU/XLA: bf16 is native and preferred
+        if device_type == "xla":
+            return torch.bfloat16
         # MPS: prefer fp16 (more widely supported) unless bf16 is allocatable
-        if device.type == "mps":
+        if device_type == "mps":
             return torch.bfloat16 if _can_alloc(device, torch.bfloat16) else torch.float16
         # CPU: bf16 is generally okay on recent CPUs, but may be slow. Still a reasonable default.
         return torch.bfloat16

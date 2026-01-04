@@ -341,7 +341,7 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--shard_size", type=int, default=1024, help="How many sequences per shard_*.pt.")
 
-    p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "mps", "cpu"])
+    p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "mps", "cpu", "tpu", "xla"])
     p.add_argument("--dtype", type=str, default="auto", choices=["auto", "fp32", "bf16", "fp16"])
 
     p.add_argument("--output_dir", type=str, required=True)
@@ -598,6 +598,11 @@ def main():
 
                 n_written += bsz
                 batch.clear()
+
+                # TPU: sync after each batch
+                if str(device).startswith("xla"):
+                    import torch_xla.core.xla_model as xm
+                    xm.mark_step()
 
                 if len(shard_inputs) >= args.shard_size:
                     flush_shard(shard_id)
