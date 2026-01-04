@@ -715,8 +715,9 @@ def main():
 
     # For TPU: accumulate on device, sync periodically (not every batch, but not full shard)
     # Too many batches = OOM on transfer; too few = slow from frequent syncs
-    # Sweet spot: ~4 batches (~512 seqs with batch=128)
-    MAX_DEVICE_BATCHES = 4  # Transfer to CPU after this many batches
+    # With rand_neg=1024 + large batch, memory spikes during XLA graph materialization
+    # Use 1 for safety with large batches, can increase if batch_size is small
+    MAX_DEVICE_BATCHES = 1  # Transfer to CPU after this many batches
     device_inputs: List[torch.Tensor] = []
     device_topk_idx: List[torch.Tensor] = []
     device_topk_vals: List[torch.Tensor] = []
