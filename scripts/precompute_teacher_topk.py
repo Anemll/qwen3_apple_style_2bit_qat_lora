@@ -715,9 +715,8 @@ def main():
 
     # For TPU: accumulate on device, sync periodically (not every batch, but not full shard)
     # Too many batches = OOM on transfer; too few = slow from frequent syncs
-    # With rand_neg=1024 + large batch, memory spikes during XLA graph materialization
-    # Use 1 for safety with large batches, can increase if batch_size is small
-    MAX_DEVICE_BATCHES = 1  # Transfer to CPU after this many batches
+    # Now that we delete logits immediately, we can accumulate more
+    MAX_DEVICE_BATCHES = 2  # Transfer to CPU after this many batches
     device_inputs: List[torch.Tensor] = []
     device_topk_idx: List[torch.Tensor] = []
     device_topk_vals: List[torch.Tensor] = []
@@ -799,6 +798,10 @@ def main():
                     rand_vals = logits.gather(dim=-1, index=rand_idx)
                     device_rand_idx.append(rand_idx)
                     device_rand_vals.append(rand_vals)
+
+                # Free the huge logits tensor (~5GB for batch=128) to reduce memory during sync
+                del out_obj
+                del logits
 
                 n_written += len(batch)
                 batch.clear()
