@@ -1556,7 +1556,12 @@ def train_e2e(
     # Initialize gradients before training loop
     optimizer.zero_grad(set_to_none=True)
 
-    while step < max_steps:
+    # With accumulation, we need max_steps * accumulation_steps micro-batches
+    # to achieve max_steps optimizer steps
+    total_micro_steps = max_steps * accumulation_steps
+    optimizer_step = 0  # Track optimizer steps for display
+
+    while step < total_micro_steps:
         # Just create new iterator each epoch (data already in RAM)
         # drop_last=True for TPU to avoid shape changes on last batch
         dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn,
@@ -1568,7 +1573,7 @@ def train_e2e(
         #     dataloader = pl.MpDeviceLoader(dataloader, device, batches_per_execution=4)
 
         for batch in dataloader:
-            if step >= max_steps:
+            if step >= total_micro_steps:
                 break
 
             # Get seq_len from first batch and print estimated total tokens
@@ -1644,6 +1649,7 @@ def train_e2e(
                 if scheduler is not None:
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)  # set_to_none more efficient
+                optimizer_step += 1  # Track for display
 
             # TPU: mark_step to execute graph (required for progress)
             if is_tpu and xm is not None:
@@ -1655,11 +1661,13 @@ def train_e2e(
             total_loss += loss_val
             step += 1
 
-            # Logging
-            if step % logging_steps == 0:
-                avg_loss = total_loss / logging_steps
+            # Logging - every logging_steps optimizer steps
+            # With accumulation, log when optimizer_step is a multiple of logging_steps
+            log_interval = logging_steps * accumulation_steps  # micro-batches between logs
+            if step % log_interval == 0 and step > 0:
+                avg_loss = total_loss / log_interval
                 elapsed = time.time() - t_start
-                eta = elapsed / step * (max_steps - step) if step > 0 else 0
+                eta = elapsed / optimizer_step * (max_steps - optimizer_step) if optimizer_step > 0 else 0
                 # Format time as M:SS or H:MM:SS
                 def fmt_time(s):
                     if s < 3600:
@@ -1667,23 +1675,23 @@ def train_e2e(
                     return f"{int(s)//3600}:{(int(s)%3600)//60:02d}:{int(s)%60:02d}"
                 # Get current LR
                 current_lr = scheduler.get_last_lr()[0] if scheduler is not None else lr
-                # Calculate throughput
+                # Calculate throughput (micro-batches per sec * tokens per micro-batch)
                 it_per_sec = step / elapsed if elapsed > 0 else 0
                 tok_per_sec = it_per_sec * batch_size * (seq_len or 0)
                 throughput_str = f"{tok_per_sec/1000:.1f}k tok/s" if seq_len else f"{it_per_sec:.2f} it/s"
-                # Print if verbose
+                # Print if verbose (show optimizer_step / max_steps)
                 if verbose:
                     if scheduler is not None:
-                        print(f"[{step}/{max_steps}] loss={avg_loss:.4f} lr={current_lr:.2e} ({fmt_time(elapsed)}, ETA {fmt_time(eta)}, {throughput_str})")
+                        print(f"[{optimizer_step}/{max_steps}] loss={avg_loss:.4f} lr={current_lr:.2e} ({fmt_time(elapsed)}, ETA {fmt_time(eta)}, {throughput_str})")
                     else:
-                        print(f"[{step}/{max_steps}] loss={avg_loss:.4f} ({fmt_time(elapsed)}, ETA {fmt_time(eta)}, {throughput_str})")
+                        print(f"[{optimizer_step}/{max_steps}] loss={avg_loss:.4f} ({fmt_time(elapsed)}, ETA {fmt_time(eta)}, {throughput_str})")
                 # Write to CSV
                 if csv_writer is not None:
                     csv_writer.writerow([step, f'{avg_loss:.6f}', '', f'{current_lr:.2e}', f'{elapsed:.1f}'])
                     csv_file.flush()
 
                 # TPU: Print metrics report at first logging step (debug recompilation)
-                if is_tpu and step == logging_steps and verbose:
+                if is_tpu and step == log_interval and verbose:
                     try:
                         import torch_xla.debug.metrics as met
                         print("\n[TPU METRICS] (look for 'CompileTime' frequency)")
@@ -1698,20 +1706,20 @@ def train_e2e(
                 # Log to wandb
                 if use_wandb and wandb_run is not None:
                     import wandb
-                    # Calculate tokens/sec
+                    # Calculate tokens/sec (tokens processed since last log)
                     log_elapsed = time.time() - last_log_time
-                    tokens_per_sec = (batch_size * seq_len * logging_steps) / max(log_elapsed, 0.001)
+                    tokens_per_sec = (batch_size * seq_len * log_interval) / max(log_elapsed, 0.001)
                     log_dict = {
                         'train/loss': avg_loss,
                         'train/lr': current_lr,
-                        'train/step': step,
+                        'train/step': optimizer_step,
                         'train/elapsed_sec': elapsed,
                         'train/tokens_per_sec': tokens_per_sec,
                     }
                     # Add best_loss when tracking by training loss (eval disabled)
                     if eval_samples <= 0:
                         log_dict['train/best_loss'] = best_loss
-                    wandb.log(log_dict, step=step)
+                    wandb.log(log_dict, step=optimizer_step)
                 last_log_time = time.time()
                 loss_history.append(avg_loss)
                 total_loss = 0.0
@@ -1728,7 +1736,9 @@ def train_e2e(
                             print(f"  [Saved best (train): {best_loss:.4f}]")
 
             # Evaluation (skip if eval_samples <= 0, e.g., on TPU)
-            if step % eval_steps == 0 and eval_samples > 0:
+            # Check every eval_steps optimizer steps
+            eval_interval = eval_steps * accumulation_steps
+            if step % eval_interval == 0 and step > 0 and eval_samples > 0:
                 model.eval()
                 eval_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=eval_samples, temperature=temperature)
                 elapsed = time.time() - t_start
@@ -1737,7 +1747,7 @@ def train_e2e(
                     print(f"  [Eval] KD Loss: {eval_loss:.4f} (best: {best_loss:.4f})")
                 # Write eval to CSV
                 if csv_writer is not None:
-                    csv_writer.writerow([step, '', f'{eval_loss:.6f}', f'{current_lr:.2e}', f'{elapsed:.1f}'])
+                    csv_writer.writerow([optimizer_step, '', f'{eval_loss:.6f}', f'{current_lr:.2e}', f'{elapsed:.1f}'])
                     csv_file.flush()
                 # Log to wandb
                 if use_wandb and wandb_run is not None:
@@ -1745,7 +1755,7 @@ def train_e2e(
                     wandb.log({
                         'eval/loss': eval_loss,
                         'eval/best_loss': best_loss,
-                    }, step=step)
+                    }, step=optimizer_step)
                 if eval_loss < best_loss:
                     best_loss = eval_loss
                     # Save best state in memory
@@ -1757,10 +1767,11 @@ def train_e2e(
                             print(f"  [Saved best checkpoint: {best_loss:.4f}]")
                 model.train()
 
-            # Periodic checkpoint saving
-            if save_steps > 0 and save_dir and step % save_steps == 0:
+            # Periodic checkpoint saving (every save_steps optimizer steps)
+            save_interval = save_steps * accumulation_steps if save_steps > 0 else 0
+            if save_interval > 0 and save_dir and step % save_interval == 0 and step > 0:
                 os.makedirs(save_dir, exist_ok=True)
-                ckpt_path = os.path.join(save_dir, f"checkpoint_step{step}.pt")
+                ckpt_path = os.path.join(save_dir, f"checkpoint_step{optimizer_step}.pt")
                 torch.save(model.state_dict(), ckpt_path)
                 if verbose:
                     print(f"  [Checkpoint saved: {ckpt_path}]")
