@@ -1574,7 +1574,7 @@ def train_e2e(
             # Get seq_len from first batch and print estimated total tokens
             if seq_len is None and 'input_ids' in batch:
                 seq_len = batch['input_ids'].shape[1]
-                total_tokens_est = batch_size * seq_len * max_steps
+                total_tokens_est = batch_size * seq_len * max_steps * accumulation_steps
                 if total_tokens_est >= 1e9:
                     tok_str = f"{total_tokens_est/1e9:.2f}B"
                 elif total_tokens_est >= 1e6:
@@ -1582,7 +1582,7 @@ def train_e2e(
                 else:
                     tok_str = f"{total_tokens_est/1e3:.0f}K"
                 if verbose:
-                    print(f"Estimated total tokens: {tok_str} (batch={batch_size}, seq={seq_len}, steps={max_steps})")
+                    print(f"Estimated total tokens: {tok_str} (batch={batch_size}x{accumulation_steps}, seq={seq_len}, steps={max_steps})")
 
                 # TPU debug: ALWAYS print dtypes on first step
                 if 'xla' in str(device).lower():
