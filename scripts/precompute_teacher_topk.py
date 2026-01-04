@@ -395,6 +395,12 @@ def parse_args():
     )
 
     p.add_argument("--seed", type=int, default=0)
+
+    # Wandb logging
+    p.add_argument("--wandb_project", type=str, default=None, help="Wandb project name. If set, enables wandb logging.")
+    p.add_argument("--wandb_run_name", type=str, default=None, help="Wandb run name.")
+    p.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity/team name.")
+
     return p.parse_args()
 
 
@@ -436,6 +442,35 @@ def main():
         param_dtype = _resolve_dtype_fallback(args.dtype, device)
 
     print(f"[device] {device} | dtype={param_dtype}")
+
+    # Initialize wandb if requested
+    use_wandb = args.wandb_project is not None
+    if use_wandb:
+        try:
+            import wandb
+            wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name or f"cache_{args.dataset_name.split('/')[-1]}",
+                entity=args.wandb_entity,
+                config={
+                    "teacher_model": args.teacher_model_name_or_path,
+                    "dataset_name": args.dataset_name,
+                    "dataset_format": args.dataset_format,
+                    "enable_thinking": args.enable_thinking,
+                    "max_length": args.max_length,
+                    "topk": args.topk,
+                    "rand_neg": args.rand_neg,
+                    "num_sequences": args.num_sequences,
+                    "batch_size": args.batch_size,
+                    "shard_size": args.shard_size,
+                    "device": str(device),
+                    "dtype": str(param_dtype),
+                },
+            )
+            print(f"[wandb] initialized: {wandb.run.name}")
+        except ImportError:
+            print("[warn] wandb not installed, skipping logging")
+            use_wandb = False
 
     hf_kwargs = _hf_common_kwargs(args)
     try:
@@ -538,13 +573,44 @@ def main():
     write_executor = ThreadPoolExecutor(max_workers=1)
     pending_write = None
 
-    def _write_shard_sync(shard_path, obj, shard_id, n_seqs, start_time, total_shards, n_written_snapshot):
+    # Helper to get device memory stats
+    def get_memory_stats():
+        """Get memory stats for current device."""
+        stats = {}
+        device_type = str(device).split(":")[0]
+        try:
+            if device_type == "xla":
+                import torch_xla.core.xla_model as xm
+                # TPU memory info (if available)
+                try:
+                    mem_info = xm.get_memory_info(device)
+                    if mem_info:
+                        stats["tpu_memory_used_gb"] = mem_info.get("bytes_used", 0) / 1e9
+                        stats["tpu_memory_limit_gb"] = mem_info.get("bytes_limit", 0) / 1e9
+                        if mem_info.get("bytes_limit", 0) > 0:
+                            stats["tpu_memory_pct"] = 100 * mem_info.get("bytes_used", 0) / mem_info.get("bytes_limit", 1)
+                except Exception:
+                    pass
+            elif device_type == "cuda":
+                stats["gpu_memory_allocated_gb"] = torch.cuda.memory_allocated(device) / 1e9
+                stats["gpu_memory_reserved_gb"] = torch.cuda.memory_reserved(device) / 1e9
+                stats["gpu_memory_max_gb"] = torch.cuda.max_memory_allocated(device) / 1e9
+            elif device_type == "mps":
+                stats["mps_memory_allocated_gb"] = torch.mps.current_allocated_memory() / 1e9
+        except Exception:
+            pass
+        return stats
+
+    def _write_shard_sync(shard_path, obj, shard_id, n_seqs, start_time, total_shards, n_written_snapshot, mem_stats=None):
         """Blocking shard write (runs in background thread)."""
         torch.save(obj, shard_path)
         # Calculate timing and ETA
         elapsed = time.time() - start_time
         elapsed_min = elapsed / 60
         shards_done = shard_id + 1
+        seqs_per_sec = n_written_snapshot / elapsed if elapsed > 0 else 0
+        tokens_per_sec = seqs_per_sec * args.max_length
+
         if shards_done > 0:
             secs_per_shard = elapsed / shards_done
             remaining_shards = total_shards - shards_done
@@ -552,6 +618,27 @@ def main():
             print(f"[write] {shard_path.name} | N={n_seqs} | {elapsed_min:.1f}min elapsed | ETA: {eta_min:.1f}min ({shards_done}/{total_shards})")
         else:
             print(f"[write] {shard_path.name} | N={n_seqs}")
+
+        # Log to wandb
+        if use_wandb:
+            try:
+                import wandb
+                log_data = {
+                    "shard_id": shard_id,
+                    "sequences_written": n_written_snapshot,
+                    "progress_pct": 100 * n_written_snapshot / args.num_sequences,
+                    "elapsed_min": elapsed_min,
+                    "eta_min": eta_min if shards_done > 0 else 0,
+                    "seqs_per_sec": seqs_per_sec,
+                    "tokens_per_sec": tokens_per_sec,
+                    "secs_per_shard": secs_per_shard if shards_done > 0 else 0,
+                }
+                if mem_stats:
+                    log_data.update(mem_stats)
+                wandb.log(log_data)
+            except Exception:
+                pass
+
         with open(progress_path, "w") as f:
             json.dump({"n_written": int(n_written_snapshot), "next_shard_id": int(shard_id) + 1}, f, indent=2)
 
@@ -584,15 +671,18 @@ def main():
         n_seqs = input_ids.shape[0]
         n_written_snapshot = n_written
 
+        # Get memory stats before async write
+        mem_stats = get_memory_stats()
+
         if async_write:
             # Submit to background thread
             pending_write = write_executor.submit(
                 _write_shard_sync, shard_path, obj, shard_id, n_seqs,
-                start_time, total_shards, n_written_snapshot
+                start_time, total_shards, n_written_snapshot, mem_stats
             )
         else:
             # Synchronous write
-            _write_shard_sync(shard_path, obj, shard_id, n_seqs, start_time, total_shards, n_written_snapshot)
+            _write_shard_sync(shard_path, obj, shard_id, n_seqs, start_time, total_shards, n_written_snapshot, mem_stats)
 
         shard_inputs.clear()
         shard_attn.clear()
@@ -726,6 +816,12 @@ def main():
         transfer_device_to_cpu()
         flush_shard(shard_id)
         print(f"[interrupt] stopping early; cached sequences={n_written} | out_dir={out}")
+        if use_wandb:
+            try:
+                import wandb
+                wandb.finish(exit_code=130)
+            except Exception:
+                pass
         raise
 
     # Transfer and flush remainder
@@ -740,6 +836,14 @@ def main():
         json.dump({"n_written": int(n_written), "next_shard_id": int(shard_id) + 1, "done": True}, f, indent=2)
 
     print(f"Done. Cached sequences={n_written} | out_dir={out}")
+
+    # Finish wandb run
+    if use_wandb:
+        try:
+            import wandb
+            wandb.finish()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
