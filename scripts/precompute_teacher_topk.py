@@ -715,8 +715,8 @@ def main():
 
     # For TPU: accumulate on device, sync periodically (not every batch, but not full shard)
     # Too many batches = OOM on transfer; too few = slow from frequent syncs
-    # Now that we delete logits immediately, we can accumulate more
-    MAX_DEVICE_BATCHES = 4  # Transfer to CPU after this many batches (2 syncs per shard)
+    # Now that we delete logits immediately, we can accumulate full shard
+    MAX_DEVICE_BATCHES = 8  # Transfer to CPU after this many batches (1 sync per shard)
     device_inputs: List[torch.Tensor] = []
     device_topk_idx: List[torch.Tensor] = []
     device_topk_vals: List[torch.Tensor] = []
