@@ -1748,6 +1748,18 @@ def train_e2e(
                     # Add best_loss when tracking by training loss (eval disabled)
                     if eval_samples <= 0:
                         log_dict['train/best_loss'] = best_loss
+                    # Add TPU memory stats if available
+                    if is_tpu and xm is not None:
+                        try:
+                            mem = xm.get_memory_info(device)
+                            if "kb_total" in mem:
+                                log_dict['tpu/memory_used_gb'] = (mem["kb_total"] - mem.get("kb_free", 0)) / 1024 / 1024
+                                log_dict['tpu/memory_total_gb'] = mem["kb_total"] / 1024 / 1024
+                            elif "bytes_used" in mem:
+                                log_dict['tpu/memory_used_gb'] = mem["bytes_used"] / 1e9
+                                log_dict['tpu/memory_total_gb'] = mem.get("bytes_limit", 0) / 1e9
+                        except Exception:
+                            pass
                     wandb.log(log_dict, step=optimizer_step)
                 last_log_time = time.time()
                 loss_history.append(avg_loss)
