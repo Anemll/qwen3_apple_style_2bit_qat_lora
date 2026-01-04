@@ -576,8 +576,13 @@ def main():
     # Build a small batcher from packed iterator
     batch: List[List[int]] = []
 
+    # Use no_grad() for TPU/XLA (inference_mode() causes "version_counter" error)
+    # Use inference_mode() for other devices (more efficient)
+    is_xla = str(device).startswith("xla")
+    grad_context = torch.no_grad() if is_xla else torch.inference_mode()
+
     try:
-        with torch.inference_mode():
+        with grad_context:
             for block in packed:
                 batch.append(block)
                 if len(batch) < args.batch_size:
