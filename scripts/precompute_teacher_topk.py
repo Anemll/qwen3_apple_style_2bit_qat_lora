@@ -713,8 +713,10 @@ def main():
     is_xla = str(device).startswith("xla")
     grad_context = torch.no_grad() if is_xla else torch.inference_mode()
 
-    # For TPU: accumulate on device, only sync at shard boundary
-    # This reduces the number of TPU<->CPU syncs dramatically
+    # For TPU: accumulate on device, sync periodically (not every batch, but not full shard)
+    # Too many batches = OOM on transfer; too few = slow from frequent syncs
+    # Sweet spot: ~4 batches (~512 seqs with batch=128)
+    MAX_DEVICE_BATCHES = 4  # Transfer to CPU after this many batches
     device_inputs: List[torch.Tensor] = []
     device_topk_idx: List[torch.Tensor] = []
     device_topk_vals: List[torch.Tensor] = []
@@ -800,11 +802,12 @@ def main():
                 n_written += len(batch)
                 batch.clear()
 
-                # Check if we have enough for a shard (count accumulated sequences)
-                accumulated_seqs = sum(t.shape[0] for t in device_inputs)
-                if accumulated_seqs >= args.shard_size:
-                    # Bulk transfer to CPU
+                # Transfer to CPU periodically to avoid OOM (every MAX_DEVICE_BATCHES)
+                if len(device_inputs) >= MAX_DEVICE_BATCHES:
                     transfer_device_to_cpu()
+
+                # Check if we have enough for a shard (count accumulated sequences on CPU)
+                if len(shard_inputs) >= args.shard_size:
                     # Write shard asynchronously
                     flush_shard(shard_id, async_write=is_xla)
                     shard_id += 1
