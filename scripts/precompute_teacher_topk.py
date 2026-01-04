@@ -183,9 +183,45 @@ def _resolve_dtype_fallback(dtype: str, device: str) -> torch.dtype:
 
 
 def _chat_text_variants(tokenizer, messages: List[dict], thinking_mode: str) -> Iterator[str]:
+    """
+    Generate text variants from chat messages.
+
+    Modes:
+    - "true": with thinking tags
+    - "false": without thinking tags
+    - "both": mix of true and false
+    - "none": raw text without chat template (just concatenate content)
+    - "all": all three variants (true, false, none)
+    """
     mode = (thinking_mode or "false").lower()
-    if mode not in ("false", "true", "both"):
+    if mode not in ("false", "true", "both", "none", "all"):
         raise ValueError(f"Unknown thinking mode: {thinking_mode}")
+
+    # "none" mode: raw text without chat template
+    if mode == "none":
+        # Just concatenate message contents
+        raw_text = "\n\n".join(m.get("content", "") for m in messages if m.get("content"))
+        if raw_text.strip():
+            yield raw_text
+        return
+
+    # "all" mode: true, false, and none variants
+    if mode == "all":
+        # Thinking enabled
+        yield tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False, enable_thinking=True
+        )
+        # Thinking disabled
+        yield tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False, enable_thinking=False
+        )
+        # Raw text (no template)
+        raw_text = "\n\n".join(m.get("content", "") for m in messages if m.get("content"))
+        if raw_text.strip():
+            yield raw_text
+        return
+
+    # Standard modes: true, false, both
     flags = [False, True] if mode == "both" else [mode == "true"]
     for enable in flags:
         yield tokenizer.apply_chat_template(
@@ -329,8 +365,8 @@ def parse_args():
         "--enable_thinking",
         type=str,
         default="false",
-        choices=["false", "true", "both"],
-        help="When dataset_format uses chat templates, control whether thinking is disabled, enabled, or both per sample.",
+        choices=["false", "true", "both", "none", "all"],
+        help="Chat template mode: false=no thinking, true=thinking, both=mix, none=raw text (no template), all=all 3 variants.",
     )
 
     p.add_argument("--max_length", type=int, default=64)
