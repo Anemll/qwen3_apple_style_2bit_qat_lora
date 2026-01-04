@@ -1561,6 +1561,11 @@ def train_e2e(
     total_micro_steps = max_steps * accumulation_steps
     optimizer_step = 0  # Track optimizer steps for display
 
+    # For smoothed ETA: track (optimizer_step, time) pairs from last N logs
+    # This avoids XLA compile time skewing the ETA
+    from collections import deque
+    eta_history = deque(maxlen=5)  # Keep last 5 log points for smoothing
+
     while step < total_micro_steps:
         # Just create new iterator each epoch (data already in RAM)
         # drop_last=True for TPU to avoid shape changes on last batch
@@ -1667,7 +1672,25 @@ def train_e2e(
             if step % log_interval == 0 and step > 0:
                 avg_loss = total_loss / log_interval
                 elapsed = time.time() - t_start
-                eta = elapsed / optimizer_step * (max_steps - optimizer_step) if optimizer_step > 0 else 0
+                current_time = time.time()
+
+                # Smoothed ETA: use recent history to avoid XLA compile time skew
+                eta_history.append((optimizer_step, current_time))
+                if len(eta_history) >= 2:
+                    # Use oldest point in history for rate calculation
+                    old_step, old_time = eta_history[0]
+                    steps_done = optimizer_step - old_step
+                    time_taken = current_time - old_time
+                    if steps_done > 0 and time_taken > 0:
+                        sec_per_step = time_taken / steps_done
+                        remaining_steps = max_steps - optimizer_step
+                        eta = sec_per_step * remaining_steps
+                    else:
+                        eta = 0
+                else:
+                    # Fallback to simple calculation for first log
+                    eta = elapsed / optimizer_step * (max_steps - optimizer_step) if optimizer_step > 0 else 0
+
                 # Format time as M:SS or H:MM:SS
                 def fmt_time(s):
                     if s < 3600:
@@ -1675,8 +1698,14 @@ def train_e2e(
                     return f"{int(s)//3600}:{(int(s)%3600)//60:02d}:{int(s)%60:02d}"
                 # Get current LR
                 current_lr = scheduler.get_last_lr()[0] if scheduler is not None else lr
-                # Calculate throughput (micro-batches per sec * tokens per micro-batch)
-                it_per_sec = step / elapsed if elapsed > 0 else 0
+                # Calculate throughput using recent window (more accurate after warmup)
+                if len(eta_history) >= 2:
+                    old_step, old_time = eta_history[0]
+                    recent_elapsed = current_time - old_time
+                    recent_micro_steps = step - (old_step * accumulation_steps)
+                    it_per_sec = recent_micro_steps / recent_elapsed if recent_elapsed > 0 else 0
+                else:
+                    it_per_sec = step / elapsed if elapsed > 0 else 0
                 tok_per_sec = it_per_sec * batch_size * (seq_len or 0)
                 throughput_str = f"{tok_per_sec/1000:.1f}k tok/s" if seq_len else f"{it_per_sec:.2f} it/s"
                 # Print if verbose (show optimizer_step / max_steps)
