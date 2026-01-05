@@ -569,6 +569,8 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
 
                 # Logging
                 if optimizer_step % 20 == 0:
+                    # Sync before reading loss to ensure XLA graph is evaluated
+                    torch_xla.sync()
                     loss_val = loss.item() * args.accumulation_steps
                     elapsed = time.time() - t_start
                     eta = elapsed / optimizer_step * (args.max_steps - optimizer_step) if optimizer_step > 0 else 0
@@ -603,8 +605,8 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
             torch_xla.sync()
             sync_time = time.time() - t_sync_start
 
-            # Log XLA metrics for first 12 steps (covers 3 optimizer steps with accum=4)
-            if step <= 12 and is_master:
+            # Log XLA metrics for first 12 steps OR when sync is slow (>10s = likely recompile)
+            if is_master and (step <= 12 or sync_time > 10.0):
                 try:
                     compile_data = met.metric_data('CompileTime')
                     if compile_data:
