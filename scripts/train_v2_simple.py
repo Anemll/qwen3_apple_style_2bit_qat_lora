@@ -282,6 +282,14 @@ def main():
         if q_loaded > 0:
             print(f"  Manually loaded {q_loaded} _Q buffers")
 
+        # Freeze Q BEFORE moving to device (avoids XLA compilations on TPU)
+        # Skip if checkpoint already has _Q
+        has_Q = any(hasattr(m, '_Q') and m._Q is not None
+                    for m in v2_model.modules() if hasattr(m, '_Q'))
+        if not has_Q:
+            print("  (No _Q in checkpoint, running freeze_Q)")
+            freeze_Q_all(v2_model)
+
         t0 = time.time()
         print(f"  Moving to {device_type.upper()} ({args.dtype})...", end=" ", flush=True)
         v2_model.to(device=device, dtype=train_dtype)
@@ -328,6 +336,9 @@ def main():
             skip_init=args.fast_init,  # Skip SVD for faster init (worse initial loss)
         )
         print(f"done ({time.time()-t0:.1f}s)")
+
+        # Freeze Q BEFORE moving to device (avoids XLA compilations on TPU)
+        freeze_Q_all(v2_model)
 
         t0 = time.time()
         print(f"  Moving to {device_type.upper()} ({args.dtype})...", end=" ", flush=True)
@@ -434,6 +445,9 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+        # Freeze Q BEFORE moving to device (avoids XLA compilations on TPU)
+        freeze_Q_all(v2_model)
+
         print(f"  Moving to {device_type.upper()} ({args.dtype})...", end=" ", flush=True)
         v2_model.to(device=device, dtype=train_dtype)
         print("done")
@@ -460,22 +474,10 @@ def main():
             print("\n[!] Warning: Model does not support gradient_checkpointing_enable()")
 
     # =========================================================================
-    # STEP 3: Freeze Q and train
+    # STEP 3: Train (freeze_Q already done before moving to device)
     # =========================================================================
     print("\n[2/3] Training with STE-FP16..." if args.v2_checkpoint else "\n[3/4] Training with STE-FP16...")
-
-    # Skip freeze_Q if loading V2 checkpoint (Q already in saved state)
-    if args.v2_checkpoint:
-        # Check if _Q is already loaded from checkpoint
-        has_Q = any(hasattr(m, '_Q') and m._Q is not None
-                    for m in v2_model.modules() if hasattr(m, '_Q'))
-        if has_Q:
-            print("  (Using Q from checkpoint, skipping freeze_Q)")
-        else:
-            print("  (No Q in checkpoint, running freeze_Q)")
-            freeze_Q_all(v2_model)
-    else:
-        freeze_Q_all(v2_model)
+    # Note: freeze_Q_all is called BEFORE moving to device to avoid XLA compilations
     # train_e2e handles requires_grad based on train_scales, train_g_only, train_mlp_only
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
