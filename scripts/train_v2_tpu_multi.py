@@ -555,8 +555,6 @@ def main():
     if args.xla_cache_dir:
         os.makedirs(args.xla_cache_dir, exist_ok=True)
         os.environ['XLA_PERSISTENT_CACHE_PATH'] = args.xla_cache_dir
-        # Also set for libtpu if available
-        os.environ['LIBTPU_INIT_ARGS'] = os.environ.get('LIBTPU_INIT_ARGS', '') + f' --xla_tpu_enable_xla_runtime=true'
         print(f"[TPU Multi-chip] XLA cache: {args.xla_cache_dir}")
 
     # Launch with xmp.spawn - nprocs=None uses all available devices
