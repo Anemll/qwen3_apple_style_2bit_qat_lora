@@ -1055,6 +1055,8 @@ def replace_linear_with_anemll_v2(
     quantize_lm_head: bool = False,
     verbose: bool = True,
     skip_init: bool = False,
+    parallel_init: bool = True,
+    num_workers: int = 0,
 ) -> int:
     """Replace MLP and optionally attention linears with AnemllQATLinearV2.
 
@@ -1062,8 +1064,12 @@ def replace_linear_with_anemll_v2(
         skip_init: If True, skip SVD-based scale initialization (use when loading state_dict after).
                    This makes layer replacement ~10x faster for multi-GPU/TPU where only rank 0
                    needs to do the full initialization.
+        parallel_init: If True and skip_init=False, run SVD initialization in parallel.
+        num_workers: Number of parallel workers (0 = auto-detect CPU count).
     """
     import re
+    from concurrent.futures import ThreadPoolExecutor
+    import os
 
     mlp_pattern = re.compile(r'\.mlp\.(gate_proj|up_proj|down_proj)$')
     attn_pattern = re.compile(r'\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$')
@@ -1072,8 +1078,8 @@ def replace_linear_with_anemll_v2(
     if attn_config is None:
         attn_config = mlp_config
 
-    replacements = []
-
+    # First pass: collect layers to replace
+    layers_to_replace = []
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
             continue
@@ -1093,18 +1099,42 @@ def replace_linear_with_anemll_v2(
         else:
             continue
 
-        new_module = AnemllQATLinearV2.from_linear(module, config=cfg, skip_init=skip_init)
+        layers_to_replace.append((name, module, cfg))
 
+    # Parallel SVD initialization
+    if not skip_init and parallel_init and len(layers_to_replace) > 1:
+        workers = num_workers if num_workers > 0 else min(os.cpu_count() or 1, len(layers_to_replace))
+        if verbose:
+            print(f"  (parallel SVD init with {workers} workers)", flush=True)
+
+        def init_layer(args):
+            name, module, cfg = args
+            return name, AnemllQATLinearV2.from_linear(module, config=cfg, skip_init=False)
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            results = list(executor.map(init_layer, layers_to_replace))
+        new_modules = {name: mod for name, mod in results}
+    else:
+        # Sequential initialization
+        new_modules = {}
+        for name, module, cfg in layers_to_replace:
+            new_modules[name] = AnemllQATLinearV2.from_linear(module, config=cfg, skip_init=skip_init)
+
+    # Build replacement list with parent references
+    replacements = []
+    named_modules_dict = dict(model.named_modules())
+    for name, module, cfg in layers_to_replace:
+        new_module = new_modules[name]
         parts = name.rsplit('.', 1)
         if len(parts) == 2:
             parent_name, attr = parts
-            parent = dict(model.named_modules())[parent_name]
+            parent = named_modules_dict[parent_name]
         else:
             parent = model
             attr = name
-
         replacements.append((parent, attr, new_module, name))
 
+    # Apply replacements
     for parent, attr, new_module, name in replacements:
         setattr(parent, attr, new_module)
         if verbose:
