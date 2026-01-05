@@ -166,6 +166,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
 
     log(f"\n[TPU Multi-chip] Starting training on {world_size} chips")
     log(f"  Rank {rank}: device={device}")
+    log(f"  Precision: BF16 (TPU native)")
     checkpoint("Worker init complete")
 
     # Config presets
