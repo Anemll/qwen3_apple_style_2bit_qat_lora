@@ -335,45 +335,76 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         from torch.optim.lr_scheduler import LambdaLR
         scheduler = LambdaLR(optimizer, lr_lambda)
 
-    # Dataset (each worker loads full dataset, DataLoader handles sharding)
-    log("\n[3/4] Loading dataset...")
+    # Dataset: streaming with file sharding across workers (no preload = less memory)
+    log("\n[3/4] Loading dataset (streaming mode)...")
 
-    # KDCacheDataset is IterableDataset, but for distributed training we need
-    # a map-style dataset. Use preload=True and wrap the cached examples.
-    from torch.utils.data import Dataset as MapDataset
+    from torch.utils.data import IterableDataset
+    from pathlib import Path
 
-    class KDMapDataset(MapDataset):
-        """Map-style wrapper for preloaded KDCacheDataset examples."""
-        def __init__(self, cache_dir):
-            # Load all examples using KDCacheDataset's preload
-            iterable_ds = KDCacheDataset(cache_dir, shuffle=False, preload=True)
-            self.examples = iterable_ds._cached_examples
-            log(f"  Loaded {len(self.examples)} examples for distributed training")
+    class ShardedKDDataset(IterableDataset):
+        """Streaming dataset that shards cache files across workers."""
+        def __init__(self, cache_dir, rank, world_size, shuffle=True):
+            self.cache_dir = Path(cache_dir)
+            self.all_files = sorted(self.cache_dir.glob('*.pt'))
+            # Shard files: rank 0 gets files [0, world_size, 2*world_size, ...]
+            self.files = [f for i, f in enumerate(self.all_files) if i % world_size == rank]
+            self.shuffle = shuffle
+            self.rank = rank
+            self.world_size = world_size
+
+        def _parse_shard(self, data):
+            """Parse shard into list of examples."""
+            ids = data['input_ids']
+            if ids.dim() == 1:
+                ids = ids.unsqueeze(0)
+            topk_idx = data['topk_idx']
+            if topk_idx.dim() == 2:
+                topk_idx = topk_idx.unsqueeze(0)
+            topk_logits = data['topk_logits']
+            if topk_logits.dim() == 2:
+                topk_logits = topk_logits.unsqueeze(0)
+            attn_mask = data.get('attention_mask')
+            if attn_mask is None:
+                attn_mask = torch.ones_like(ids)
+            elif attn_mask.dim() == 1:
+                attn_mask = attn_mask.unsqueeze(0)
+
+            examples = []
+            for i in range(ids.shape[0]):
+                examples.append({
+                    'input_ids': ids[i],
+                    'attention_mask': attn_mask[i],
+                    'topk_idx': topk_idx[i],
+                    'topk_logits': topk_logits[i],
+                })
+            return examples
+
+        def __iter__(self):
+            files = list(self.files)
+            if self.shuffle:
+                import random
+                random.shuffle(files)
+            for f in files:
+                data = torch.load(f, map_location='cpu', weights_only=True)
+                examples = self._parse_shard(data)
+                if self.shuffle:
+                    import random
+                    random.shuffle(examples)
+                for ex in examples:
+                    yield ex
 
         def __len__(self):
-            return len(self.examples)
+            # Approximate: assume equal distribution across files
+            return len(self.files) * 100  # Rough estimate
 
-        def __getitem__(self, idx):
-            return self.examples[idx]
+    dataset = ShardedKDDataset(args.cache_dir, rank, world_size, shuffle=True)
+    log(f"  Rank {rank}: streaming from {len(dataset.files)}/{len(dataset.all_files)} shard files")
+    checkpoint("Dataset created (streaming)")
 
-    dataset = KDMapDataset(args.cache_dir)
-    checkpoint(f"Dataset loaded, {len(dataset)} examples")
-
-    # Sampler for distributed training
-    from torch.utils.data.distributed import DistributedSampler
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True,
-        drop_last=True,
-    )
-    checkpoint("Sampler created")
-
+    # No sampler needed - sharding is built into dataset
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        sampler=sampler,
         collate_fn=collate_fn,
         drop_last=True,
     )
@@ -483,11 +514,11 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
 
     total_micro_steps = args.max_steps * args.accumulation_steps
     log(f"  Total micro-steps: {total_micro_steps}")
-    log(f"  Dataset size: {len(dataset)}, Dataloader batches: {len(dataloader)}")
+    log(f"  Streaming from {len(dataset.files)} shard files (rank {rank})")
 
     epoch = 0
     while step < total_micro_steps:
-        sampler.set_epoch(epoch)
+        # For streaming dataset, re-create iterator each epoch (shuffles files)
         epoch += 1
         log(f"  Starting epoch {epoch}...")
 
