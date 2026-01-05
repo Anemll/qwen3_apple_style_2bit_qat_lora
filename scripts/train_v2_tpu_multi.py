@@ -423,16 +423,23 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
 
             # Heartbeat for steps 4-8 (post-optimizer debugging)
             if 4 <= step <= 8 and is_master:
-                print(f"  [heartbeat] step={step} starting forward...", flush=True)
+                # Extra sync before forward to isolate any pending work
+                print(f"  [heartbeat] step={step} pre-forward sync...", flush=True)
+                t_presync = time.time()
+                torch_xla.sync()
+                print(f"  [heartbeat] step={step} pre-forward sync done ({time.time()-t_presync:.1f}s), starting forward...", flush=True)
 
             # Forward pass (no autocast needed on TPU - BF16 is native)
             if step == 0:
                 checkpoint("Starting first forward pass...")
+            # Pass debug_step for steps 4-8 to help debug post-optimizer hang
+            dbg_step = step if (4 <= step <= 8 and is_master) else -1
             loss = compute_kd_loss_batch(
                 model, batch, device, args.temperature,
                 no_grad=False,
                 hard_top1_weight=args.hard_top1,
                 hard_full_weight=0.0,  # Disabled for TPU
+                debug_step=dbg_step,
             )
             if step == 0:
                 checkpoint("First forward pass complete")

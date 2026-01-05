@@ -224,6 +224,7 @@ def compute_kd_loss_batch(
     no_grad: bool = False,
     hard_top1_weight: float = 0.0,
     hard_full_weight: float = 0.0,
+    debug_step: int = -1,
 ) -> torch.Tensor:
     """Compute KD loss for a batch using memory-efficient approach.
 
@@ -236,13 +237,23 @@ def compute_kd_loss_batch(
                  During training, set to False to allow gradients.
         hard_top1_weight: Weight for hard label loss on top-1 (helps stabilize training)
         hard_full_weight: Weight for hard label loss on full vocab (small value helps)
+        debug_step: If >= 0, print debug info for this step (for XLA debugging)
 
     Returns:
         Combined loss scalar (KL + hard label losses)
     """
-    # Get model dtype for consistent precision (bf16 on TPU)
-    model_dtype = next(model.parameters()).dtype
+    import time as _time
+    _dbg = debug_step >= 0
 
+    # Get model dtype for consistent precision (bf16 on TPU)
+    if _dbg:
+        print(f"    [kd_loss] step={debug_step} getting model dtype...", flush=True)
+    model_dtype = next(model.parameters()).dtype
+    if _dbg:
+        print(f"    [kd_loss] step={debug_step} model_dtype={model_dtype}", flush=True)
+
+    if _dbg:
+        print(f"    [kd_loss] step={debug_step} moving batch to device...", flush=True)
     input_ids = batch['input_ids'].to(device)
     attention_mask = batch.get('attention_mask')
     if attention_mask is not None:
@@ -250,6 +261,8 @@ def compute_kd_loss_batch(
 
     topk_idx = batch['topk_idx'].to(device).long()
     topk_logits = batch['topk_logits'].to(device).to(model_dtype)  # Match model dtype
+    if _dbg:
+        print(f"    [kd_loss] step={debug_step} batch moved, input_ids.shape={input_ids.shape}", flush=True)
 
     # Get hidden states (not full logits)
     def forward_pass():
@@ -261,11 +274,16 @@ def compute_kd_loss_batch(
         )
         return out.last_hidden_state[:, :-1, :]  # [B, S, H]
 
+    if _dbg:
+        print(f"    [kd_loss] step={debug_step} starting model.model() forward...", flush=True)
+        _t0 = _time.time()
     if no_grad:
         with torch.no_grad():
             hidden = forward_pass()
     else:
         hidden = forward_pass()
+    if _dbg:
+        print(f"    [kd_loss] step={debug_step} model.model() done ({_time.time()-_t0:.1f}s), hidden.shape={hidden.shape}", flush=True)
 
     B, S, H = hidden.shape
 
