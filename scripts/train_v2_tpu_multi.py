@@ -777,9 +777,12 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                 elapsed = time.time() - t_start
                 print(f"  [step {step}] opt={optimizer_step}, sync={sync_time:.1f}s, t={elapsed:.1f}s", flush=True)
 
-    # Final save
+    # Sync all workers before final save
+    xm.rendezvous('before_final_save')
+
+    # Final save - only master saves
+    elapsed = time.time() - t_start
     if is_master:
-        elapsed = time.time() - t_start
         log(f"\n  Training complete: {elapsed/60:.1f} min")
 
         os.makedirs(args.output_dir, exist_ok=True)
