@@ -23,3 +23,6 @@ qat_lora/__pycache__/*
 
 # Teacher top-k caches / local artifacts
 caches/
+
+# Local terminal guides (contain project-specific configs)
+docs/SR-008B-terminal.md
