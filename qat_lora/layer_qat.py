@@ -1635,8 +1635,10 @@ def train_e2e(
                 # Show that training is starting
                 print(f"\nTraining:", flush=True)
 
-            # Track step timing (for debugging XLA compilation)
-            step_start_time = time.time()
+            # Track optimizer step timing (for debugging XLA compilation)
+            # Reset timer at start of each optimizer step (not each micro-batch)
+            if step % accumulation_steps == 0:
+                opt_step_start_time = time.time()
 
             # Forward pass with optional autocast for FP16 or mixed precision
             # Note: TPU/XLA uses 'xla' device type for autocast
@@ -1695,32 +1697,27 @@ def train_e2e(
                 optimizer.zero_grad(set_to_none=True)  # set_to_none more efficient
                 optimizer_step += 1  # Track for display
 
-                # Progress indicator with timing (helpful for debugging XLA compilation)
-                step_time = time.time() - step_start_time
-                if verbose and optimizer_step <= 5:
-                    # Show detailed timing for first 5 steps (to catch XLA compilation delays)
-                    compile_info = ""
-                    if is_tpu:
-                        try:
-                            import torch_xla.debug.metrics as met
-                            report = met.metrics_report()
-                            for line in report.split('\n'):
-                                if 'CompileTime' in line and 'Count' in line:
-                                    parts = line.split('Count:')
-                                    if len(parts) > 1:
-                                        compile_count = int(parts[1].strip().split()[0])
-                                        compile_info = f" [compiles: {compile_count}]"
-                                    break
-                        except Exception:
-                            pass
-                    print(f"  step {optimizer_step}: {step_time:.1f}s{compile_info}", flush=True)
-                elif verbose and optimizer_step % logging_steps == 0:
-                    # Then show at logging intervals
-                    pass  # Will be shown in the regular logging below
-
             # TPU: mark_step to execute graph (required for progress)
             if is_tpu and xm is not None:
                 xm.mark_step()
+
+                # Progress indicator with timing (helpful for debugging XLA compilation)
+                # Sync to get accurate timing (XLA ops are async)
+                if verbose and optimizer_step <= 5:
+                    import torch_xla
+                    torch_xla.sync()  # Wait for actual execution
+                    step_time = time.time() - opt_step_start_time
+
+                    # Get compilation count from XLA metrics
+                    compile_info = ""
+                    try:
+                        import torch_xla.debug.metrics as met
+                        # Use counter_value for accurate count
+                        compile_count = met.counter_value('UncachedCompile') or 0
+                        compile_info = f" [compiles: {compile_count}]"
+                    except Exception:
+                        pass
+                    print(f"  step {optimizer_step}: {step_time:.1f}s{compile_info}", flush=True)
 
             # Track loss - always sync (simpler, proven to work)
             # Note: loss was scaled for accumulation, so multiply back for logging
@@ -1950,15 +1947,8 @@ def train_e2e(
         if is_tpu:
             try:
                 import torch_xla.debug.metrics as met
-                report = met.metrics_report()
-                compile_count = 0
-                for line in report.split('\n'):
-                    if 'CompileTime' in line and 'Count' in line:
-                        # Parse "CompileTime                : ... Count: N"
-                        parts = line.split('Count:')
-                        if len(parts) > 1:
-                            compile_count = int(parts[1].strip().split()[0])
-                            break
+                # Use counter_value API (more reliable than parsing report string)
+                compile_count = met.counter_value('UncachedCompile') or 0
                 print(f"\n[TPU] XLA compilations: {compile_count}")
                 if compile_count > 3:
                     print(f"  Warning: {compile_count} compilations detected (expected 1-3)")
