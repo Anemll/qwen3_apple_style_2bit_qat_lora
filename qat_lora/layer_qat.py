@@ -1927,6 +1927,26 @@ def train_e2e(
             print(f"Tokens:  {tok_str} ({avg_tok_per_sec/1000:.1f}k tok/s avg)")
         print(f"Time: {elapsed:.1f}s")
 
+        # TPU: Print compilation summary
+        if is_tpu:
+            try:
+                import torch_xla.debug.metrics as met
+                report = met.metrics_report()
+                compile_count = 0
+                for line in report.split('\n'):
+                    if 'CompileTime' in line and 'Count' in line:
+                        # Parse "CompileTime                : ... Count: N"
+                        parts = line.split('Count:')
+                        if len(parts) > 1:
+                            compile_count = int(parts[1].strip().split()[0])
+                            break
+                print(f"\n[TPU] XLA compilations: {compile_count}")
+                if compile_count > 3:
+                    print(f"  Warning: {compile_count} compilations detected (expected 1-3)")
+                    print(f"  This may indicate dynamic shapes or recompilation issues")
+            except Exception as e:
+                print(f"[TPU] Metrics not available: {e}")
+
     # Cleanup to free GPU memory
     del optimizer
     if scheduler is not None:
