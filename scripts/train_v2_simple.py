@@ -93,8 +93,10 @@ def main():
     # Training precision
     parser.add_argument('--dtype', type=str, default='fp32', choices=['fp32', 'bf16', 'fp16'],
                         help='Training dtype: fp32 (default, ANE-safe), bf16 (2x faster), fp16 (fastest but risky)')
-    parser.add_argument('--mixed-precision', action='store_true',
-                        help='Mixed precision: FP32 master weights + BF16 compute (best of both)')
+    parser.add_argument('--mixed-precision', action='store_true', default=True,
+                        help='Mixed precision: FP32 master weights + BF16 compute (default: enabled)')
+    parser.add_argument('--no-mixed-precision', dest='mixed_precision', action='store_false',
+                        help='Disable mixed precision (use pure FP32)')
     # TPU support
     parser.add_argument('--tpu', action='store_true',
                         help='Force TPU mode (auto-detected if available)')
