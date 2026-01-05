@@ -618,8 +618,8 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
             if step <= args.accumulation_steps:
                 checkpoint("XLA step sync complete")
 
-            # Heartbeat every step (for debugging slow steps)
-            if is_master:
+            # Only log steps during warmup or when sync is slow (likely recompile)
+            if is_master and (step <= 12 or sync_time > 1.0):
                 elapsed = time.time() - t_start
                 print(f"  [step {step}] opt={optimizer_step}, sync={sync_time:.1f}s, t={elapsed:.1f}s", flush=True)
 
