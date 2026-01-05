@@ -525,6 +525,22 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     del warmup_iter, warmup_batch
     gc.collect()
 
+    # Log HBM usage after warmup
+    try:
+        mem = xm.get_memory_info(device)
+        if "bytes_used" in mem:
+            used_gb = mem["bytes_used"] / 1e9
+            total_gb = mem.get("bytes_limit", 0) / 1e9
+            log(f"  [HBM after warmup] {used_gb:.1f}/{total_gb:.1f} GB ({100*used_gb/total_gb:.0f}%)")
+            if use_wandb:
+                wandb.log({
+                    'warmup/hbm_used_gb': used_gb,
+                    'warmup/hbm_total_gb': total_gb,
+                    'warmup/hbm_pct': 100 * used_gb / total_gb if total_gb > 0 else 0,
+                }, step=0)
+    except Exception as e:
+        log(f"  [HBM] Could not get memory info: {e}")
+
     log("  [warmup] XLA compilation complete. Training should be fast now.")
     checkpoint("XLA warmup complete")
 
