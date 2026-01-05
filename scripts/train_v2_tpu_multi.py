@@ -518,14 +518,27 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
 
             step += 1
             # Use new API (torch_xla.sync) instead of deprecated xm.mark_step()
+            t_sync_start = time.time()
             torch_xla.sync()
+            sync_time = time.time() - t_sync_start
+
+            # Log XLA metrics after first few steps to detect recompilation
+            if step <= 8 and is_master:
+                try:
+                    compile_data = met.metric_data('CompileTime')
+                    if compile_data:
+                        n_compiles, total_ns, _ = compile_data
+                        print(f"  [XLA] step={step}: {n_compiles} compiles, {total_ns/1e9:.2f}s total, sync={sync_time:.1f}s", flush=True)
+                except Exception:
+                    pass
+
             if step <= args.accumulation_steps:
                 checkpoint("XLA step sync complete")
 
             # Heartbeat every step (for debugging slow steps)
             if is_master:
                 elapsed = time.time() - t_start
-                print(f"  [step {step}] opt={optimizer_step}, t={elapsed:.1f}s", flush=True)
+                print(f"  [step {step}] opt={optimizer_step}, sync={sync_time:.1f}s, t={elapsed:.1f}s", flush=True)
 
     # Final save
     if is_master:
