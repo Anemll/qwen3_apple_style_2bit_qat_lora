@@ -394,6 +394,11 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     # XLA WARMUP: Precompile all graphs (forward + backward + optimizer)
     # This avoids compilation delays during actual training
     # =========================================================================
+    # CRITICAL: Sync all ranks before warmup to ensure everyone is ready
+    # Without this, rank 0 may start warmup while others are still loading
+    xm.rendezvous("before_warmup")
+    checkpoint("All ranks synchronized, starting warmup")
+
     log("\n[XLA] Warmup: precompiling forward + backward + optimizer...")
     checkpoint("Starting XLA warmup")
 
