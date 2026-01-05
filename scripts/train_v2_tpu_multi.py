@@ -447,10 +447,16 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                 if is_master:
                     log("  XLA Compilation Metrics:")
                     try:
-                        compile_time = met.metric_data('CompileTime')
+                        def _fmt_metric(metric):
+                            if not metric:
+                                return None
+                            count, total_ns, _samples = metric
+                            return f"{count} calls, {total_ns/1e9:.2f}s total"
+
+                        compile_time = _fmt_metric(met.metric_data('CompileTime'))
                         if compile_time:
                             log(f"    CompileTime: {compile_time}")
-                        execute_time = met.metric_data('ExecuteTime')
+                        execute_time = _fmt_metric(met.metric_data('ExecuteTime'))
                         if execute_time:
                             log(f"    ExecuteTime: {execute_time}")
                     except Exception as e:
@@ -466,13 +472,19 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                     checkpoint("Gradient sync complete")
 
                 # Optimizer step
+                if step < args.accumulation_steps:
+                    checkpoint("Optimizer step starting...")
                 xm.optimizer_step(optimizer)
+                if step < args.accumulation_steps:
+                    checkpoint("Optimizer step complete")
 
                 if scheduler is not None:
                     scheduler.step()
 
                 optimizer.zero_grad()
                 optimizer_step += 1
+                if optimizer_step == 1:
+                    checkpoint("Optimizer step 1 complete")
 
                 # Logging
                 if optimizer_step % 20 == 0:
@@ -507,6 +519,8 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
             step += 1
             # Use new API (torch_xla.sync) instead of deprecated xm.mark_step()
             torch_xla.sync()
+            if step <= args.accumulation_steps:
+                checkpoint("XLA step sync complete")
 
     # Final save
     if is_master:
