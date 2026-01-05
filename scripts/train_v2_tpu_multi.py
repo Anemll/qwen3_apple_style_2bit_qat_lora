@@ -742,15 +742,16 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                             pass
                         wandb.log(log_dict)
 
-                # Save checkpoint
-                if args.save_steps > 0 and optimizer_step % args.save_steps == 0 and is_master:
-                    os.makedirs(args.output_dir, exist_ok=True)
+                # Save checkpoint - ALL workers must call xm.save() for sync, but only master writes
+                if args.save_steps > 0 and optimizer_step % args.save_steps == 0:
                     save_path = f"{args.output_dir}/checkpoint_step{optimizer_step}.pt"
-                    # Only master saves (all chips have same weights after sync)
+                    if is_master:
+                        os.makedirs(args.output_dir, exist_ok=True)
+                    # xm.save MUST be called by all workers (handles sync internally)
+                    # Only master actually writes the file
                     xm.save(model.state_dict(), save_path)
-                    # CRITICAL: xm.save is async - must sync to ensure file is written
-                    torch_xla.sync()
-                    print(f"  Saved: {save_path}", flush=True)
+                    if is_master:
+                        print(f"  Saved: {save_path}", flush=True)
 
             step += 1
             # Use new API (torch_xla.sync) instead of deprecated xm.mark_step()
