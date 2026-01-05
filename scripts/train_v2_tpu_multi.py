@@ -74,6 +74,10 @@ def parse_args():
     parser.add_argument('--num-chips', type=int, default=None,
                         help='Number of TPU chips to use (default: all available)')
 
+    # XLA compilation cache
+    parser.add_argument('--xla-cache-dir', type=str, default='/tmp/xla_cache',
+                        help='XLA persistent cache directory (shared across ranks)')
+
     return parser.parse_args()
 
 
@@ -545,6 +549,15 @@ def main():
         print(f"[TPU Multi-chip] Limiting to {args.num_chips} chips via TPU_NUM_DEVICES")
     else:
         print("[TPU Multi-chip] Using all available TPU chips")
+
+    # Set up XLA persistent cache (shared across all ranks)
+    # This allows compiled graphs to be reused, saving compilation time on restart
+    if args.xla_cache_dir:
+        os.makedirs(args.xla_cache_dir, exist_ok=True)
+        os.environ['XLA_PERSISTENT_CACHE_PATH'] = args.xla_cache_dir
+        # Also set for libtpu if available
+        os.environ['LIBTPU_INIT_ARGS'] = os.environ.get('LIBTPU_INIT_ARGS', '') + f' --xla_tpu_enable_xla_runtime=true'
+        print(f"[TPU Multi-chip] XLA cache: {args.xla_cache_dir}")
 
     # Launch with xmp.spawn - nprocs=None uses all available devices
     import torch_xla.distributed.xla_multiprocessing as xmp
