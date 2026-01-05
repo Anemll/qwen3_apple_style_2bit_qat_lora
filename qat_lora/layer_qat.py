@@ -1516,6 +1516,7 @@ def train_e2e(
         # Run one forward+backward pass to trigger compilation
         model.train()
         autocast_device = 'xla'
+        print("forward...", end=" ", flush=True)
         if use_mixed_precision:
             with torch.amp.autocast(device_type=autocast_device, dtype=torch.bfloat16):
                 warmup_loss = compute_kd_loss_batch(
@@ -1531,6 +1532,9 @@ def train_e2e(
                 hard_top1_weight=hard_top1_weight,
                 hard_full_weight=hard_full_weight,
             )
+        if xm is not None:
+            xm.mark_step()
+        print("backward...", end=" ", flush=True)
         warmup_loss.backward()
         if xm is not None:
             xm.mark_step()
@@ -1628,6 +1632,9 @@ def train_e2e(
                     model_dtype = next(model.parameters()).dtype
                     print(f"[TPU DEBUG] model dtype: {model_dtype}, device: {device}")
 
+                # Show that training is starting
+                print(f"\nTraining: ", end="", flush=True)
+
             # Forward pass with optional autocast for FP16 or mixed precision
             # Note: TPU/XLA uses 'xla' device type for autocast
             autocast_device = 'xla' if is_tpu else device.type
@@ -1684,6 +1691,13 @@ def train_e2e(
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)  # set_to_none more efficient
                 optimizer_step += 1  # Track for display
+
+                # Progress indicator: show dots until first log
+                log_interval_steps = logging_steps
+                if verbose and optimizer_step <= log_interval_steps:
+                    print(".", end="", flush=True)
+                    if optimizer_step == log_interval_steps:
+                        print()  # newline before first log
 
             # TPU: mark_step to execute graph (required for progress)
             if is_tpu and xm is not None:
