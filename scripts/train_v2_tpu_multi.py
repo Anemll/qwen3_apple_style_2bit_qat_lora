@@ -488,14 +488,15 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     warmup_iter = iter(dataloader)
     warmup_batch = next(warmup_iter)
 
-    # Forward pass
+    # Forward pass (use autocast for BF16 compute even with FP32 weights)
     log("  [warmup] forward...", end=" ")
-    warmup_loss = compute_kd_loss_batch(
-        model, warmup_batch, device, args.temperature,
-        no_grad=False,
-        hard_top1_weight=args.hard_top1,
-        hard_full_weight=0.0,
-    )
+    with torch.amp.autocast(device_type='xla', dtype=compute_dtype):
+        warmup_loss = compute_kd_loss_batch(
+            model, warmup_batch, device, args.temperature,
+            no_grad=False,
+            hard_top1_weight=args.hard_top1,
+            hard_full_weight=0.0,
+        )
     torch_xla.sync()
     log("done")
     checkpoint("Warmup forward complete")
@@ -575,18 +576,19 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                     print("  [NOTE] If step 4 forward is slow (~60-90s), this may be XLA recompiling due to optimizer state.", flush=True)
                     print("         This is expected on first optimizer step. Step 5+ should be fast.", flush=True)
 
-            # Forward pass (no autocast needed on TPU - BF16 is native)
+            # Forward pass with autocast for BF16 compute (saves memory vs FP32 activations)
             if step == 0:
                 checkpoint("Starting first forward pass...")
             # Pass debug_step for steps 4-8 to help debug post-optimizer hang
             dbg_step = step if (4 <= step <= 8 and is_master) else -1
-            loss = compute_kd_loss_batch(
-                model, batch, device, args.temperature,
-                no_grad=False,
-                hard_top1_weight=args.hard_top1,
-                hard_full_weight=0.0,  # Disabled for TPU
-                debug_step=dbg_step,
-            )
+            with torch.amp.autocast(device_type='xla', dtype=compute_dtype):
+                loss = compute_kd_loss_batch(
+                    model, batch, device, args.temperature,
+                    no_grad=False,
+                    hard_top1_weight=args.hard_top1,
+                    hard_full_weight=0.0,  # Disabled for TPU
+                    debug_step=dbg_step,
+                )
             if step == 0:
                 checkpoint("First forward pass complete")
 
