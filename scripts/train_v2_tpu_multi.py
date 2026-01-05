@@ -303,22 +303,29 @@ def train_worker(index, args):
     t_start = time.time()
 
     total_micro_steps = args.max_steps * args.accumulation_steps
+    log(f"  Total micro-steps: {total_micro_steps}")
+    log(f"  Dataset size: {len(dataset)}, Dataloader batches: {len(dataloader)}")
 
+    epoch = 0
     while step < total_micro_steps:
-        sampler.set_epoch(step // len(dataloader))  # For proper shuffling
+        sampler.set_epoch(epoch)
+        epoch += 1
+        log(f"  Starting epoch {epoch}...")
 
-        for batch in dataloader:
+        for batch_idx, batch in enumerate(dataloader):
             if step >= total_micro_steps:
                 break
 
-            # Forward pass with autocast
-            with torch.amp.autocast(device_type='xla', dtype=torch.bfloat16):
-                loss = compute_kd_loss_batch(
-                    model, batch, device, args.temperature,
-                    no_grad=False,
-                    hard_top1_weight=args.hard_top1,
-                    hard_full_weight=0.0,  # Disabled for TPU
-                )
+            if step == 0:
+                log(f"  First batch received, starting XLA compilation...")
+
+            # Forward pass (no autocast needed on TPU - BF16 is native)
+            loss = compute_kd_loss_batch(
+                model, batch, device, args.temperature,
+                no_grad=False,
+                hard_top1_weight=args.hard_top1,
+                hard_full_weight=0.0,  # Disabled for TPU
+            )
 
             # Scale for accumulation
             if args.accumulation_steps > 1:
