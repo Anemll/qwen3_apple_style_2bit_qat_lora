@@ -636,12 +636,24 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                               f"ETA: {eta/60:.1f}m", flush=True)
 
                     if use_wandb:
-                        wandb.log({
+                        log_dict = {
                             'step': optimizer_step,
                             'loss': loss_val,
                             'lr': optimizer.param_groups[0]['lr'],
                             'tokens_per_sec': tok_per_sec,
-                        })
+                        }
+                        # Add TPU memory stats
+                        try:
+                            mem = xm.get_memory_info(device)
+                            if "kb_total" in mem:
+                                log_dict['tpu/memory_used_gb'] = (mem["kb_total"] - mem.get("kb_free", 0)) / 1024 / 1024
+                                log_dict['tpu/memory_total_gb'] = mem["kb_total"] / 1024 / 1024
+                            elif "bytes_used" in mem:
+                                log_dict['tpu/memory_used_gb'] = mem["bytes_used"] / 1e9
+                                log_dict['tpu/memory_total_gb'] = mem.get("bytes_limit", 0) / 1e9
+                        except Exception:
+                            pass
+                        wandb.log(log_dict)
 
                 # Save checkpoint
                 if args.save_steps > 0 and optimizer_step % args.save_steps == 0 and is_master:
