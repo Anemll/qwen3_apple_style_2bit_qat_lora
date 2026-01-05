@@ -166,7 +166,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
 
     log(f"\n[TPU Multi-chip] Starting training on {world_size} chips")
     log(f"  Rank {rank}: device={device}")
-    log(f"  Precision: BF16 (TPU native)")
+    log(f"  Precision: Mixed (FP32 weights + BF16 compute)")
     checkpoint("Worker init complete")
 
     # Config presets
@@ -179,8 +179,9 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     }
     preset = CONFIG_PRESETS[args.config]
 
-    # Training dtype (always BF16 on TPU)
-    train_dtype = torch.bfloat16
+    # Mixed precision: FP32 master weights + BF16 compute via autocast
+    train_dtype = torch.float32  # FP32 for optimizer updates (stability)
+    compute_dtype = torch.bfloat16  # BF16 for forward/backward (speed)
 
     # Load model - serialize to avoid all workers downloading simultaneously
     log("\n[1/4] Loading model...")
@@ -191,7 +192,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         checkpoint("Rank 0 loading model (others waiting)...")
         model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
-            torch_dtype=train_dtype,
+            torch_dtype=train_dtype,  # FP32 for stability
             trust_remote_code=True,
         )
         checkpoint("Rank 0 model loaded")
