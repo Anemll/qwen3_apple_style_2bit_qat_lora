@@ -406,15 +406,17 @@ def main():
         print("ERROR: TPU not available. Use train_v2_simple.py for CPU/GPU.")
         sys.exit(1)
 
-    # Use specified chips or default to 4 (detected inside worker)
-    num_chips = args.num_chips or 4
-    print(f"[TPU Multi-chip] Launching on {num_chips} chips...")
-    print(f"  (device count will be verified inside workers)")
+    # Set number of devices via environment variable (new torch_xla API)
+    if args.num_chips:
+        os.environ['TPU_NUM_DEVICES'] = str(args.num_chips)
+        print(f"[TPU Multi-chip] Limiting to {args.num_chips} chips via TPU_NUM_DEVICES")
+    else:
+        print("[TPU Multi-chip] Using all available TPU chips")
 
-    # Launch with xmp.spawn - this is where XLA should first initialize
+    # Launch with xmp.spawn - nprocs=None uses all available devices
     import torch_xla.distributed.xla_multiprocessing as xmp
 
-    xmp.spawn(train_worker, args=(args,), nprocs=num_chips)
+    xmp.spawn(train_worker, args=(args,), nprocs=None)
 
 
 if __name__ == '__main__':
