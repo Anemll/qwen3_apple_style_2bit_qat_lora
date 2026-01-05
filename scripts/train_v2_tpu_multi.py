@@ -236,13 +236,18 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     v2_cache_path = "/tmp/v2_model_state.pt"
 
     if is_master:
-        checkpoint("Rank 0: Replacing layers with V2 quantized layers (SVD init)...")
+        do_skip_init = args.v2_checkpoint is not None
+        checkpoint(
+            "Rank 0: Replacing layers with V2 quantized layers "
+            + ("(skip_init=True)..." if do_skip_init else "(SVD init)...")
+        )
         replace_linear_with_anemll_v2(
             model,
             mlp_config=v2_mlp_config,
             attn_config=v2_attn_config,
             quantize_attn=True,
             quantize_lm_head=False,
+            skip_init=do_skip_init,
         )
         checkpoint("Rank 0: V2 layer replacement complete")
 
