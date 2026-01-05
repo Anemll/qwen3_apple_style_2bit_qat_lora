@@ -271,6 +271,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         if args.v2_checkpoint:
             state_dict = torch.load(args.v2_checkpoint, map_location='cpu', weights_only=False)
             model.load_state_dict(state_dict, strict=False)
+            del state_dict  # Free memory
             log(f"  Loaded checkpoint: {args.v2_checkpoint}")
 
         # Save for other ranks
@@ -296,6 +297,8 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         checkpoint(f"Rank {rank}: Loading V2 weights from rank 0...")
         state_dict = torch.load(v2_cache_path, map_location='cpu', weights_only=False)
         model.load_state_dict(state_dict, strict=False)
+        del state_dict  # Free memory
+        gc.collect()
         checkpoint(f"Rank {rank}: V2 weights loaded")
 
     # Freeze Q BEFORE moving to device (avoids XLA compilations on TPU)
@@ -318,6 +321,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     # Move to device
     checkpoint("Moving model to device...")
     model.to(device=device, dtype=train_dtype)
+    gc.collect()  # Free CPU memory after move
     checkpoint("Model on device")
     log(f"  Model loaded ({time.time()-t0:.1f}s)")
 
