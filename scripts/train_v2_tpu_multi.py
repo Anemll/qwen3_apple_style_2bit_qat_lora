@@ -228,7 +228,6 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
 
     # Serialize layer replacement - one rank at a time to avoid CPU contention
     # Each rank's SVD takes ~1-2 min; doing all 4 simultaneously causes 10+ min freeze
-    world_size = xm.xrt_world_size()
     for replacing_rank in range(world_size):
         if rank == replacing_rank:
             checkpoint(f"Rank {rank}: Replacing layers with V2 quantized layers...")
