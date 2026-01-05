@@ -125,6 +125,10 @@ def train_worker(index, args):
 
     log_all(f"Worker started: device={device}, world_size={world_size}")
 
+    # Check if PT_XLA_DEBUG is enabled
+    if os.environ.get('PT_XLA_DEBUG', '0') == '1':
+        log_all("PT_XLA_DEBUG=1 - Extended XLA debugging enabled")
+
     try:
         _train_worker_impl(index, args, device, rank, world_size, is_master, log, log_all)
     except Exception as e:
@@ -141,6 +145,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     import torch
     import torch_xla
     import torch_xla.core.xla_model as xm
+    import torch_xla.debug.metrics as met  # XLA metrics for compilation monitoring
     from torch.utils.data import DataLoader
     from transformers import AutoModelForCausalLM
 
@@ -151,9 +156,18 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     )
     from qat_lora.layer_qat import KDCacheDataset, compute_kd_loss_batch, collate_fn
 
+    # Helper for timestamped checkpoints
+    import time as time_module
+    t_checkpoint = time_module.time()
+    def checkpoint(msg):
+        nonlocal t_checkpoint
+        elapsed = time_module.time() - t_checkpoint
+        log_all(f"CHECKPOINT [{elapsed:.1f}s]: {msg}")
+        t_checkpoint = time_module.time()
+
     log(f"\n[TPU Multi-chip] Starting training on {world_size} chips")
     log(f"  Rank {rank}: device={device}")
-    log_all("CHECKPOINT: Worker init complete")
+    checkpoint("Worker init complete")
 
     # Config presets
     CONFIG_PRESETS = {
@@ -174,25 +188,25 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
 
     # Rank 0 loads first (downloads if needed), others wait then load from cache
     if is_master:
-        log_all("CHECKPOINT: Rank 0 loading model (others waiting)...")
+        checkpoint("Rank 0 loading model (others waiting)...")
         model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
             torch_dtype=train_dtype,
             trust_remote_code=True,
         )
-        log_all("CHECKPOINT: Rank 0 model loaded")
+        checkpoint("Rank 0 model loaded")
 
     # Barrier - wait for rank 0 to finish downloading
     xm.rendezvous("model_download")
 
     if not is_master:
-        log_all("CHECKPOINT: Loading model from cache...")
+        checkpoint("Loading model from cache...")
         model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
             torch_dtype=train_dtype,
             trust_remote_code=True,
         )
-        log_all("CHECKPOINT: Model loaded from cache")
+        checkpoint("Model loaded from cache")
 
     # Replace with V2 layers
     v2_mlp_config = AnemllQuantConfigV2(
@@ -212,7 +226,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         use_ste_fp16=False,
     )
 
-    log_all("CHECKPOINT: Replacing layers with V2 quantized layers...")
+    checkpoint("Replacing layers with V2 quantized layers...")
     replace_linear_with_anemll_v2(
         model,
         mlp_config=v2_mlp_config,
@@ -220,7 +234,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         quantize_attn=True,
         quantize_lm_head=False,
     )
-    log_all("CHECKPOINT: V2 layer replacement complete")
+    checkpoint("V2 layer replacement complete")
 
     # Load checkpoint if provided
     if args.v2_checkpoint:
@@ -229,14 +243,14 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         log(f"  Loaded checkpoint: {args.v2_checkpoint}")
 
     # Move to device
-    log_all("CHECKPOINT: Moving model to device...")
+    checkpoint("Moving model to device...")
     model.to(device=device, dtype=train_dtype)
-    log_all("CHECKPOINT: Model on device")
+    checkpoint("Model on device")
     log(f"  Model loaded ({time.time()-t0:.1f}s)")
 
     # Freeze Q
     freeze_Q_all(model)
-    log_all("CHECKPOINT: Model frozen")
+    checkpoint("Model frozen")
 
     # Setup trainable parameters
     log("\n[2/4] Setting up training...")
@@ -287,7 +301,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
             return self.examples[idx]
 
     dataset = KDMapDataset(args.cache_dir)
-    log_all(f"CHECKPOINT: Dataset loaded, {len(dataset)} examples")
+    checkpoint(f"Dataset loaded, {len(dataset)} examples")
 
     # Sampler for distributed training
     from torch.utils.data.distributed import DistributedSampler
@@ -298,7 +312,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         shuffle=True,
         drop_last=True,
     )
-    log_all("CHECKPOINT: Sampler created")
+    checkpoint("Sampler created")
 
     dataloader = DataLoader(
         dataset,
@@ -307,7 +321,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         collate_fn=collate_fn,
         drop_last=True,
     )
-    log_all("CHECKPOINT: DataLoader created")
+    checkpoint("DataLoader created")
 
     # Effective batch size
     effective_batch = args.batch_size * args.accumulation_steps * world_size
@@ -316,7 +330,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     log(f"  Total tokens: {total_tokens/1e6:.1f}M")
 
     # WandB (master only)
-    log_all("CHECKPOINT: Before WandB init")
+    checkpoint("Before WandB init")
     use_wandb = args.wandb and is_master
     if use_wandb:
         try:
@@ -339,11 +353,11 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
             log("  WandB initialized")
         except ImportError:
             use_wandb = False
-    log_all("CHECKPOINT: After WandB init")
+    checkpoint("After WandB init")
 
     # Training loop
     log("\n[4/4] Training...")
-    log_all("CHECKPOINT: Starting training loop")
+    checkpoint("Starting training loop")
     log(f"  Steps: {args.max_steps}, Warmup: {args.warmup_steps}")
 
     model.train()
@@ -369,12 +383,12 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                 break
 
             if step == 0:
-                log_all("CHECKPOINT: First batch received")
+                checkpoint("First batch received")
                 log(f"  First batch received, starting XLA compilation...")
 
             # Forward pass (no autocast needed on TPU - BF16 is native)
             if step == 0:
-                log_all("CHECKPOINT: Starting first forward pass...")
+                checkpoint("Starting first forward pass...")
             loss = compute_kd_loss_batch(
                 model, batch, device, args.temperature,
                 no_grad=False,
@@ -382,7 +396,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                 hard_full_weight=0.0,  # Disabled for TPU
             )
             if step == 0:
-                log_all("CHECKPOINT: First forward pass complete")
+                checkpoint("First forward pass complete")
 
             # Scale for accumulation
             if args.accumulation_steps > 1:
@@ -390,19 +404,31 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
 
             # Backward
             if step == 0:
-                log_all("CHECKPOINT: Starting first backward pass...")
+                checkpoint("Starting first backward pass...")
             loss.backward()
             if step == 0:
-                log_all("CHECKPOINT: First backward pass complete")
+                checkpoint("First backward pass complete")
+                # Print XLA compilation metrics after first pass
+                if is_master:
+                    log("  XLA Compilation Metrics:")
+                    try:
+                        compile_time = met.metric_data('CompileTime')
+                        if compile_time:
+                            log(f"    CompileTime: {compile_time}")
+                        execute_time = met.metric_data('ExecuteTime')
+                        if execute_time:
+                            log(f"    ExecuteTime: {execute_time}")
+                    except Exception as e:
+                        log(f"    (metrics unavailable: {e})")
 
             # Optimizer step every accumulation_steps
             if (step + 1) % args.accumulation_steps == 0:
                 if step < args.accumulation_steps:
-                    log_all("CHECKPOINT: First optimizer step - gradient sync...")
+                    checkpoint("First optimizer step - gradient sync...")
                 # Gradient sync across chips
                 xm.reduce_gradients(optimizer)
                 if step < args.accumulation_steps:
-                    log_all("CHECKPOINT: Gradient sync complete")
+                    checkpoint("Gradient sync complete")
 
                 # Optimizer step
                 xm.optimizer_step(optimizer)
