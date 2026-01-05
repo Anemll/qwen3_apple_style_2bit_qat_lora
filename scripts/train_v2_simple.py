@@ -68,6 +68,8 @@ def main():
     parser.add_argument('--hard-full', type=float, default=0.00005, help='Hard label full vocab weight')
     parser.add_argument('--temperature', type=float, default=2.0, help='KD temperature (default: 2.0)')
     parser.add_argument('--warmup-steps', type=int, default=100, help='LR warmup steps (default: 100)')
+    parser.add_argument('--constant-lr', action='store_true',
+                        help='Use constant LR (disable cosine decay)')
     parser.add_argument('--eval-steps', type=int, default=100, help='Eval every N steps (default: 100)')
     parser.add_argument('--eval-samples', type=int, default=None, help='Eval samples (default: 40, 0=skip)')
     parser.add_argument('--g-only', action='store_true', help='Train only rank_magnitude (G), freeze A and B')
@@ -516,7 +518,7 @@ def main():
         max_steps=args.max_steps,
         batch_size=args.batch_size,
         lr=args.lr,
-        use_cosine_schedule=True,
+        use_cosine_schedule=not args.constant_lr,
         warmup_steps=args.warmup_steps,
         temperature=args.temperature,
         train_weights=False,
