@@ -1633,7 +1633,10 @@ def train_e2e(
                     print(f"[TPU DEBUG] model dtype: {model_dtype}, device: {device}")
 
                 # Show that training is starting
-                print(f"\nTraining: ", end="", flush=True)
+                print(f"\nTraining:", flush=True)
+
+            # Track step timing (for debugging XLA compilation)
+            step_start_time = time.time()
 
             # Forward pass with optional autocast for FP16 or mixed precision
             # Note: TPU/XLA uses 'xla' device type for autocast
@@ -1692,12 +1695,28 @@ def train_e2e(
                 optimizer.zero_grad(set_to_none=True)  # set_to_none more efficient
                 optimizer_step += 1  # Track for display
 
-                # Progress indicator: show dots until first log
-                log_interval_steps = logging_steps
-                if verbose and optimizer_step <= log_interval_steps:
-                    print(".", end="", flush=True)
-                    if optimizer_step == log_interval_steps:
-                        print()  # newline before first log
+                # Progress indicator with timing (helpful for debugging XLA compilation)
+                step_time = time.time() - step_start_time
+                if verbose and optimizer_step <= 5:
+                    # Show detailed timing for first 5 steps (to catch XLA compilation delays)
+                    compile_info = ""
+                    if is_tpu:
+                        try:
+                            import torch_xla.debug.metrics as met
+                            report = met.metrics_report()
+                            for line in report.split('\n'):
+                                if 'CompileTime' in line and 'Count' in line:
+                                    parts = line.split('Count:')
+                                    if len(parts) > 1:
+                                        compile_count = int(parts[1].strip().split()[0])
+                                        compile_info = f" [compiles: {compile_count}]"
+                                    break
+                        except Exception:
+                            pass
+                    print(f"  step {optimizer_step}: {step_time:.1f}s{compile_info}", flush=True)
+                elif verbose and optimizer_step % logging_steps == 0:
+                    # Then show at logging intervals
+                    pass  # Will be shown in the regular logging below
 
             # TPU: mark_step to execute graph (required for progress)
             if is_tpu and xm is not None:
