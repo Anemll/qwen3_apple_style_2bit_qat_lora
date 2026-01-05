@@ -65,6 +65,10 @@ def parse_args():
     parser.add_argument('--wandb-project', type=str, default='qwen3-qat')
     parser.add_argument('--wandb-run', type=str, default=None)
 
+    # Training mode
+    parser.add_argument('--mlp-only', action='store_true',
+                        help='Train only MLP layers (gate/up/down_proj), freeze attention (q/k/v/o_proj)')
+
     # Multi-chip options
     parser.add_argument('--num-chips', type=int, default=None,
                         help='Number of TPU chips to use (default: all available)')
@@ -284,6 +288,19 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     # Freeze Q BEFORE moving to device (avoids XLA compilations on TPU)
     freeze_Q_all(model)
     checkpoint("Model frozen")
+
+    # Freeze attention layers if --mlp-only
+    if args.mlp_only:
+        attn_proj_names = ('q_proj', 'k_proj', 'v_proj', 'o_proj')
+        attn_frozen = 0
+        for name, module in model.named_modules():
+            if type(module).__name__ in ('AnemllQATLinear', 'AnemllQATLinearV2'):
+                if any(proj in name for proj in attn_proj_names):
+                    for p in module.parameters():
+                        p.requires_grad = False
+                        attn_frozen += p.numel()
+        if is_master:
+            print(f"  MLP-only mode: frozen {attn_frozen:,} attention params")
 
     # Move to device
     checkpoint("Moving model to device...")
