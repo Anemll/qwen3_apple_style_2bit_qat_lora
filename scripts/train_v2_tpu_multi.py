@@ -75,8 +75,8 @@ def parse_args():
                         help='Number of TPU chips to use (default: all available)')
 
     # XLA compilation cache
-    parser.add_argument('--xla-cache-dir', type=str, default='/tmp/xla_cache',
-                        help='XLA persistent cache directory (shared across ranks)')
+    parser.add_argument('--xla-cache-dir', type=str, default=None,
+                        help='XLA persistent cache directory (shared across ranks; may be unsupported on some PJRT/libtpu builds)')
 
     return parser.parse_args()
 
