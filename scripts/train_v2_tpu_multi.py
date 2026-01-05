@@ -77,6 +77,10 @@ def parse_args():
     parser.add_argument('--xla-cache-dir', type=str, default=None,
                         help='XLA persistent cache directory (shared across ranks; may be unsupported on some PJRT/libtpu builds)')
 
+    # Precision
+    parser.add_argument('--bf16', action='store_true',
+                        help='Use pure BF16 (saves ~50%% HBM, default is FP32 master weights)')
+
     return parser.parse_args()
 
 
@@ -184,8 +188,17 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     preset = CONFIG_PRESETS[args.config]
 
     # Mixed precision: FP32 master weights + BF16 compute via autocast
-    train_dtype = torch.float32  # FP32 for optimizer updates (stability)
-    compute_dtype = torch.bfloat16  # BF16 for forward/backward (speed)
+    # Precision mode: BF16 saves ~50% HBM but may have slightly less stable training
+    if args.bf16:
+        train_dtype = torch.bfloat16  # Pure BF16 (saves HBM)
+        compute_dtype = torch.bfloat16
+        if is_master:
+            print("  Precision: Pure BF16 (--bf16 flag)")
+    else:
+        train_dtype = torch.float32  # FP32 for optimizer updates (stability)
+        compute_dtype = torch.bfloat16  # BF16 for forward/backward (speed)
+        if is_master:
+            print("  Precision: Mixed (FP32 master weights + BF16 compute)")
 
     # Load model - serialize to avoid all workers downloading simultaneously
     log("\n[1/4] Loading model...")
@@ -451,6 +464,16 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     xm.rendezvous("before_warmup")
     checkpoint("All ranks synchronized, starting warmup")
 
+    # Log HBM usage before warmup
+    try:
+        mem = xm.get_memory_info(device)
+        if "bytes_used" in mem:
+            used_gb = mem["bytes_used"] / 1e9
+            total_gb = mem.get("bytes_limit", 0) / 1e9
+            log(f"  [HBM before warmup] {used_gb:.1f}/{total_gb:.1f} GB")
+    except Exception as e:
+        log(f"  [HBM] Could not get memory info: {e}")
+
     log("\n[XLA] Warmup: precompiling forward + backward + optimizer...")
     checkpoint("Starting XLA warmup")
 
@@ -476,6 +499,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     # Backward pass
     log("  [warmup] backward...", end=" ")
     warmup_loss.backward()
+    del warmup_loss  # Free memory before sync
     torch_xla.sync()
     log("done")
     checkpoint("Warmup backward complete")
