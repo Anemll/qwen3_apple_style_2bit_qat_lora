@@ -111,6 +111,8 @@ def main():
     parser.add_argument('--attn-lut', type=int, default=None, help='Override Attention LUT size')
     parser.add_argument('--attn-rank', type=int, default=None, help='Override Attention scale rank')
     parser.add_argument('--group-size', type=int, default=32, help='Group size for scale init (default: 32)')
+    parser.add_argument('--fast-init', action='store_true',
+                        help='Skip SVD-based scale initialization (faster, worse initial loss)')
     args = parser.parse_args()
 
     # Validate inputs - need v1, v2 checkpoint, or from-scratch
@@ -259,6 +261,7 @@ def main():
             attn_config=v2_attn_config,
             quantize_attn=True,
             quantize_lm_head=False,
+            skip_init=True,  # Always skip for v2 checkpoint (will load state)
         )
         print(f"done ({time.time()-t0:.1f}s)")
 
@@ -322,6 +325,7 @@ def main():
             attn_config=v2_attn_config,
             quantize_attn=True,
             quantize_lm_head=False,
+            skip_init=args.fast_init,  # Skip SVD for faster init (worse initial loss)
         )
         print(f"done ({time.time()-t0:.1f}s)")
 
