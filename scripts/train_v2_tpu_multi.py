@@ -427,7 +427,11 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                 print(f"  [heartbeat] step={step} pre-forward sync...", flush=True)
                 t_presync = time.time()
                 torch_xla.sync()
-                print(f"  [heartbeat] step={step} pre-forward sync done ({time.time()-t_presync:.1f}s), starting forward...", flush=True)
+                presync_elapsed = time.time() - t_presync
+                print(f"  [heartbeat] step={step} pre-forward sync done ({presync_elapsed:.1f}s), starting forward...", flush=True)
+                if step == 4:
+                    print("  [NOTE] If step 4 forward is slow (~60-90s), this may be XLA recompiling due to optimizer state.", flush=True)
+                    print("         This is expected on first optimizer step. Step 5+ should be fast.", flush=True)
 
             # Forward pass (no autocast needed on TPU - BF16 is native)
             if step == 0:
