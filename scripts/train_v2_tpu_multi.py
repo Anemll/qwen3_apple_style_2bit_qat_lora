@@ -168,15 +168,31 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     # Training dtype (always BF16 on TPU)
     train_dtype = torch.bfloat16
 
-    # Load model
+    # Load model - serialize to avoid all workers downloading simultaneously
     log("\n[1/4] Loading model...")
     t0 = time.time()
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        torch_dtype=train_dtype,
-        trust_remote_code=True,
-    )
+    # Rank 0 loads first (downloads if needed), others wait then load from cache
+    if is_master:
+        log_all("CHECKPOINT: Rank 0 loading model (others waiting)...")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            torch_dtype=train_dtype,
+            trust_remote_code=True,
+        )
+        log_all("CHECKPOINT: Rank 0 model loaded")
+
+    # Barrier - wait for rank 0 to finish downloading
+    xm.rendezvous("model_download")
+
+    if not is_master:
+        log_all("CHECKPOINT: Loading model from cache...")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            torch_dtype=train_dtype,
+            trust_remote_code=True,
+        )
+        log_all("CHECKPOINT: Model loaded from cache")
 
     # Replace with V2 layers
     v2_mlp_config = AnemllQuantConfigV2(
