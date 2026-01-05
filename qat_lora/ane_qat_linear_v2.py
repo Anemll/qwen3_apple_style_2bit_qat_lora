@@ -300,8 +300,11 @@ class AnemllQATLinearV2(nn.Module):
         lora_r: int = 0,
         lora_alpha: float = 1.0,
         lora_dropout: float = 0.0,
+        # Internal: skip SVD init (used by from_linear with skip_init=True)
+        _skip_scale_init: bool = False,
     ):
         super().__init__()
+        self._skip_scale_init = _skip_scale_init
         self.in_features = in_features
         self.out_features = out_features
         self.config = config or AnemllQuantConfigV2()
@@ -412,7 +415,9 @@ class AnemllQATLinearV2(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
         # Initialize scales from weight statistics
-        self._init_scales_from_weight()
+        # Note: skip if called from from_linear() which handles this separately
+        if not getattr(self, '_skip_scale_init', False):
+            self._init_scales_from_weight()
 
         if self.lora_r > 0:
             nn.init.normal_(self.lora_A, std=0.02)
@@ -1017,11 +1022,13 @@ class AnemllQATLinearV2(nn.Module):
         """
         config = config or AnemllQuantConfigV2()
 
+        # Create layer, skipping SVD init in __init__ (we'll do it after copying weights)
         layer = cls(
             in_features=linear.in_features,
             out_features=linear.out_features,
             bias=linear.bias is not None,
             config=config,
+            _skip_scale_init=True,  # Skip SVD in reset_parameters
         )
 
         # Copy weights
@@ -1029,7 +1036,7 @@ class AnemllQATLinearV2(nn.Module):
         if linear.bias is not None:
             layer.bias.data = linear.bias.data.clone()
 
-        # Re-initialize scales from the actual weights (slow SVD - skip if loading state_dict)
+        # Initialize scales from the actual weights (slow SVD - skip if loading state_dict)
         if not skip_init:
             layer._init_scales_from_weight()
 
