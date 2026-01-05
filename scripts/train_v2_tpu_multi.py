@@ -19,6 +19,7 @@ This will use all 4 TPU chips with data parallelism:
 import argparse
 import os
 import sys
+import importlib.util
 from pathlib import Path
 
 REPO_DIR = Path(__file__).parent.parent
@@ -26,14 +27,8 @@ sys.path.insert(0, str(REPO_DIR))
 
 # Check for TPU - IMPORTANT: Don't call any XLA functions before xmp.spawn()!
 def check_tpu():
-    """Check if TPU is available (import only, no XLA calls)."""
-    try:
-        import torch_xla
-        # Don't call any XLA functions here - they pre-initialize XLA
-        # which conflicts with xmp.spawn()
-        return True
-    except ImportError:
-        return False
+    """Check if torch_xla is installed without importing it (avoids PJRT/XLA init)."""
+    return importlib.util.find_spec("torch_xla") is not None
 
 
 def parse_args():
@@ -579,7 +574,11 @@ def main():
     # Launch with xmp.spawn - nprocs=None uses all available devices
     import torch_xla.distributed.xla_multiprocessing as xmp
 
-    xmp.spawn(train_worker, args=(args,), nprocs=None)
+    # Prefer `spawn` start method to avoid inheriting PJRT/XLA runtime state (can crash on restart).
+    try:
+        xmp.spawn(train_worker, args=(args,), nprocs=None, start_method='spawn')
+    except TypeError:
+        xmp.spawn(train_worker, args=(args,), nprocs=None)
 
 
 if __name__ == '__main__':
