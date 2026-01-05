@@ -514,9 +514,10 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     log_hbm("after_forward")
 
     # Backward pass
-    log("  [warmup] backward...", end=" ")
+    log("  [warmup] backward...", end=" ", flush=True)
     warmup_loss.backward()
     del warmup_loss  # Free memory before sync
+    log("graph built, syncing...", end=" ", flush=True)
     torch_xla.sync()
     log("done")
     checkpoint("Warmup backward complete")
