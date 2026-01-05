@@ -1101,24 +1101,11 @@ def replace_linear_with_anemll_v2(
 
         layers_to_replace.append((name, module, cfg))
 
-    # Parallel SVD initialization
-    if not skip_init and parallel_init and len(layers_to_replace) > 1:
-        workers = num_workers if num_workers > 0 else min(os.cpu_count() or 1, len(layers_to_replace))
-        if verbose:
-            print(f"  (parallel SVD init with {workers} workers)", flush=True)
-
-        def init_layer(args):
-            name, module, cfg = args
-            return name, AnemllQATLinearV2.from_linear(module, config=cfg, skip_init=False)
-
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            results = list(executor.map(init_layer, layers_to_replace))
-        new_modules = {name: mod for name, mod in results}
-    else:
-        # Sequential initialization
-        new_modules = {}
-        for name, module, cfg in layers_to_replace:
-            new_modules[name] = AnemllQATLinearV2.from_linear(module, config=cfg, skip_init=skip_init)
+    # Sequential SVD initialization (parallel disabled - GIL + BLAS conflicts make it slower)
+    # Each SVD uses full BLAS parallelism internally, so sequential is actually faster
+    new_modules = {}
+    for name, module, cfg in layers_to_replace:
+        new_modules[name] = AnemllQATLinearV2.from_linear(module, config=cfg, skip_init=skip_init)
 
     # Build replacement list with parent references
     replacements = []
