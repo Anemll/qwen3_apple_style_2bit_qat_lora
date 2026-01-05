@@ -114,9 +114,9 @@ def train_worker(index, args):
 
     is_master = (rank == 0)
 
-    def log(msg):
+    def log(msg, end="\n", flush=True):
         if is_master:
-            print(msg, flush=True)
+            print(msg, end=end, flush=flush)
 
     # Print from ALL ranks for debugging
     def log_all(msg):
