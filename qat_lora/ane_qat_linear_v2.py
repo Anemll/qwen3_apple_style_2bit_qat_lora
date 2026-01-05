@@ -1006,8 +1006,15 @@ class AnemllQATLinearV2(nn.Module):
         cls,
         linear: nn.Linear,
         config: Optional[AnemllQuantConfigV2] = None,
+        skip_init: bool = False,
     ) -> "AnemllQATLinearV2":
-        """Create AnemllQATLinearV2 from existing nn.Linear."""
+        """Create AnemllQATLinearV2 from existing nn.Linear.
+
+        Args:
+            linear: Source nn.Linear to convert
+            config: Quantization config
+            skip_init: If True, skip SVD-based scale initialization (caller will load state_dict)
+        """
         config = config or AnemllQuantConfigV2()
 
         layer = cls(
@@ -1022,8 +1029,9 @@ class AnemllQATLinearV2(nn.Module):
         if linear.bias is not None:
             layer.bias.data = linear.bias.data.clone()
 
-        # Re-initialize scales from the actual weights
-        layer._init_scales_from_weight()
+        # Re-initialize scales from the actual weights (slow SVD - skip if loading state_dict)
+        if not skip_init:
+            layer._init_scales_from_weight()
 
         return layer
 
@@ -1046,8 +1054,15 @@ def replace_linear_with_anemll_v2(
     quantize_attn: bool = True,
     quantize_lm_head: bool = False,
     verbose: bool = True,
+    skip_init: bool = False,
 ) -> int:
-    """Replace MLP and optionally attention linears with AnemllQATLinearV2."""
+    """Replace MLP and optionally attention linears with AnemllQATLinearV2.
+
+    Args:
+        skip_init: If True, skip SVD-based scale initialization (use when loading state_dict after).
+                   This makes layer replacement ~10x faster for multi-GPU/TPU where only rank 0
+                   needs to do the full initialization.
+    """
     import re
 
     mlp_pattern = re.compile(r'\.mlp\.(gate_proj|up_proj|down_proj)$')
@@ -1078,7 +1093,7 @@ def replace_linear_with_anemll_v2(
         else:
             continue
 
-        new_module = AnemllQATLinearV2.from_linear(module, config=cfg)
+        new_module = AnemllQATLinearV2.from_linear(module, config=cfg, skip_init=skip_init)
 
         parts = name.rsplit('.', 1)
         if len(parts) == 2:

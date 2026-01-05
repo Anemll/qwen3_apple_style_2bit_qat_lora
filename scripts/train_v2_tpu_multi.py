@@ -226,27 +226,52 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         use_ste_fp16=False,
     )
 
-    # Serialize layer replacement - one rank at a time to avoid CPU contention
-    # Each rank's SVD takes ~1-2 min; doing all 4 simultaneously causes 10+ min freeze
-    for replacing_rank in range(world_size):
-        if rank == replacing_rank:
-            checkpoint(f"Rank {rank}: Replacing layers with V2 quantized layers...")
-            replace_linear_with_anemll_v2(
-                model,
-                mlp_config=v2_mlp_config,
-                attn_config=v2_attn_config,
-                quantize_attn=True,
-                quantize_lm_head=False,
-            )
-            checkpoint(f"Rank {rank}: V2 layer replacement complete")
-        # All ranks wait here before next rank starts
-        xm.rendezvous(f"layer_replacement_done_{replacing_rank}")
+    # Rank 0 does layer replacement (SVD) once, saves state_dict for others to load
+    # Other ranks still need to create the V2 structure, but load weights from rank 0
+    # (they do SVD but it gets overwritten - future optimization: add skip_init option)
+    v2_cache_path = "/tmp/v2_model_state.pt"
 
-    # Load checkpoint if provided
-    if args.v2_checkpoint:
-        state_dict = torch.load(args.v2_checkpoint, map_location='cpu', weights_only=False)
+    if is_master:
+        checkpoint("Rank 0: Replacing layers with V2 quantized layers (SVD init)...")
+        replace_linear_with_anemll_v2(
+            model,
+            mlp_config=v2_mlp_config,
+            attn_config=v2_attn_config,
+            quantize_attn=True,
+            quantize_lm_head=False,
+        )
+        checkpoint("Rank 0: V2 layer replacement complete")
+
+        # Load user checkpoint if provided (before saving for others)
+        if args.v2_checkpoint:
+            state_dict = torch.load(args.v2_checkpoint, map_location='cpu', weights_only=False)
+            model.load_state_dict(state_dict, strict=False)
+            log(f"  Loaded checkpoint: {args.v2_checkpoint}")
+
+        # Save for other ranks
+        checkpoint("Rank 0: Saving V2 model state for other ranks...")
+        torch.save(model.state_dict(), v2_cache_path)
+        checkpoint("Rank 0: V2 state saved")
+
+    # Wait for rank 0 to finish
+    xm.rendezvous("v2_model_ready")
+
+    if not is_master:
+        # Other ranks: create V2 structure (skip SVD) then load rank 0's weights
+        # skip_init=True makes this ~10x faster (no SVD computation)
+        checkpoint(f"Rank {rank}: Creating V2 structure (skip_init=True)...")
+        replace_linear_with_anemll_v2(
+            model,
+            mlp_config=v2_mlp_config,
+            attn_config=v2_attn_config,
+            quantize_attn=True,
+            quantize_lm_head=False,
+            skip_init=True,  # Skip SVD - will load from rank 0
+        )
+        checkpoint(f"Rank {rank}: Loading V2 weights from rank 0...")
+        state_dict = torch.load(v2_cache_path, map_location='cpu', weights_only=False)
         model.load_state_dict(state_dict, strict=False)
-        log(f"  Loaded checkpoint: {args.v2_checkpoint}")
+        checkpoint(f"Rank {rank}: V2 weights loaded")
 
     # Move to device
     checkpoint("Moving model to device...")
