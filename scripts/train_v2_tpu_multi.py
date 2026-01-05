@@ -24,27 +24,16 @@ from pathlib import Path
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_DIR))
 
-# Check for TPU before anything else
+# Check for TPU - IMPORTANT: Don't call any XLA functions before xmp.spawn()!
 def check_tpu():
-    """Check if TPU is available and return number of chips."""
+    """Check if TPU is available (import only, no XLA calls)."""
     try:
         import torch_xla
-        # Try new API first, fall back to old API
-        try:
-            import torch_xla.runtime as xr
-            num_devices = xr.world_size()
-        except (ImportError, AttributeError):
-            import torch_xla.core.xla_model as xm
-            if hasattr(xm, 'xrt_world_size'):
-                num_devices = xm.xrt_world_size()
-            else:
-                num_devices = 1
-        return True, num_devices
+        # Don't call any XLA functions here - they pre-initialize XLA
+        # which conflicts with xmp.spawn()
+        return True
     except ImportError:
-        return False, 0
-    except Exception as e:
-        print(f"[WARN] TPU check failed: {e}")
-        return False, 0
+        return False
 
 
 def parse_args():
@@ -379,7 +368,8 @@ def train_worker(index, args):
                     print(f"  Saved: {save_path}", flush=True)
 
             step += 1
-            xm.mark_step()
+            # Use new API (torch_xla.sync) instead of deprecated xm.mark_step()
+            torch_xla.sync()
 
     # Final save
     if is_master:
@@ -411,16 +401,17 @@ def main():
         assert os.path.exists(args.v2_checkpoint), f"Checkpoint not found: {args.v2_checkpoint}"
     assert os.path.exists(args.cache_dir), f"Cache dir not found: {args.cache_dir}"
 
-    # Check TPU
-    has_tpu, num_devices = check_tpu()
-    if not has_tpu:
+    # Check TPU (import only - no XLA function calls!)
+    if not check_tpu():
         print("ERROR: TPU not available. Use train_v2_simple.py for CPU/GPU.")
         sys.exit(1)
 
-    num_chips = args.num_chips or num_devices
+    # Use specified chips or default to 4 (detected inside worker)
+    num_chips = args.num_chips or 4
     print(f"[TPU Multi-chip] Launching on {num_chips} chips...")
+    print(f"  (device count will be verified inside workers)")
 
-    # Launch with xmp.spawn
+    # Launch with xmp.spawn - this is where XLA should first initialize
     import torch_xla.distributed.xla_multiprocessing as xmp
 
     xmp.spawn(train_worker, args=(args,), nprocs=num_chips)
