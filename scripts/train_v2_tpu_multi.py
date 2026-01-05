@@ -228,7 +228,9 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     # Rank 0 does layer replacement (SVD) once, saves state_dict for others to load
     # Other ranks still need to create the V2 structure, but load weights from rank 0
     # (they do SVD but it gets overwritten - future optimization: add skip_init option)
-    v2_cache_path = "/tmp/v2_model_state.pt"
+    # Use output_dir for temp file (avoids /tmp permission issues on TPU VMs)
+    os.makedirs(args.output_dir, exist_ok=True)
+    v2_cache_path = os.path.join(args.output_dir, ".v2_model_state_temp.pt")
 
     if is_master:
         do_skip_init = args.v2_checkpoint is not None
