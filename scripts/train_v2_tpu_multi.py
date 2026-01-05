@@ -513,6 +513,10 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     last_loss = 0.0   # Last logged loss value
     t_start = time.time()
 
+    # Rolling window for smoothed ETA/throughput (avoids XLA compile time skew)
+    from collections import deque
+    eta_history = deque(maxlen=5)  # Track (optimizer_step, time) pairs
+
     total_micro_steps = args.max_steps * args.accumulation_steps
     log(f"  Total micro-steps: {total_micro_steps}")
     log(f"  Streaming from {len(dataset.files)} shard files (rank {rank})")
@@ -637,15 +641,39 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                     # Sync before reading loss to ensure XLA graph is evaluated
                     torch_xla.sync()
                     loss_val = last_loss.item() if hasattr(last_loss, 'item') else last_loss
-                    elapsed = time.time() - t_start
-                    eta = elapsed / optimizer_step * (args.max_steps - optimizer_step) if optimizer_step > 0 else 0
-                    tok_per_sec = (optimizer_step * effective_batch * 128) / elapsed
+                    current_time = time.time()
+                    elapsed = current_time - t_start
+
+                    # Update rolling window for smoothed ETA/throughput
+                    eta_history.append((optimizer_step, current_time))
+
+                    # Calculate smoothed ETA and throughput using rolling window
+                    if len(eta_history) >= 2:
+                        old_step, old_time = eta_history[0]
+                        recent_elapsed = current_time - old_time
+                        recent_steps = optimizer_step - old_step
+                        if recent_steps > 0 and recent_elapsed > 0:
+                            steps_per_sec = recent_steps / recent_elapsed
+                            remaining_steps = args.max_steps - optimizer_step
+                            eta = remaining_steps / steps_per_sec
+                            tok_per_sec = steps_per_sec * effective_batch * 128
+                        else:
+                            eta = 0
+                            tok_per_sec = 0
+                    else:
+                        # Fallback for first log
+                        eta = elapsed / optimizer_step * (args.max_steps - optimizer_step) if optimizer_step > 0 else 0
+                        tok_per_sec = (optimizer_step * effective_batch * 128) / elapsed if elapsed > 0 else 0
+
+                    # Format elapsed time
+                    elapsed_str = f"{int(elapsed)//60}:{int(elapsed)%60:02d}"
 
                     if is_master:
                         print(f"  Step {optimizer_step}/{args.max_steps} | "
                               f"Loss: {loss_val:.4f} | "
                               f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
                               f"Tok/s: {tok_per_sec:.0f} | "
+                              f"Time: {elapsed_str} | "
                               f"ETA: {eta/60:.1f}m", flush=True)
 
                     if use_wandb:
