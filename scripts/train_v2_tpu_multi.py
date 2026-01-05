@@ -509,7 +509,8 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
 
     step = 0
     optimizer_step = 0
-    total_loss = 0.0
+    accum_loss = 0.0  # Accumulated loss for current optimizer step
+    last_loss = 0.0   # Last logged loss value
     t_start = time.time()
 
     total_micro_steps = args.max_steps * args.accumulation_steps
@@ -565,10 +566,17 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
             if args.accumulation_steps > 1:
                 loss = loss / args.accumulation_steps
 
+            # Track loss for logging (before backward, while tensor is valid)
+            accum_loss += loss.detach()
+
             # Backward
             if step == 0:
                 checkpoint("Starting first backward pass...")
             loss.backward()
+
+            # Free loss tensor to reduce HBM pressure during accumulation
+            del loss
+
             if step == 0:
                 checkpoint("First backward pass complete")
 
@@ -616,6 +624,11 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
 
                 optimizer.zero_grad()
                 optimizer_step += 1
+
+                # Save accumulated loss and reset for next optimizer step
+                last_loss = accum_loss
+                accum_loss = 0.0
+
                 if optimizer_step == 1:
                     checkpoint("Optimizer step 1 complete")
 
@@ -623,7 +636,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                 if optimizer_step % 20 == 0:
                     # Sync before reading loss to ensure XLA graph is evaluated
                     torch_xla.sync()
-                    loss_val = loss.item() * args.accumulation_steps
+                    loss_val = last_loss.item() if hasattr(last_loss, 'item') else last_loss
                     elapsed = time.time() - t_start
                     eta = elapsed / optimizer_step * (args.max_steps - optimizer_step) if optimizer_step > 0 else 0
                     tok_per_sec = (optimizer_step * effective_batch * 128) / elapsed
