@@ -102,8 +102,8 @@ def main():
                         help='XLA compilation cache directory (speeds up TPU restarts)')
     # Quantization config
     parser.add_argument('--config', type=str, default='q2a4',
-                        choices=['q2a4', 'q4a4', 'q4a4_r32', 'q2a2'],
-                        help='Quantization config preset (default: q2a4)')
+                        choices=['q2a4', 'q4a4', 'q4a4_r32', 'q4_r32', 'q2a2'],
+                        help='Quantization config preset (default: q2a4). q4_r32 is alias for q4a4_r32')
     parser.add_argument('--mlp-lut', type=int, default=None, help='Override MLP LUT size (2-bit=4, 4-bit=16)')
     parser.add_argument('--mlp-rank', type=int, default=None, help='Override MLP scale rank')
     parser.add_argument('--attn-lut', type=int, default=None, help='Override Attention LUT size')
@@ -176,6 +176,7 @@ def main():
         'q2a4': {'mlp_lut': 4, 'mlp_rank': 32, 'attn_lut': 16, 'attn_rank': 8},   # 2-bit MLP, 4-bit Attn
         'q4a4': {'mlp_lut': 16, 'mlp_rank': 4, 'attn_lut': 16, 'attn_rank': 4},    # 4-bit both, rank=4
         'q4a4_r32': {'mlp_lut': 16, 'mlp_rank': 32, 'attn_lut': 16, 'attn_rank': 32},  # 4-bit both, rank=32
+        'q4_r32': {'mlp_lut': 16, 'mlp_rank': 32, 'attn_lut': 16, 'attn_rank': 32},  # Alias for q4a4_r32
         'q2a2': {'mlp_lut': 4, 'mlp_rank': 32, 'attn_lut': 4, 'attn_rank': 32},    # 2-bit both
     }
 

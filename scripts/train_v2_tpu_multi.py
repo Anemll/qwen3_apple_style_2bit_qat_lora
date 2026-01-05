@@ -29,9 +29,16 @@ def check_tpu():
     """Check if TPU is available and return number of chips."""
     try:
         import torch_xla
-        import torch_xla.core.xla_model as xm
-        # Get number of devices
-        num_devices = xm.xrt_world_size() if hasattr(xm, 'xrt_world_size') else 1
+        # Try new API first, fall back to old API
+        try:
+            import torch_xla.runtime as xr
+            num_devices = xr.world_size()
+        except (ImportError, AttributeError):
+            import torch_xla.core.xla_model as xm
+            if hasattr(xm, 'xrt_world_size'):
+                num_devices = xm.xrt_world_size()
+            else:
+                num_devices = 1
         return True, num_devices
     except ImportError:
         return False, 0
@@ -101,9 +108,20 @@ def train_worker(index, args):
     from qat_lora.layer_qat import KDCacheDataset, compute_kd_loss_batch, collate_fn
 
     # Get device for this worker
-    device = xm.xla_device()
-    world_size = xm.xrt_world_size()
-    rank = xm.get_ordinal()
+    # Use new API (torch_xla.device) if available, else fall back
+    try:
+        device = torch_xla.device()
+    except AttributeError:
+        device = xm.xla_device()
+
+    # Get world size - try new API first
+    try:
+        import torch_xla.runtime as xr
+        world_size = xr.world_size()
+        rank = xr.global_ordinal()
+    except (ImportError, AttributeError):
+        world_size = xm.xrt_world_size() if hasattr(xm, 'xrt_world_size') else 1
+        rank = xm.get_ordinal()
 
     is_master = (rank == 0)
 
