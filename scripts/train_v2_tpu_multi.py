@@ -54,6 +54,8 @@ def parse_args():
     parser.add_argument('--accumulation-steps', type=int, default=1)
     parser.add_argument('--weight-decay', type=float, default=0.0)
     parser.add_argument('--dropout', type=float, default=0.0)
+    parser.add_argument('--gradient-checkpointing', action='store_true',
+                        help='Enable gradient checkpointing (saves HBM, slower)')
 
     # Quantization config
     parser.add_argument('--config', type=str, default='q4_r32',
@@ -301,6 +303,18 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                         attn_frozen += p.numel()
         if is_master:
             print(f"  MLP-only mode: frozen {attn_frozen:,} attention params")
+
+    # Enable gradient checkpointing (saves HBM by recomputing activations)
+    if args.gradient_checkpointing:
+        if hasattr(model, 'gradient_checkpointing_enable'):
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            if is_master:
+                print(f"  Gradient checkpointing: enabled")
+        else:
+            if is_master:
+                print(f"  [!] Warning: Model does not support gradient_checkpointing_enable()")
 
     # Move to device
     checkpoint("Moving model to device...")
