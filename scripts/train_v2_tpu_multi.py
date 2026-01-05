@@ -421,6 +421,10 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                 checkpoint("First batch received")
                 log(f"  First batch received, starting XLA compilation...")
 
+            # Heartbeat for steps 4-8 (post-optimizer debugging)
+            if 4 <= step <= 8 and is_master:
+                print(f"  [heartbeat] step={step} starting forward...", flush=True)
+
             # Forward pass (no autocast needed on TPU - BF16 is native)
             if step == 0:
                 checkpoint("Starting first forward pass...")
@@ -433,6 +437,10 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
             if step == 0:
                 checkpoint("First forward pass complete")
 
+            # Heartbeat for steps 4-8
+            if 4 <= step <= 8 and is_master:
+                print(f"  [heartbeat] step={step} forward done, starting backward...", flush=True)
+
             # Scale for accumulation
             if args.accumulation_steps > 1:
                 loss = loss / args.accumulation_steps
@@ -443,24 +451,29 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
             loss.backward()
             if step == 0:
                 checkpoint("First backward pass complete")
-                # Print XLA compilation metrics after first pass
-                if is_master:
-                    log("  XLA Compilation Metrics:")
-                    try:
-                        def _fmt_metric(metric):
-                            if not metric:
-                                return None
-                            count, total_ns, _samples = metric
-                            return f"{count} calls, {total_ns/1e9:.2f}s total"
 
-                        compile_time = _fmt_metric(met.metric_data('CompileTime'))
-                        if compile_time:
-                            log(f"    CompileTime: {compile_time}")
-                        execute_time = _fmt_metric(met.metric_data('ExecuteTime'))
-                        if execute_time:
-                            log(f"    ExecuteTime: {execute_time}")
-                    except Exception as e:
-                        log(f"    (metrics unavailable: {e})")
+            # Heartbeat for steps 4-8
+            if 4 <= step <= 8 and is_master:
+                print(f"  [heartbeat] step={step} backward done", flush=True)
+
+            # Print XLA compilation metrics after first pass
+            if step == 0 and is_master:
+                log("  XLA Compilation Metrics:")
+                try:
+                    def _fmt_metric(metric):
+                        if not metric:
+                            return None
+                        count, total_ns, _samples = metric
+                        return f"{count} calls, {total_ns/1e9:.2f}s total"
+
+                    compile_time = _fmt_metric(met.metric_data('CompileTime'))
+                    if compile_time:
+                        log(f"    CompileTime: {compile_time}")
+                    execute_time = _fmt_metric(met.metric_data('ExecuteTime'))
+                    if execute_time:
+                        log(f"    ExecuteTime: {execute_time}")
+                except Exception as e:
+                    log(f"    (metrics unavailable: {e})")
 
             # Optimizer step every accumulation_steps
             if (step + 1) % args.accumulation_steps == 0:
