@@ -223,7 +223,26 @@ def train_worker(index, args):
 
     # Dataset (each worker loads full dataset, DataLoader handles sharding)
     log("\n[3/4] Loading dataset...")
-    dataset = KDCacheDataset(args.cache_dir, shuffle=True, preload=True)
+
+    # KDCacheDataset is IterableDataset, but for distributed training we need
+    # a map-style dataset. Use preload=True and wrap the cached examples.
+    from torch.utils.data import Dataset as MapDataset
+
+    class KDMapDataset(MapDataset):
+        """Map-style wrapper for preloaded KDCacheDataset examples."""
+        def __init__(self, cache_dir):
+            # Load all examples using KDCacheDataset's preload
+            iterable_ds = KDCacheDataset(cache_dir, shuffle=False, preload=True)
+            self.examples = iterable_ds._cached_examples
+            log(f"  Loaded {len(self.examples)} examples for distributed training")
+
+        def __len__(self):
+            return len(self.examples)
+
+        def __getitem__(self, idx):
+            return self.examples[idx]
+
+    dataset = KDMapDataset(args.cache_dir)
 
     # Sampler for distributed training
     from torch.utils.data.distributed import DistributedSampler
