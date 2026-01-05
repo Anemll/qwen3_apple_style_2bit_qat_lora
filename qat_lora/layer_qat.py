@@ -1535,8 +1535,19 @@ def train_e2e(
         if xm is not None:
             xm.mark_step()
 
-        # Clear gradients (don't actually step optimizer)
+        # Do a FULL optimizer step to precompile optimizer graph
+        # (This was missing - caused hang at first real optimizer step)
+        print("optimizer...", end=" ", flush=True)
+        optimizer.step()
+        if xm is not None:
+            xm.mark_step()
+
+        # Clear gradients and reset optimizer state
         optimizer.zero_grad()
+
+        # Reset optimizer state (we don't want warmup to affect training)
+        # AdamW stores exp_avg and exp_avg_sq per parameter
+        optimizer.state.clear()
 
         warmup_time = time.time() - warmup_t0
         print(f"done ({warmup_time:.1f}s)")

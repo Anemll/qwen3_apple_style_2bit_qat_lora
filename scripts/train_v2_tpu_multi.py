@@ -390,6 +390,58 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
             use_wandb = False
     checkpoint("After WandB init")
 
+    # =========================================================================
+    # XLA WARMUP: Precompile all graphs (forward + backward + optimizer)
+    # This avoids compilation delays during actual training
+    # =========================================================================
+    log("\n[XLA] Warmup: precompiling forward + backward + optimizer...")
+    checkpoint("Starting XLA warmup")
+
+    model.train()
+    optimizer.zero_grad()
+
+    # Get one batch for warmup
+    warmup_iter = iter(dataloader)
+    warmup_batch = next(warmup_iter)
+
+    # Forward pass
+    log("  [warmup] forward...", end=" ")
+    warmup_loss = compute_kd_loss_batch(
+        model, warmup_batch, device, args.temperature,
+        no_grad=False,
+        hard_top1_weight=args.hard_top1,
+        hard_full_weight=0.0,
+    )
+    torch_xla.sync()
+    log("done")
+    checkpoint("Warmup forward complete")
+
+    # Backward pass
+    log("  [warmup] backward...", end=" ")
+    warmup_loss.backward()
+    torch_xla.sync()
+    log("done")
+    checkpoint("Warmup backward complete")
+
+    # Gradient sync + optimizer step (this is the key missing piece!)
+    log("  [warmup] optimizer...", end=" ")
+    xm.reduce_gradients(optimizer)
+    xm.optimizer_step(optimizer)
+    torch_xla.sync()
+    log("done")
+    checkpoint("Warmup optimizer complete")
+
+    # Reset optimizer state (don't want warmup to affect training)
+    optimizer.zero_grad()
+    optimizer.state.clear()
+
+    # Reset dataloader for actual training
+    del warmup_iter, warmup_batch
+    gc.collect()
+
+    log("  [warmup] XLA compilation complete. Training should be fast now.")
+    checkpoint("XLA warmup complete")
+
     # Training loop
     log("\n[4/4] Training...")
     checkpoint("Starting training loop")
