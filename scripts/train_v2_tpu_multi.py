@@ -277,15 +277,15 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         model.load_state_dict(state_dict, strict=False)
         checkpoint(f"Rank {rank}: V2 weights loaded")
 
+    # Freeze Q BEFORE moving to device (avoids XLA compilations on TPU)
+    freeze_Q_all(model)
+    checkpoint("Model frozen")
+
     # Move to device
     checkpoint("Moving model to device...")
     model.to(device=device, dtype=train_dtype)
     checkpoint("Model on device")
     log(f"  Model loaded ({time.time()-t0:.1f}s)")
-
-    # Freeze Q
-    freeze_Q_all(model)
-    checkpoint("Model frozen")
 
     # Setup trainable parameters
     log("\n[2/4] Setting up training...")
