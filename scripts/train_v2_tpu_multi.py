@@ -522,8 +522,8 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
             torch_xla.sync()
             sync_time = time.time() - t_sync_start
 
-            # Log XLA metrics after first few steps to detect recompilation
-            if step <= 8 and is_master:
+            # Log XLA metrics for first 12 steps (covers 3 optimizer steps with accum=4)
+            if step <= 12 and is_master:
                 try:
                     compile_data = met.metric_data('CompileTime')
                     if compile_data:
