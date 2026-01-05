@@ -748,6 +748,8 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                     save_path = f"{args.output_dir}/checkpoint_step{optimizer_step}.pt"
                     # Only master saves (all chips have same weights after sync)
                     xm.save(model.state_dict(), save_path)
+                    # CRITICAL: xm.save is async - must sync to ensure file is written
+                    torch_xla.sync()
                     print(f"  Saved: {save_path}", flush=True)
 
             step += 1
