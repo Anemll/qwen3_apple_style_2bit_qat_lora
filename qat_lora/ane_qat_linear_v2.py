@@ -1093,10 +1093,10 @@ def replace_linear_with_anemll_v2(
     for parent, attr, new_module, name in replacements:
         setattr(parent, attr, new_module)
         if verbose:
-            print(f'  [replaced] {name}')
+            print(f'  [replaced] {name}', flush=True)
 
     if verbose:
-        print(f'\nReplaced {len(replacements)} layers with V2')
+        print(f'\nReplaced {len(replacements)} layers with V2', flush=True)
 
     return len(replacements)
 
