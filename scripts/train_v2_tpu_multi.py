@@ -468,15 +468,26 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     xm.rendezvous("before_warmup")
     checkpoint("All ranks synchronized, starting warmup")
 
-    # Log HBM usage before warmup
-    try:
-        mem = xm.get_memory_info(device)
-        if "bytes_used" in mem:
-            used_gb = mem["bytes_used"] / 1e9
-            total_gb = mem.get("bytes_limit", 0) / 1e9
-            log(f"  [HBM before warmup] {used_gb:.1f}/{total_gb:.1f} GB")
-    except Exception as e:
-        log(f"  [HBM] Could not get memory info: {e}")
+    # Helper to log HBM at each stage
+    def log_hbm(stage_name):
+        try:
+            mem = xm.get_memory_info(device)
+            if "bytes_used" in mem:
+                used_gb = mem["bytes_used"] / 1e9
+                total_gb = mem.get("bytes_limit", 0) / 1e9
+                free_gb = total_gb - used_gb
+                log(f"  [HBM {stage_name}] {used_gb:.1f}/{total_gb:.1f} GB ({100*used_gb/total_gb:.0f}%) - {free_gb:.1f} GB free")
+                if use_wandb:
+                    wandb.log({
+                        f'warmup/{stage_name}_used_gb': used_gb,
+                        f'warmup/{stage_name}_free_gb': free_gb,
+                    }, step=0)
+                return used_gb
+        except Exception as e:
+            log(f"  [HBM] Could not get memory info: {e}")
+        return 0
+
+    log_hbm("before_warmup")
 
     log("\n[XLA] Warmup: precompiling forward + backward + optimizer...")
     checkpoint("Starting XLA warmup")
@@ -500,6 +511,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     torch_xla.sync()
     log("done")
     checkpoint("Warmup forward complete")
+    log_hbm("after_forward")
 
     # Backward pass
     log("  [warmup] backward...", end=" ")
@@ -508,6 +520,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     torch_xla.sync()
     log("done")
     checkpoint("Warmup backward complete")
+    log_hbm("after_backward")
 
     # Gradient sync + optimizer step (this is the key missing piece!)
     log("  [warmup] optimizer...", end=" ")
@@ -516,6 +529,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     torch_xla.sync()
     log("done")
     checkpoint("Warmup optimizer complete")
+    log_hbm("after_optimizer")
 
     # Reset optimizer state (don't want warmup to affect training)
     optimizer.zero_grad()
@@ -524,22 +538,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     # Reset dataloader for actual training
     del warmup_iter, warmup_batch
     gc.collect()
-
-    # Log HBM usage after warmup
-    try:
-        mem = xm.get_memory_info(device)
-        if "bytes_used" in mem:
-            used_gb = mem["bytes_used"] / 1e9
-            total_gb = mem.get("bytes_limit", 0) / 1e9
-            log(f"  [HBM after warmup] {used_gb:.1f}/{total_gb:.1f} GB ({100*used_gb/total_gb:.0f}%)")
-            if use_wandb:
-                wandb.log({
-                    'warmup/hbm_used_gb': used_gb,
-                    'warmup/hbm_total_gb': total_gb,
-                    'warmup/hbm_pct': 100 * used_gb / total_gb if total_gb > 0 else 0,
-                }, step=0)
-    except Exception as e:
-        log(f"  [HBM] Could not get memory info: {e}")
+    log_hbm("after_cleanup")
 
     log("  [warmup] XLA compilation complete. Training should be fast now.")
     checkpoint("XLA warmup complete")
