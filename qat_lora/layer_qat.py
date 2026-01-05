@@ -1702,17 +1702,17 @@ def train_e2e(
                 xm.mark_step()
 
                 # Progress indicator with timing (helpful for debugging XLA compilation)
-                # Sync to get accurate timing (XLA ops are async)
-                if verbose and optimizer_step <= 5:
+                # Only print after completing an optimizer step (not every micro-batch)
+                just_did_opt_step = (step + 1) % accumulation_steps == 0
+                if verbose and optimizer_step <= 5 and just_did_opt_step:
                     import torch_xla
-                    torch_xla.sync()  # Wait for actual execution
+                    torch_xla.sync()  # Wait for actual execution (XLA ops are async)
                     step_time = time.time() - opt_step_start_time
 
                     # Get compilation count from XLA metrics
                     compile_info = ""
                     try:
                         import torch_xla.debug.metrics as met
-                        # Use counter_value for accurate count
                         compile_count = met.counter_value('UncachedCompile') or 0
                         compile_info = f" [compiles: {compile_count}]"
                     except Exception:
