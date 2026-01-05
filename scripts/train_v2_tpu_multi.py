@@ -212,6 +212,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         use_ste_fp16=False,
     )
 
+    log_all("CHECKPOINT: Replacing layers with V2 quantized layers...")
     replace_linear_with_anemll_v2(
         model,
         mlp_config=v2_mlp_config,
@@ -219,6 +220,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         quantize_attn=True,
         quantize_lm_head=False,
     )
+    log_all("CHECKPOINT: V2 layer replacement complete")
 
     # Load checkpoint if provided
     if args.v2_checkpoint:
