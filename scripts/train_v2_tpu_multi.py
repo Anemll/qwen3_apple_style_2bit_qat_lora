@@ -226,15 +226,22 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         use_ste_fp16=False,
     )
 
-    checkpoint("Replacing layers with V2 quantized layers...")
-    replace_linear_with_anemll_v2(
-        model,
-        mlp_config=v2_mlp_config,
-        attn_config=v2_attn_config,
-        quantize_attn=True,
-        quantize_lm_head=False,
-    )
-    checkpoint("V2 layer replacement complete")
+    # Serialize layer replacement - one rank at a time to avoid CPU contention
+    # Each rank's SVD takes ~1-2 min; doing all 4 simultaneously causes 10+ min freeze
+    world_size = xm.xrt_world_size()
+    for replacing_rank in range(world_size):
+        if rank == replacing_rank:
+            checkpoint(f"Rank {rank}: Replacing layers with V2 quantized layers...")
+            replace_linear_with_anemll_v2(
+                model,
+                mlp_config=v2_mlp_config,
+                attn_config=v2_attn_config,
+                quantize_attn=True,
+                quantize_lm_head=False,
+            )
+            checkpoint(f"Rank {rank}: V2 layer replacement complete")
+        # All ranks wait here before next rank starts
+        xm.rendezvous(f"layer_replacement_done_{replacing_rank}")
 
     # Load checkpoint if provided
     if args.v2_checkpoint:
