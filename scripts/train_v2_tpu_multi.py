@@ -81,6 +81,7 @@ def train_worker(index, args):
     """Training worker function - runs on each TPU chip."""
     import time
     import gc
+    import traceback
     import torch
     import torch_xla
     import torch_xla.core.xla_model as xm
@@ -118,8 +119,41 @@ def train_worker(index, args):
         if is_master:
             print(msg, flush=True)
 
+    # Print from ALL ranks for debugging
+    def log_all(msg):
+        print(f"[Rank {rank}] {msg}", flush=True)
+
+    log_all(f"Worker started: device={device}, world_size={world_size}")
+
+    try:
+        _train_worker_impl(index, args, device, rank, world_size, is_master, log, log_all)
+    except Exception as e:
+        log_all(f"FATAL ERROR: {e}")
+        traceback.print_exc()
+        raise
+
+
+def _train_worker_impl(index, args, device, rank, world_size, is_master, log, log_all):
+    """Actual training implementation (wrapped for error handling)."""
+    import time
+    import gc
+    import math
+    import torch
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    from torch.utils.data import DataLoader
+    from transformers import AutoModelForCausalLM
+
+    from qat_lora import (
+        AnemllQuantConfigV2,
+        replace_linear_with_anemll_v2,
+        freeze_Q_all,
+    )
+    from qat_lora.layer_qat import KDCacheDataset, compute_kd_loss_batch, collate_fn
+
     log(f"\n[TPU Multi-chip] Starting training on {world_size} chips")
     log(f"  Rank {rank}: device={device}")
+    log_all("CHECKPOINT: Worker init complete")
 
     # Config presets
     CONFIG_PRESETS = {
@@ -177,11 +211,14 @@ def train_worker(index, args):
         log(f"  Loaded checkpoint: {args.v2_checkpoint}")
 
     # Move to device
+    log_all("CHECKPOINT: Moving model to device...")
     model.to(device=device, dtype=train_dtype)
+    log_all("CHECKPOINT: Model on device")
     log(f"  Model loaded ({time.time()-t0:.1f}s)")
 
     # Freeze Q
     freeze_Q_all(model)
+    log_all("CHECKPOINT: Model frozen")
 
     # Setup trainable parameters
     log("\n[2/4] Setting up training...")
@@ -232,6 +269,7 @@ def train_worker(index, args):
             return self.examples[idx]
 
     dataset = KDMapDataset(args.cache_dir)
+    log_all(f"CHECKPOINT: Dataset loaded, {len(dataset)} examples")
 
     # Sampler for distributed training
     from torch.utils.data.distributed import DistributedSampler
@@ -242,6 +280,7 @@ def train_worker(index, args):
         shuffle=True,
         drop_last=True,
     )
+    log_all("CHECKPOINT: Sampler created")
 
     dataloader = DataLoader(
         dataset,
@@ -250,6 +289,7 @@ def train_worker(index, args):
         collate_fn=collate_fn,
         drop_last=True,
     )
+    log_all("CHECKPOINT: DataLoader created")
 
     # Effective batch size
     effective_batch = args.batch_size * args.accumulation_steps * world_size
@@ -258,10 +298,12 @@ def train_worker(index, args):
     log(f"  Total tokens: {total_tokens/1e6:.1f}M")
 
     # WandB (master only)
+    log_all("CHECKPOINT: Before WandB init")
     use_wandb = args.wandb and is_master
     if use_wandb:
         try:
             import wandb
+            log("  Initializing WandB...")
             wandb.init(
                 project=args.wandb_project,
                 name=args.wandb_run or f"tpu_multi_{args.config}",
@@ -276,11 +318,14 @@ def train_worker(index, args):
                     'accumulation_steps': args.accumulation_steps,
                 },
             )
+            log("  WandB initialized")
         except ImportError:
             use_wandb = False
+    log_all("CHECKPOINT: After WandB init")
 
     # Training loop
     log("\n[4/4] Training...")
+    log_all("CHECKPOINT: Starting training loop")
     log(f"  Steps: {args.max_steps}, Warmup: {args.warmup_steps}")
 
     model.train()
@@ -306,27 +351,40 @@ def train_worker(index, args):
                 break
 
             if step == 0:
+                log_all("CHECKPOINT: First batch received")
                 log(f"  First batch received, starting XLA compilation...")
 
             # Forward pass (no autocast needed on TPU - BF16 is native)
+            if step == 0:
+                log_all("CHECKPOINT: Starting first forward pass...")
             loss = compute_kd_loss_batch(
                 model, batch, device, args.temperature,
                 no_grad=False,
                 hard_top1_weight=args.hard_top1,
                 hard_full_weight=0.0,  # Disabled for TPU
             )
+            if step == 0:
+                log_all("CHECKPOINT: First forward pass complete")
 
             # Scale for accumulation
             if args.accumulation_steps > 1:
                 loss = loss / args.accumulation_steps
 
             # Backward
+            if step == 0:
+                log_all("CHECKPOINT: Starting first backward pass...")
             loss.backward()
+            if step == 0:
+                log_all("CHECKPOINT: First backward pass complete")
 
             # Optimizer step every accumulation_steps
             if (step + 1) % args.accumulation_steps == 0:
+                if step < args.accumulation_steps:
+                    log_all("CHECKPOINT: First optimizer step - gradient sync...")
                 # Gradient sync across chips
                 xm.reduce_gradients(optimizer)
+                if step < args.accumulation_steps:
+                    log_all("CHECKPOINT: Gradient sync complete")
 
                 # Optimizer step
                 xm.optimizer_step(optimizer)
