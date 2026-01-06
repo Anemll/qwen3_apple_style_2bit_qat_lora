@@ -46,11 +46,17 @@ def parse_args():
     parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--max-steps', type=int, default=1000)
     parser.add_argument('--lr', type=float, default=5e-5)
-    parser.add_argument('--hard-top1', type=float, default=0.2)
+    parser.add_argument('--hard-top1', type=float, default=0.2, help='Hard label top-1 weight (start)')
+    parser.add_argument('--hard-top1-end', type=float, default=None,
+                        help='Hard label top-1 weight at end (for annealing). If set, decays from --hard-top1 to this.')
     parser.add_argument('--temperature', type=float, default=2.0)
     parser.add_argument('--warmup-steps', type=int, default=100)
     parser.add_argument('--constant-lr', action='store_true')
+    parser.add_argument('--min-lr-ratio', type=float, default=0.1,
+                        help='Minimum LR as ratio of peak LR for cosine annealing (default: 0.1)')
     parser.add_argument('--save-steps', type=int, default=500)
+    parser.add_argument('--keep-checkpoints', type=int, default=0,
+                        help='Keep only the last N checkpoints (0=keep all). Useful for long runs.')
     parser.add_argument('--accumulation-steps', type=int, default=1)
     parser.add_argument('--weight-decay', type=float, default=0.0)
     parser.add_argument('--dropout', type=float, default=0.0)
@@ -339,7 +345,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     scheduler = None
     if not args.constant_lr or args.warmup_steps > 0:
         import math
-        min_lr_ratio = 0.1
+        min_lr_ratio = args.min_lr_ratio
 
         def lr_lambda(step):
             if step < args.warmup_steps:
@@ -548,6 +554,13 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
     log("\n[4/4] Training...")
     checkpoint("Starting training loop")
     log(f"  Steps: {args.max_steps}, Warmup: {args.warmup_steps}")
+    log(f"  LR: {args.lr} → {args.lr * args.min_lr_ratio} (cosine, min_lr_ratio={args.min_lr_ratio})")
+    if args.hard_top1_end is not None:
+        log(f"  Hard-top1: {args.hard_top1} → {args.hard_top1_end} (annealing)")
+    else:
+        log(f"  Hard-top1: {args.hard_top1}")
+    if args.keep_checkpoints > 0:
+        log(f"  Checkpoints: save every {args.save_steps}, keep last {args.keep_checkpoints}")
 
     model.train()
     optimizer.zero_grad()
@@ -595,13 +608,22 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
             # Forward pass with autocast for BF16 compute (saves memory vs FP32 activations)
             if step == 0:
                 checkpoint("Starting first forward pass...")
+
+            # Calculate current hard_top1 (with optional annealing)
+            if args.hard_top1_end is not None:
+                # Linear decay from hard_top1 to hard_top1_end
+                progress = min(1.0, optimizer_step / max(1, args.max_steps))
+                current_hard_top1 = args.hard_top1 + (args.hard_top1_end - args.hard_top1) * progress
+            else:
+                current_hard_top1 = args.hard_top1
+
             # Pass debug_step for steps 4-8 to help debug post-optimizer hang
             dbg_step = step if (4 <= step <= 8 and is_master) else -1
             with torch.amp.autocast(device_type='xla', dtype=compute_dtype):
                 loss = compute_kd_loss_batch(
                     model, batch, device, args.temperature,
                     no_grad=False,
-                    hard_top1_weight=args.hard_top1,
+                    hard_top1_weight=current_hard_top1,
                     hard_full_weight=0.0,  # Disabled for TPU
                     debug_step=dbg_step,
                 )
@@ -729,6 +751,9 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                             'lr': optimizer.param_groups[0]['lr'],
                             'tokens_per_sec': tok_per_sec,
                         }
+                        # Add hard_top1 if annealing
+                        if args.hard_top1_end is not None:
+                            log_dict['hard_top1'] = current_hard_top1
                         # Add TPU memory stats
                         try:
                             mem = xm.get_memory_info(device)
@@ -752,6 +777,19 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                     xm.save(model.state_dict(), save_path)
                     if is_master:
                         print(f"  Saved: {save_path}", flush=True)
+
+                        # Clean up old checkpoints if keep_checkpoints is set
+                        if args.keep_checkpoints > 0:
+                            import glob
+                            ckpt_pattern = f"{args.output_dir}/checkpoint_step*.pt"
+                            ckpts = sorted(glob.glob(ckpt_pattern), key=os.path.getmtime)
+                            while len(ckpts) > args.keep_checkpoints:
+                                old_ckpt = ckpts.pop(0)
+                                try:
+                                    os.remove(old_ckpt)
+                                    print(f"  [Removed old: {os.path.basename(old_ckpt)}]", flush=True)
+                                except OSError:
+                                    pass
 
             step += 1
             # Use new API (torch_xla.sync) instead of deprecated xm.mark_step()

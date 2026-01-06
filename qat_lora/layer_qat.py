@@ -1203,6 +1203,7 @@ def train_e2e(
     train_g_only: bool = False,
     train_mlp_only: bool = False,
     hard_top1_weight: float = 0.0,
+    hard_top1_end: float = None,
     hard_full_weight: float = 0.0005,
     logging_steps: int = 50,
     eval_steps: int = 200,
@@ -1222,6 +1223,7 @@ def train_e2e(
     weight_decay: float = 0.0,
     dropout: float = 0.0,
     accumulation_steps: int = 1,
+    keep_checkpoints: int = 0,
 ) -> dict:
     """End-to-end KD-QAT training (all layers unfrozen).
 
@@ -1238,7 +1240,8 @@ def train_e2e(
         train_g_only: If True, train only rank_magnitude (G), freeze A and B (requires train_scales=True)
         train_mlp_only: If True, freeze attention layers (q/k/v/o_proj) and only train MLP
                         (gate/up/down_proj). Useful for mixed-bit configs (e.g., 4-bit attn, 2-bit MLP)
-        hard_top1_weight: Weight for hard label top-1 loss (0 to disable)
+        hard_top1_weight: Weight for hard label top-1 loss (0 to disable), or start weight if annealing
+        hard_top1_end: End weight for hard_top1 annealing (None = no annealing, use fixed weight)
         hard_full_weight: Weight for hard label full vocab loss (default 0.0005, helps stability)
         logging_steps: Log every N steps
         eval_steps: Evaluate every N steps
@@ -1259,6 +1262,7 @@ def train_e2e(
         dropout: Dropout rate (default 0.0, try 0.1 for regularization)
         accumulation_steps: Gradient accumulation steps (default 1 = no accumulation)
                            Effective batch = batch_size * accumulation_steps
+        keep_checkpoints: Keep only the last N checkpoints (0=keep all). Useful for long runs.
 
     Returns:
         Dict with 'initial_loss', 'final_loss', 'best_loss', 'steps', 'time_sec'
@@ -1398,7 +1402,10 @@ def train_e2e(
         else:
             print(f"Steps: {max_steps}, LR: {lr}, Batch: {batch_size}")
         if hard_top1_weight > 0 or hard_full_weight > 0:
-            print(f"Hard label: top1={hard_top1_weight}, full={hard_full_weight}")
+            if hard_top1_end is not None:
+                print(f"Hard label: top1={hard_top1_weight}→{hard_top1_end} (annealing), full={hard_full_weight}")
+            else:
+                print(f"Hard label: top1={hard_top1_weight}, full={hard_full_weight}")
 
     # Apply dropout to model if specified
     if dropout > 0:
@@ -1644,12 +1651,20 @@ def train_e2e(
             # Note: TPU/XLA uses 'xla' device type for autocast
             autocast_device = 'xla' if is_tpu else device.type
 
+            # Calculate current hard_top1 (with optional annealing)
+            if hard_top1_end is not None:
+                # Linear decay from hard_top1_weight to hard_top1_end
+                progress = min(1.0, optimizer_step / max(1, max_steps))
+                current_hard_top1 = hard_top1_weight + (hard_top1_end - hard_top1_weight) * progress
+            else:
+                current_hard_top1 = hard_top1_weight
+
             if use_fp16:
                 with torch.amp.autocast(device_type=autocast_device, dtype=torch.float16):
                     loss = compute_kd_loss_batch(
                         model, batch, device, temperature,
                         no_grad=False,
-                        hard_top1_weight=hard_top1_weight,
+                        hard_top1_weight=current_hard_top1,
                         hard_full_weight=hard_full_weight,
                     )
             elif use_mixed_precision:
@@ -1658,14 +1673,14 @@ def train_e2e(
                     loss = compute_kd_loss_batch(
                         model, batch, device, temperature,
                         no_grad=False,
-                        hard_top1_weight=hard_top1_weight,
+                        hard_top1_weight=current_hard_top1,
                         hard_full_weight=hard_full_weight,
                     )
             else:
                 loss = compute_kd_loss_batch(
                     model, batch, device, temperature,
                     no_grad=False,
-                    hard_top1_weight=hard_top1_weight,
+                    hard_top1_weight=current_hard_top1,
                     hard_full_weight=hard_full_weight,
                 )
 
@@ -1804,6 +1819,9 @@ def train_e2e(
                         'train/elapsed_sec': elapsed,
                         'train/tokens_per_sec': tokens_per_sec,
                     }
+                    # Add hard_top1 if annealing
+                    if hard_top1_end is not None:
+                        log_dict['train/hard_top1'] = current_hard_top1
                     # Add best_loss when tracking by training loss (eval disabled)
                     if eval_samples <= 0:
                         log_dict['train/best_loss'] = best_loss
@@ -1875,6 +1893,20 @@ def train_e2e(
                 torch.save(model.state_dict(), ckpt_path)
                 if verbose:
                     print(f"  [Checkpoint saved: {ckpt_path}]")
+
+                # Clean up old checkpoints if keep_checkpoints is set
+                if keep_checkpoints > 0:
+                    import glob
+                    ckpt_pattern = os.path.join(save_dir, "checkpoint_step*.pt")
+                    ckpts = sorted(glob.glob(ckpt_pattern), key=os.path.getmtime)
+                    while len(ckpts) > keep_checkpoints:
+                        old_ckpt = ckpts.pop(0)
+                        try:
+                            os.remove(old_ckpt)
+                            if verbose:
+                                print(f"  [Removed old checkpoint: {os.path.basename(old_ckpt)}]")
+                        except OSError:
+                            pass
 
     # Final evaluation (skip if eval_samples <= 0, e.g., on TPU)
     elapsed = time.time() - t_start

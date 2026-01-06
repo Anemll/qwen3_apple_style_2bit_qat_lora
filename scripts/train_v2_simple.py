@@ -64,7 +64,9 @@ def main():
     parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--max-steps', type=int, default=1000)
     parser.add_argument('--lr', type=float, default=5e-5)  # Lower LR for stability
-    parser.add_argument('--hard-top1', type=float, default=0.2, help='Hard label top-1 weight')
+    parser.add_argument('--hard-top1', type=float, default=0.2, help='Hard label top-1 weight (start)')
+    parser.add_argument('--hard-top1-end', type=float, default=None,
+                        help='Hard label top-1 weight at end (for annealing). If set, decays from --hard-top1 to this.')
     parser.add_argument('--hard-full', type=float, default=0.00005, help='Hard label full vocab weight')
     parser.add_argument('--temperature', type=float, default=2.0, help='KD temperature (default: 2.0)')
     parser.add_argument('--warmup-steps', type=int, default=100, help='LR warmup steps (default: 100)')
@@ -75,6 +77,10 @@ def main():
     parser.add_argument('--g-only', action='store_true', help='Train only rank_magnitude (G), freeze A and B')
     parser.add_argument('--mlp-only', action='store_true', help='Train only MLP layers, freeze attention')
     parser.add_argument('--save-steps', type=int, default=0, help='Save checkpoint every N steps (0=disabled)')
+    parser.add_argument('--keep-checkpoints', type=int, default=0,
+                        help='Keep only the last N checkpoints (0=keep all). Useful for long runs.')
+    parser.add_argument('--min-lr-ratio', type=float, default=0.1,
+                        help='Minimum LR as ratio of peak LR for cosine annealing (default: 0.1)')
     # Regularization
     parser.add_argument('--weight-decay', type=float, default=0.0, help='Weight decay for AdamW (default: 0.0, try 0.01)')
     parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate (default: 0.0, try 0.1)')
@@ -535,6 +541,7 @@ def main():
         train_g_only=args.g_only,
         train_mlp_only=args.mlp_only,
         hard_top1_weight=args.hard_top1,
+        hard_top1_end=args.hard_top1_end,
         hard_full_weight=tpu_hard_full,
         logging_steps=20,
         eval_steps=args.eval_steps,
@@ -551,6 +558,8 @@ def main():
         weight_decay=args.weight_decay,
         dropout=args.dropout,
         accumulation_steps=args.accumulation_steps,
+        min_lr_ratio=args.min_lr_ratio,
+        keep_checkpoints=args.keep_checkpoints,
     )
 
     print(f"\n  Final loss: {result.get('final_loss', 'N/A')}")
