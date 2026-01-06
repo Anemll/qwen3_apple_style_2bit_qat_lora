@@ -81,6 +81,8 @@ def main():
                         help='Keep only the last N checkpoints (0=keep all). Useful for long runs.')
     parser.add_argument('--min-lr-ratio', type=float, default=0.1,
                         help='Minimum LR as ratio of peak LR for cosine annealing (default: 0.1)')
+    parser.add_argument('--clip-grad-norm', type=float, default=1.0,
+                        help='Max gradient norm for clipping (default: 1.0, 0=disable)')
     # Regularization
     parser.add_argument('--weight-decay', type=float, default=0.0, help='Weight decay for AdamW (default: 0.0, try 0.01)')
     parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate (default: 0.0, try 0.1)')
@@ -560,6 +562,7 @@ def main():
         accumulation_steps=args.accumulation_steps,
         min_lr_ratio=args.min_lr_ratio,
         keep_checkpoints=args.keep_checkpoints,
+        clip_grad_norm=args.clip_grad_norm,
     )
 
     print(f"\n  Final loss: {result.get('final_loss', 'N/A')}")

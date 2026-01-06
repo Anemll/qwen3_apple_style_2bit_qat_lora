@@ -57,6 +57,8 @@ def parse_args():
     parser.add_argument('--save-steps', type=int, default=500)
     parser.add_argument('--keep-checkpoints', type=int, default=0,
                         help='Keep only the last N checkpoints (0=keep all). Useful for long runs.')
+    parser.add_argument('--clip-grad-norm', type=float, default=1.0,
+                        help='Max gradient norm for clipping (default: 1.0, 0=disable)')
     parser.add_argument('--accumulation-steps', type=int, default=1)
     parser.add_argument('--weight-decay', type=float, default=0.0)
     parser.add_argument('--dropout', type=float, default=0.0)
@@ -561,6 +563,8 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         log(f"  Hard-top1: {args.hard_top1}")
     if args.keep_checkpoints > 0:
         log(f"  Checkpoints: save every {args.save_steps}, keep last {args.keep_checkpoints}")
+    if args.clip_grad_norm > 0:
+        log(f"  Gradient clipping: max_norm={args.clip_grad_norm}")
 
     model.train()
     optimizer.zero_grad()
@@ -683,6 +687,10 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                 xm.reduce_gradients(optimizer)
                 if step < args.accumulation_steps:
                     checkpoint("Gradient sync complete")
+
+                # Gradient clipping for stability
+                if args.clip_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_grad_norm)
 
                 # Optimizer step
                 if step < args.accumulation_steps:

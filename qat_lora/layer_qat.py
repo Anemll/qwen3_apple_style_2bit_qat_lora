@@ -1224,6 +1224,7 @@ def train_e2e(
     dropout: float = 0.0,
     accumulation_steps: int = 1,
     keep_checkpoints: int = 0,
+    clip_grad_norm: float = 1.0,
 ) -> dict:
     """End-to-end KD-QAT training (all layers unfrozen).
 
@@ -1263,6 +1264,7 @@ def train_e2e(
         accumulation_steps: Gradient accumulation steps (default 1 = no accumulation)
                            Effective batch = batch_size * accumulation_steps
         keep_checkpoints: Keep only the last N checkpoints (0=keep all). Useful for long runs.
+        clip_grad_norm: Max gradient norm for clipping (default 1.0, 0=disable). Improves stability.
 
     Returns:
         Dict with 'initial_loss', 'final_loss', 'best_loss', 'steps', 'time_sec'
@@ -1406,6 +1408,8 @@ def train_e2e(
                 print(f"Hard label: top1={hard_top1_weight}→{hard_top1_end} (annealing), full={hard_full_weight}")
             else:
                 print(f"Hard label: top1={hard_top1_weight}, full={hard_full_weight}")
+        if clip_grad_norm > 0:
+            print(f"Gradient clipping: max_norm={clip_grad_norm}")
 
     # Apply dropout to model if specified
     if dropout > 0:
@@ -1698,13 +1702,14 @@ def train_e2e(
             if (step + 1) % accumulation_steps == 0:
                 if scaler is not None:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    if clip_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    # Gradient clipping for FP16 stability
-                    if use_fp16:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    # Gradient clipping for stability (all precisions)
+                    if clip_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
                     optimizer.step()
 
                 if scheduler is not None:
