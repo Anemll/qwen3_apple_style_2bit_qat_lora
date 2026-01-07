@@ -2101,7 +2101,8 @@ def train_recovery_lora(
         hf_text_field: HF dataset text field (default: 'text')
         hf_max_samples: Max samples from HF dataset (default: all)
         template_mode: Tokenization mode - 'none' (raw text), 'no-think' (chat template),
-                       'think' (chat+thinking), 'both' (mix). Should match KD training.
+                       'think' (chat+thinking), 'both' (mix no-think+think),
+                       'all' (random from none/no-think/think per sample).
         dataset_format: Dataset format for parsing - 'text', 'alpaca', 'sharegpt'
         device: Device to train on
         tokenizer: Tokenizer for encoding text data (required for JSONL/HF data)
@@ -2277,6 +2278,41 @@ def train_recovery_lora(
                     if text:
                         rendered.append(text)
                     break  # Only add once if enable_thinking not supported
+        elif template_mode == "all":
+            # Randomly select from none/no-think/think for each sample
+            import random
+            mode_choice = random.choice(["none", "no-think", "think"])
+            if mode_choice == "none":
+                # Raw text - no template
+                text = "\n\n".join(m.get("content", "") for m in messages if m.get("content"))
+                if text:
+                    rendered.append(text)
+            elif mode_choice == "no-think":
+                try:
+                    text = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=False, enable_thinking=False
+                    )
+                    if text:
+                        rendered.append(text)
+                except TypeError:
+                    text = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=False
+                    )
+                    if text:
+                        rendered.append(text)
+            else:  # think
+                try:
+                    text = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=False, enable_thinking=True
+                    )
+                    if text:
+                        rendered.append(text)
+                except TypeError:
+                    text = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=False
+                    )
+                    if text:
+                        rendered.append(text)
 
         return rendered
 

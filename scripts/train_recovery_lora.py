@@ -99,9 +99,10 @@ def main():
 
     # Template/tokenization args
     parser.add_argument("--template-mode", type=str, default="none",
-                       choices=["none", "no-think", "think", "both"],
+                       choices=["none", "no-think", "think", "both", "all"],
                        help="Tokenization mode: none=raw text, no-think=chat template, "
-                            "think=chat+thinking, both=mix (default: none)")
+                            "think=chat+thinking, both=mix no-think+think, "
+                            "all=random from none/no-think/think (default: none)")
     parser.add_argument("--dataset-format", type=str, default="text",
                        choices=["text", "alpaca", "sharegpt"],
                        help="Dataset format for template parsing (default: text)")
