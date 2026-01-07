@@ -7,6 +7,14 @@ Usage:
     python scripts/test_inference.py checkpoint.pt
     python scripts/test_inference.py checkpoint.pt --prompt "What is 2+2?"
     python scripts/test_inference.py checkpoint.pt --interactive
+
+    # With LoRA adapter (recovery LoRA on top of quantized model)
+    # Option A: Separate LoRA file
+    python scripts/test_inference.py checkpoint.pt --lora lora_adapter.pt
+    python scripts/test_inference.py checkpoint.pt --lora lora_adapter.pt --lora-r 8
+
+    # Option B: Full checkpoint with embedded LoRA (auto-detected)
+    python scripts/test_inference.py full_checkpoint_with_lora.pt
 """
 
 import argparse
@@ -49,6 +57,12 @@ def parse_args():
                         help='Scale rank for attention (auto-detect from config.json)')
     parser.add_argument('--version', type=str, default=None, choices=['v1', 'v2'],
                         help='Force V1 or V2 (auto-detect from config.json)')
+
+    # LoRA adapter
+    parser.add_argument('--lora', type=str, default=None,
+                        help='Path to LoRA adapter checkpoint (loads on top of base V2)')
+    parser.add_argument('--lora-r', type=int, default=8,
+                        help='LoRA rank (must match saved adapter)')
 
     return parser.parse_args()
 
@@ -213,6 +227,48 @@ def load_model(args):
         if baked_detected > 0:
             print(f"  Detected {baked_detected} layers with baked scales (FP16 snap)")
 
+    # Load LoRA adapter
+    # Priority: 1) --lora flag, 2) embedded in checkpoint, 3) none
+    has_lora = False
+    lora_r = args.lora_r  # Default from CLI
+    if version == 'v2':
+        from qat_lora.ane_qat_linear_v2 import enable_recovery_lora_all
+
+        if args.lora:
+            # Explicit --lora flag: load from separate file
+            print(f"\nLoading LoRA adapter: {args.lora}")
+            lora_state = torch.load(args.lora, map_location='cpu')
+            lora_keys = [k for k in lora_state if 'lora_' in k]
+        else:
+            # Check if checkpoint contains LoRA weights
+            lora_keys = [k for k in state_dict if 'lora_' in k]
+            if lora_keys:
+                print(f"\nDetected LoRA weights in checkpoint")
+                lora_state = state_dict
+
+        if args.lora or lora_keys:
+            # Get LoRA rank from config if available (CLI arg takes priority)
+            if config.get('recovery_r') and args.lora_r == 8:  # 8 is default
+                lora_r = config.get('recovery_r')
+            mlp_only = config.get('mlp_only', False)
+            skip_k_proj = config.get('skip_k_proj', True)
+
+            # Enable LoRA on V2 layers
+            enable_recovery_lora_all(
+                model,
+                r=lora_r,
+                mlp_only=mlp_only,
+                skip_k_proj=skip_k_proj,
+                verbose=False,
+            )
+
+            # Load LoRA weights
+            lora_only = {k: lora_state[k] for k in lora_keys}
+            missing, unexpected = model.load_state_dict(lora_only, strict=False)
+            source = "separate file" if args.lora else "checkpoint"
+            print(f"  Loaded {len(lora_keys)} LoRA tensors (from {source})")
+            has_lora = True
+
     # Move to device
     model.to(device)
     model.eval()
@@ -220,26 +276,46 @@ def load_model(args):
     # Freeze for inference
     print("Freezing for inference...")
     if version == 'v2':
-        # V2: Freeze Q first if needed, then cache W_eff
+        # V2: Freeze Q first if needed
         for name, m in model.named_modules():
             if type(m).__name__ == 'AnemllQATLinearV2':
                 if m._Q is None:
                     m.freeze_Q()
-                # Cache W_eff for inference
-                with torch.no_grad():
-                    scales = m._compute_full_scales()
-                    m._cached_weight_q = (m._Q * scales).to(m.weight.dtype)
+                # Only cache W_eff if no LoRA (LoRA adds its own contribution)
+                if not has_lora:
+                    with torch.no_grad():
+                        scales = m._compute_full_scales()
+                        m._cached_weight_q = (m._Q * scales).to(m.weight.dtype)
 
         # Print inference mode
         mode_info = get_inference_mode_v2(model)
-        print(f"  V2 Inference: {mode_info['total']} layers, "
-              f"{mode_info['has_frozen_Q']} with frozen Q")
+        if has_lora:
+            print(f"  V2 Inference: {mode_info['total']} layers with LoRA adapters")
+        else:
+            print(f"  V2 Inference: {mode_info['total']} layers, "
+                  f"{mode_info['has_frozen_Q']} with frozen Q")
     else:
         # V1: Standard freeze
         for m in model.modules():
             if type(m).__name__ == 'AnemllQATLinear':
                 m.freeze_for_inference()
 
+    # Print diagnostic summary
+    print("\n" + "=" * 50)
+    print("Model Configuration Summary")
+    print("=" * 50)
+    print(f"  Version:        {version.upper()}")
+    print(f"  Model ID:       {model_id}")
+    print(f"  Device:         {device}")
+    print(f"  Dtype:          {dtype}")
+    print(f"  LUT bits:       {lut_bits} (MLP), {attn_lut_bits} (Attn)")
+    print(f"  Scale rank:     {scale_rank} (MLP), {attn_scale_rank} (Attn)")
+    print(f"  LoRA:           {'Enabled (r=' + str(lora_r) + ')' if has_lora else 'Disabled'}")
+    if version == 'v2':
+        print(f"  V2 layers:      {mode_info['total']}")
+        if not has_lora:
+            print(f"  Frozen Q:       {mode_info['has_frozen_Q']}")
+    print("=" * 50)
     print("Model ready!\n")
     return model, tokenizer, device
 

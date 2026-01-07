@@ -2026,3 +2026,805 @@ def train_e2e(
         'csv_path': csv_path,
         'wandb_url': wandb_url,
     }
+
+
+# ==============================================================================
+# RECOVERY LORA TRAINING
+# ==============================================================================
+
+
+def train_recovery_lora(
+    model: nn.Module,
+    train_data: Optional[str] = None,
+    train_data_hf: Optional[str] = None,
+    hf_subset: Optional[str] = None,
+    hf_split: str = "train",
+    hf_text_field: str = "text",
+    hf_max_samples: Optional[int] = None,
+    template_mode: str = "none",
+    dataset_format: str = "text",
+    device: torch.device = None,
+    tokenizer = None,
+    recovery_r: int = 8,
+    recovery_alpha: float = None,
+    mlp_only: bool = True,
+    skip_k_proj: bool = True,
+    lr: float = 3e-4,
+    max_steps: int = 1000,
+    batch_size: int = 4,
+    seq_len: int = 4096,
+    warmup_steps: int = 100,
+    weight_decay: float = 0.0,
+    grad_clip: float = 1.0,
+    accumulation_steps: int = 1,
+    log_interval: int = 50,
+    eval_interval: int = 200,
+    eval_samples: int = 100,
+    save_dir: Optional[str] = None,
+    save_steps: int = 500,
+    keep_checkpoints: int = 3,
+    anchor_kl_weight: float = 0.0,
+    anchor_samples: int = 32,
+    resume_from: Optional[str] = None,
+    save_lora_only: bool = False,
+    config: Optional[dict] = None,
+    lora_mode: str = "recover",
+    teacher_model: Optional[str] = None,
+    kd_temperature: float = 2.0,
+    kd_alpha: float = 0.5,
+    use_wandb: bool = False,
+    wandb_project: str = "recovery-lora",
+    wandb_run_name: str = None,
+    verbose: bool = True,
+    debug: bool = False,
+) -> dict:
+    """Train recovery LoRA adapters with multiple training modes.
+
+    Modes:
+        - recover: Standard CE loss on raw text (default)
+        - sft: Supervised fine-tuning on instruction/response pairs
+        - kd: Knowledge distillation from teacher model
+
+    CRITICAL ORDER (before calling this function):
+        1. model = load_model(...)
+        2. model.load_state_dict(checkpoint)
+        3. enable_recovery_lora_all(model, r=8)  # Enable LoRA
+        4. freeze_for_recovery_training(model)    # Freeze base, keep LoRA trainable
+        5. train_recovery_lora(model, ...)        # This function
+
+    Args:
+        model: Model with V2 layers (LoRA already enabled and frozen)
+        train_data: Path to training data (JSONL with 'text' field or packed .pt tensors)
+        train_data_hf: HuggingFace dataset name (e.g., 'NeelNanda/pile-10k')
+        hf_subset: HF dataset subset (e.g., 'wikitext-103-v1')
+        hf_split: HF dataset split (default: 'train')
+        hf_text_field: HF dataset text field (default: 'text')
+        hf_max_samples: Max samples from HF dataset (default: all)
+        template_mode: Tokenization mode - 'none' (raw text), 'no-think' (chat template),
+                       'think' (chat+thinking), 'both' (mix). Should match KD training.
+        dataset_format: Dataset format for parsing - 'text', 'alpaca', 'sharegpt'
+        device: Device to train on
+        tokenizer: Tokenizer for encoding text data (required for JSONL/HF data)
+        recovery_r: LoRA rank (if LoRA not already enabled)
+        recovery_alpha: LoRA alpha (default: recovery_r)
+        mlp_only: If True, only enable LoRA on MLP layers
+        skip_k_proj: If True, skip K projection
+        lr: Learning rate (LoRA tolerates higher LR, default 3e-4)
+        max_steps: Maximum training steps
+        batch_size: Batch size
+        seq_len: Sequence length (4K-8K recommended for recovery)
+        warmup_steps: Warmup steps for LR scheduler
+        weight_decay: Weight decay (0 or small for LoRA)
+        grad_clip: Gradient clipping value
+        accumulation_steps: Gradient accumulation steps
+        log_interval: Steps between logging
+        eval_interval: Steps between evaluation
+        eval_samples: Number of samples for evaluation
+        save_dir: Directory to save checkpoints
+        save_steps: Steps between checkpoints
+        keep_checkpoints: Number of checkpoints to keep
+        anchor_kl_weight: Weight for anchor KL regularizer (0 = disabled)
+        anchor_samples: Number of anchor samples for KL regularizer
+        use_wandb: Whether to log to wandb
+        wandb_project: Wandb project name
+        wandb_run_name: Wandb run name
+        verbose: Print progress
+
+    Returns:
+        Dictionary with training results
+    """
+    import time
+    import json
+    from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
+    # Import recovery LoRA utilities
+    from .ane_qat_linear_v2 import (
+        enable_recovery_lora_all,
+        freeze_for_recovery_training,
+        get_recovery_lora_params,
+        get_recovery_lora_stats,
+    )
+
+    t_start = time.time()
+
+    # Check if LoRA is already enabled, if not enable it
+    lora_stats = get_recovery_lora_stats(model)
+    if lora_stats['enabled'] == 0:
+        if verbose:
+            print("[Recovery LoRA] Enabling LoRA adapters...")
+        enable_recovery_lora_all(
+            model,
+            r=recovery_r,
+            alpha=recovery_alpha,
+            mlp_only=mlp_only,
+            skip_k_proj=skip_k_proj,
+            verbose=verbose,
+        )
+        freeze_for_recovery_training(model, verbose=verbose)
+
+    # Resume from checkpoint if specified
+    if resume_from:
+        if verbose:
+            print(f"\n[Recovery LoRA] Resuming from: {resume_from}")
+        resume_state = torch.load(resume_from, map_location='cpu')
+        # Load only LoRA weights (lora_A, lora_B)
+        lora_keys = [k for k in resume_state if 'lora_' in k]
+        lora_state = {k: resume_state[k] for k in lora_keys}
+        missing, unexpected = model.load_state_dict(lora_state, strict=False)
+        if verbose:
+            print(f"  Loaded {len(lora_keys)} LoRA tensors")
+            if missing:
+                # Filter to show only LoRA-related missing keys
+                lora_missing = [k for k in missing if 'lora_' in k]
+                if lora_missing:
+                    print(f"  Missing LoRA keys: {len(lora_missing)}")
+
+    # Get trainable params
+    trainable_params = get_recovery_lora_params(model)
+    if verbose:
+        print(f"\n[Recovery LoRA Training]")
+        print(f"  Mode: {lora_mode}" + (f" (teacher: {teacher_model})" if lora_mode == "kd" else ""))
+        print(f"  Trainable params: {trainable_params:,} ({trainable_params * 4 / 1024 / 1024:.1f} MB)")
+        print(f"  LR: {lr}, Max steps: {max_steps}, Batch size: {batch_size}")
+        print(f"  Seq len: {seq_len}, Accumulation: {accumulation_steps}")
+        if lora_mode == "kd":
+            print(f"  KD: temperature={kd_temperature}, alpha={kd_alpha}")
+
+    # Helper for template-based tokenization
+    def render_with_template(item, tokenizer, template_mode, dataset_format):
+        """Render text using chat template based on mode and format."""
+        # Parse item into messages based on format
+        if dataset_format == "text":
+            # Raw text - just use the text field
+            text = item if isinstance(item, str) else item.get('text', item.get('content', ''))
+            if template_mode == "none":
+                return [text] if text else []
+            # For text format with template, wrap as user message
+            messages = [{"role": "user", "content": text}]
+        elif dataset_format == "alpaca":
+            # Alpaca format: instruction, input, output
+            instruction = item.get('instruction', '')
+            inp = item.get('input', '')
+            output = item.get('output', '')
+            user_content = f"{instruction}\n{inp}".strip() if inp else instruction
+            messages = [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": output}
+            ]
+        elif dataset_format == "sharegpt":
+            # ShareGPT format: conversations list
+            convs = item.get('conversations', item.get('messages', []))
+            messages = []
+            for c in convs:
+                role = c.get('from', c.get('role', 'user'))
+                role = 'user' if role in ['human', 'user'] else 'assistant'
+                messages.append({"role": role, "content": c.get('value', c.get('content', ''))})
+        else:
+            return []
+
+        if not messages:
+            return []
+
+        # Apply template based on mode
+        rendered = []
+        if template_mode == "none":
+            # Raw text - no template
+            text = "\n\n".join(m.get("content", "") for m in messages if m.get("content"))
+            if text:
+                rendered.append(text)
+        elif template_mode == "no-think":
+            # Chat template without thinking
+            try:
+                text = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=False, enable_thinking=False
+                )
+                if text:
+                    rendered.append(text)
+            except TypeError:
+                # Tokenizer doesn't support enable_thinking
+                text = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=False
+                )
+                if text:
+                    rendered.append(text)
+        elif template_mode == "think":
+            # Chat template with thinking enabled
+            try:
+                text = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=False, enable_thinking=True
+                )
+                if text:
+                    rendered.append(text)
+            except TypeError:
+                text = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=False
+                )
+                if text:
+                    rendered.append(text)
+        elif template_mode == "both":
+            # Both thinking and no-thinking variants
+            for enable in [False, True]:
+                try:
+                    text = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=False, enable_thinking=enable
+                    )
+                    if text:
+                        rendered.append(text)
+                except TypeError:
+                    text = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=False
+                    )
+                    if text:
+                        rendered.append(text)
+                    break  # Only add once if enable_thinking not supported
+
+        return rendered
+
+    # Streaming tokenizer - samples batch_size texts, tokenizes to seq_len each step
+    class StreamingTokenizer:
+        """Memory-efficient tokenizer: sample texts, tokenize, truncate/pad to seq_len."""
+        def __init__(self, texts, tokenizer, render_fn, template_mode, dataset_format,
+                     seq_len, batch_size):
+            # Keep reference to dataset (don't copy to list - saves memory!)
+            # HuggingFace datasets support random access via ds[idx]
+            self.texts = texts
+            self.num_texts = len(texts)
+            self.tokenizer = tokenizer
+            self.render_fn = render_fn
+            self.template_mode = template_mode
+            self.dataset_format = dataset_format
+            self.seq_len = seq_len
+            self.batch_size = batch_size
+            self.pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+
+        def _tokenize_item(self, item):
+            """Tokenize a single item, return tokens truncated to seq_len."""
+            # Get text based on format
+            if self.dataset_format == "text":
+                if isinstance(item, str):
+                    text = item
+                else:
+                    text = item.get('text', item.get('content', ''))
+                if not text or not text.strip():
+                    return None
+                to_render = text
+            else:
+                to_render = item
+
+            # Render with template
+            rendered_list = self.render_fn(to_render, self.tokenizer, self.template_mode, self.dataset_format)
+            if not rendered_list:
+                return None
+
+            # Tokenize first rendered text, truncate to seq_len
+            tokens = self.tokenizer.encode(rendered_list[0], add_special_tokens=False)
+            if len(tokens) > self.seq_len:
+                tokens = tokens[:self.seq_len]
+            return tokens
+
+        def get_batch(self):
+            """Sample batch_size texts, tokenize each to seq_len, return [B, seq_len]."""
+            batch = []
+            attempts = 0
+            max_attempts = self.batch_size * 100  # More attempts for sparse datasets (WikiText has many empty lines)
+
+            while len(batch) < self.batch_size and attempts < max_attempts:
+                attempts += 1
+                # Sample random text (use num_texts for length)
+                idx = random.randint(0, self.num_texts - 1)
+                tokens = self._tokenize_item(self.texts[idx])
+
+                if tokens is None or len(tokens) < 32:  # Skip very short texts
+                    continue
+
+                # Pad if needed
+                if len(tokens) < self.seq_len:
+                    tokens = tokens + [self.pad_id] * (self.seq_len - len(tokens))
+
+                batch.append(tokens)
+
+            if len(batch) < self.batch_size:
+                # Last resort: pad with random tokens if we can't find enough valid texts
+                print(f"  Warning: only found {len(batch)}/{self.batch_size} valid texts after {attempts} attempts")
+                while len(batch) < self.batch_size:
+                    # Create random tokens as fallback
+                    random_tokens = [random.randint(100, 10000) for _ in range(self.seq_len)]
+                    batch.append(random_tokens)
+
+            return torch.tensor(batch, dtype=torch.long)
+
+        def get_total_texts(self):
+            return self.num_texts
+
+    if verbose and template_mode != "none":
+        print(f"  Template mode: {template_mode}, Format: {dataset_format}")
+
+    # Memory debug helper
+    def _debug_mem(label):
+        if not debug:
+            return
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 1024**3
+            print(f"    [MEM {label}] GPU: {alloc:.2f}GB")
+        else:
+            try:
+                import psutil
+                mem = psutil.Process().memory_info().rss / 1024**3
+                print(f"    [MEM {label}] RSS: {mem:.2f}GB")
+            except ImportError:
+                pass
+
+    _debug_mem("start of train_recovery_lora")
+
+    # Load training data
+    # Suppress tokenizer length warnings - we handle chunking ourselves
+    if tokenizer is not None:
+        tokenizer.model_max_length = int(1e12)
+
+    streaming_tokenizer = None  # Will be set for HF/JSONL, None for pre-tokenized .pt
+    input_ids = None  # Will be set for pre-tokenized .pt
+
+    if train_data_hf is not None:
+        # Load from HuggingFace - use streaming tokenizer (memory efficient)
+        if verbose:
+            subset_str = f" ({hf_subset})" if hf_subset else ""
+            print(f"  Loading HF dataset: {train_data_hf}{subset_str}")
+
+        try:
+            from datasets import load_dataset
+        except ImportError:
+            raise ImportError("datasets library required for --train-data-hf. Install with: pip install datasets")
+
+        if hf_subset:
+            ds = load_dataset(train_data_hf, hf_subset, split=hf_split)
+        else:
+            ds = load_dataset(train_data_hf, split=hf_split)
+
+        # Limit samples if requested
+        max_samples = hf_max_samples if hf_max_samples else len(ds)
+        if max_samples < len(ds):
+            ds = ds.select(range(max_samples))
+
+        if verbose:
+            print(f"  Dataset size: {len(ds):,} samples")
+
+        if tokenizer is None:
+            raise ValueError("tokenizer required for HF data")
+
+        # Create streaming tokenizer - tokenizes on-demand, not all at once
+        streaming_tokenizer = StreamingTokenizer(
+            texts=ds,
+            tokenizer=tokenizer,
+            render_fn=render_with_template,
+            template_mode=template_mode,
+            dataset_format=dataset_format,
+            seq_len=seq_len,
+            batch_size=batch_size,
+        )
+        if verbose:
+            print(f"  Streaming tokenizer ready ({batch_size} texts × {seq_len} tokens/batch)")
+
+    elif train_data is not None:
+        if verbose:
+            print(f"  Loading data: {train_data}")
+
+        if train_data.endswith('.pt'):
+            # Pre-tokenized packed tensors - load directly (most efficient)
+            data = torch.load(train_data, map_location='cpu')
+            if isinstance(data, torch.Tensor):
+                input_ids = data
+            else:
+                input_ids = data.get('input_ids', data.get('tokens'))
+            if verbose:
+                print(f"  Pre-tokenized: {input_ids.numel():,} tokens")
+        elif train_data.endswith('.jsonl') or train_data.endswith('.json'):
+            # JSONL - use streaming tokenizer (memory efficient)
+            if tokenizer is None:
+                raise ValueError("tokenizer required for JSONL data")
+
+            # Load items into list (just metadata, not tokenized)
+            items = []
+            with open(train_data, 'r') as f:
+                for line in f:
+                    items.append(json.loads(line))
+
+            if verbose:
+                print(f"  Loaded {len(items):,} items")
+
+            # Create streaming tokenizer
+            streaming_tokenizer = StreamingTokenizer(
+                texts=items,
+                tokenizer=tokenizer,
+                render_fn=render_with_template,
+                template_mode=template_mode,
+                dataset_format=dataset_format,
+                seq_len=seq_len,
+                batch_size=batch_size,
+            )
+            if verbose:
+                print(f"  Streaming tokenizer ready ({batch_size} texts × {seq_len} tokens/batch)")
+        else:
+            raise ValueError(f"Unsupported data format: {train_data}")
+    else:
+        raise ValueError("One of train_data or train_data_hf must be provided")
+
+    # Summary
+    effective_batch_tokens = batch_size * seq_len
+    if verbose:
+        if input_ids is not None:
+            print(f"  Total tokens: {input_ids.numel():,}")
+        print(f"  Effective batch: {effective_batch_tokens:,} tokens")
+
+    # Compute anchor logits if KL regularizer enabled
+    anchor_logits = None
+    if anchor_kl_weight > 0 and anchor_samples > 0:
+        if verbose:
+            print(f"  Computing anchor logits ({anchor_samples} samples)...")
+        model.eval()
+
+        if streaming_tokenizer is not None:
+            # Use streaming tokenizer to get anchor samples
+            anchor_batch = streaming_tokenizer.get_batch().to(device)
+            # Get more samples if needed
+            anchor_batches = [anchor_batch]
+            while sum(b.shape[0] for b in anchor_batches) < anchor_samples:
+                anchor_batches.append(streaming_tokenizer.get_batch().to(device))
+            anchor_batch = torch.cat(anchor_batches, dim=0)[:anchor_samples]
+        else:
+            # Use pre-tokenized input_ids
+            total_tokens = input_ids.numel()
+            anchor_inputs = []
+            for i in range(anchor_samples):
+                start = (i * seq_len) % max(1, total_tokens - seq_len)
+                end = start + seq_len
+                anchor_inputs.append(input_ids[start:end].unsqueeze(0))
+            anchor_batch = torch.cat(anchor_inputs, dim=0).to(device)
+
+        with torch.no_grad():
+            anchor_logits = model(anchor_batch).logits.detach()
+        model.train()
+        if verbose:
+            print(f"  Anchor logits computed: {anchor_logits.shape}")
+
+    # Load teacher model for KD mode
+    teacher = None
+    if lora_mode == "kd" and teacher_model is not None:
+        if verbose:
+            print(f"\n[Recovery LoRA] Loading teacher model: {teacher_model}")
+        from transformers import AutoModelForCausalLM
+        teacher = AutoModelForCausalLM.from_pretrained(
+            teacher_model,
+            torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
+            trust_remote_code=True,
+        )
+        teacher.to(device)
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad = False
+        if verbose:
+            print(f"  Teacher loaded: {sum(p.numel() for p in teacher.parameters()):,} params")
+
+    # Setup optimizer (only LoRA params are trainable)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = AdamW(params, lr=lr, weight_decay=weight_decay)
+
+    # Setup LR scheduler (cosine with warmup)
+    total_steps = max_steps * accumulation_steps
+    # Ensure warmup doesn't exceed total steps
+    effective_warmup = min(warmup_steps, total_steps - 1) if total_steps > 1 else 0
+    cosine_steps = max(1, total_steps - effective_warmup)  # At least 1 to avoid division by zero
+
+    if effective_warmup > 0:
+        warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=effective_warmup)
+        cosine_scheduler = CosineAnnealingLR(optimizer, T_max=cosine_steps)
+        scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[effective_warmup])
+    else:
+        scheduler = CosineAnnealingLR(optimizer, T_max=cosine_steps)
+
+    # Wandb setup
+    wandb_run = None
+    if use_wandb:
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project=wandb_project,
+                name=wandb_run_name or f"recovery_r{recovery_r}",
+                config={
+                    'recovery_r': recovery_r,
+                    'lr': lr,
+                    'max_steps': max_steps,
+                    'batch_size': batch_size,
+                    'seq_len': seq_len,
+                    'mlp_only': mlp_only,
+                    'anchor_kl_weight': anchor_kl_weight,
+                },
+            )
+        except ImportError:
+            print("wandb not installed, skipping logging")
+            use_wandb = False
+
+    # Training loop
+    total_loss = 0.0
+    best_loss = float('inf')
+    best_state = None
+    loss_history = []
+    optimizer_step = 0
+
+    # Sanity check: compare eval vs train mode CE loss
+    if debug and (streaming_tokenizer is not None or input_ids is not None):
+        print(f"\n  [DEBUG] Sanity check - eval vs train mode:")
+        # Get a test batch
+        if streaming_tokenizer is not None:
+            test_batch = streaming_tokenizer.get_batch().to(device)
+        else:
+            test_batch = input_ids[:seq_len].unsqueeze(0).to(device)
+        test_labels = test_batch.clone()
+
+        # Eval mode
+        model.eval()
+        with torch.no_grad():
+            eval_out = model(test_batch)
+            eval_logits = eval_out.logits
+            eval_loss = F.cross_entropy(
+                eval_logits[:, :-1, :].reshape(-1, eval_logits.size(-1)),
+                test_labels[:, 1:].reshape(-1),
+            )
+        print(f"    Eval mode CE loss: {eval_loss.item():.4f}")
+        print(f"    Eval logits range: [{eval_logits.min().item():.2f}, {eval_logits.max().item():.2f}]")
+
+        # Train mode
+        model.train()
+        with torch.no_grad():
+            train_out = model(test_batch)
+            train_logits = train_out.logits
+            train_loss = F.cross_entropy(
+                train_logits[:, :-1, :].reshape(-1, train_logits.size(-1)),
+                test_labels[:, 1:].reshape(-1),
+            )
+        print(f"    Train mode CE loss: {train_loss.item():.4f}")
+        print(f"    Train logits range: [{train_logits.min().item():.2f}, {train_logits.max().item():.2f}]")
+
+        # Check if they're similar
+        logit_diff = (eval_logits - train_logits).abs().max().item()
+        print(f"    Max logit diff (eval vs train): {logit_diff:.6f}")
+        if logit_diff > 0.01:
+            print(f"    WARNING: Significant difference between eval and train mode!")
+
+        # Clean up sanity check tensors
+        del eval_out, eval_logits, eval_loss, train_out, train_logits, train_loss
+        del test_batch, test_labels
+        import gc
+        gc.collect()
+
+    model.train()
+
+    if verbose:
+        print(f"\n  Starting training...")
+
+    for step in range(1, total_steps + 1):
+        # Get batch - either from streaming tokenizer or pre-tokenized data
+        if streaming_tokenizer is not None:
+            input_batch = streaming_tokenizer.get_batch().to(device)  # [B, seq_len]
+        else:
+            # Sample random batch from pre-tokenized packed data
+            total_tokens = input_ids.numel()
+            batch_inputs = []
+            for b in range(batch_size):
+                start = random.randint(0, max(1, total_tokens - seq_len - 1))
+                end = start + seq_len
+                batch_inputs.append(input_ids[start:end])
+            input_batch = torch.stack(batch_inputs).to(device)  # [B, seq_len]
+
+        labels = input_batch.clone()  # Next token prediction
+
+        # Debug: show input sequence before forward pass
+        if debug and step == 1:
+            print(f"\n  [DEBUG] Step {step}:")
+            print(f"    Input shape: {input_batch.shape}")
+            print(f"    Input tokens (first 50): {input_batch[0, :50].tolist()}")
+            if tokenizer is not None:
+                decoded = tokenizer.decode(input_batch[0, :100].tolist(), skip_special_tokens=False)
+                print(f"    Input text (first 100 tokens): {repr(decoded[:200])}")
+
+        # Forward pass
+        outputs = model(input_batch)
+        logits = outputs.logits  # [B, seq_len, vocab]
+
+        # Debug: show batch info on first step
+        if debug and step == 1:
+            print(f"    Logits shape: {logits.shape}")
+            print(f"    Logits range: [{logits.min().item():.2f}, {logits.max().item():.2f}]")
+
+        # Compute CE loss (shift for next-token prediction)
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        ce_loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
+
+        # Mode-specific loss computation
+        if lora_mode == "kd" and teacher is not None:
+            # Knowledge distillation: combine CE + KL from teacher
+            with torch.no_grad():
+                teacher_outputs = teacher(input_batch)
+                teacher_logits = teacher_outputs.logits[:, :-1, :].contiguous()
+
+            # KL divergence with temperature
+            kd_loss = F.kl_div(
+                F.log_softmax(shift_logits / kd_temperature, dim=-1),
+                F.softmax(teacher_logits / kd_temperature, dim=-1),
+                reduction='batchmean',
+            ) * (kd_temperature ** 2)
+
+            # Combined loss: alpha * KD + (1 - alpha) * CE
+            loss = kd_alpha * kd_loss + (1 - kd_alpha) * ce_loss
+
+            if debug and step == 1:
+                print(f"    KD mode: ce={ce_loss.item():.4f}, kd={kd_loss.item():.4f}, total={loss.item():.4f}")
+        else:
+            # recover/sft mode: just CE loss
+            loss = ce_loss
+
+        # Debug: show loss and predictions
+        if debug and step == 1:
+            print(f"    CE Loss: {ce_loss.item():.4f}")
+            # Show predicted vs actual for first few tokens
+            with torch.no_grad():
+                preds = shift_logits[0, :5].argmax(dim=-1)
+                actuals = shift_labels[0, :5]
+                print(f"    Predicted tokens (0-4): {preds.tolist()}")
+                print(f"    Actual tokens (0-4):    {actuals.tolist()}")
+                if tokenizer is not None:
+                    pred_text = tokenizer.decode(preds.tolist())
+                    actual_text = tokenizer.decode(actuals.tolist())
+                    print(f"    Predicted: {repr(pred_text)}")
+                    print(f"    Actual:    {repr(actual_text)}")
+
+        # Optional anchor KL regularizer
+        if anchor_kl_weight > 0 and anchor_logits is not None:
+            # Use first anchor_samples batches for KL
+            anchor_idx = (step - 1) % anchor_samples
+            anchor_input = input_ids[anchor_idx * seq_len:(anchor_idx + 1) * seq_len].unsqueeze(0).to(device)
+            current_logits = model(anchor_input)
+            kl_loss = F.kl_div(
+                F.log_softmax(current_logits, dim=-1),
+                F.softmax(anchor_logits[anchor_idx:anchor_idx+1], dim=-1),
+                reduction='batchmean',
+            )
+            loss = loss + anchor_kl_weight * kl_loss
+
+        # Scale loss for accumulation
+        loss = loss / accumulation_steps
+        loss.backward()
+        total_loss += loss.item() * accumulation_steps
+
+        # Optimizer step
+        if step % accumulation_steps == 0:
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(params, grad_clip)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+            optimizer_step += 1
+
+            # Logging
+            if optimizer_step % log_interval == 0:
+                avg_loss = total_loss / log_interval
+                elapsed = time.time() - t_start
+                current_lr = scheduler.get_last_lr()[0]
+                tokens_processed = optimizer_step * batch_size * seq_len * accumulation_steps
+                tok_per_sec = tokens_processed / elapsed
+
+                if verbose:
+                    print(f"  Step {optimizer_step}/{max_steps}: loss={avg_loss:.4f}, lr={current_lr:.2e}, tok/s={tok_per_sec:.0f}")
+
+                if use_wandb and wandb_run is not None:
+                    wandb.log({
+                        'train/loss': avg_loss,
+                        'train/lr': current_lr,
+                        'train/tokens_per_sec': tok_per_sec,
+                    }, step=optimizer_step)
+
+                loss_history.append(avg_loss)
+                total_loss = 0.0
+
+                # Track best checkpoint
+                if avg_loss < best_loss:
+                    best_loss = avg_loss
+                    if save_dir:
+                        os.makedirs(save_dir, exist_ok=True)
+                        # Save config.json if provided and not already present
+                        config_path = os.path.join(save_dir, "config.json")
+                        if config and not os.path.exists(config_path):
+                            import json
+                            with open(config_path, 'w') as f:
+                                json.dump(config, f, indent=2)
+                            if verbose:
+                                print(f"    [Saved config.json]")
+                        best_path = os.path.join(save_dir, "best_recovery_lora.pt")
+                        if save_lora_only:
+                            # Save only LoRA weights (17MB, memory efficient)
+                            state = {k: v.cpu().clone() for k, v in model.state_dict().items() if 'lora_' in k}
+                            torch.save(state, best_path)
+                            del state
+                            if verbose:
+                                print(f"    [Saved best LoRA-only: {best_loss:.4f}]")
+                        else:
+                            # Save full model (can be used directly for inference)
+                            torch.save(model.state_dict(), best_path)
+                            if verbose:
+                                print(f"    [Saved best: {best_loss:.4f}]")
+
+            # Periodic checkpoint saving
+            if save_steps > 0 and save_dir and optimizer_step % save_steps == 0:
+                os.makedirs(save_dir, exist_ok=True)
+                ckpt_path = os.path.join(save_dir, f"recovery_step{optimizer_step}.pt")
+                if save_lora_only:
+                    state = {k: v.cpu().clone() for k, v in model.state_dict().items() if 'lora_' in k}
+                    torch.save(state, ckpt_path)
+                    del state
+                else:
+                    torch.save(model.state_dict(), ckpt_path)
+                if verbose:
+                    print(f"    [Checkpoint: {ckpt_path}]")
+
+                # Clean up old checkpoints
+                if keep_checkpoints > 0:
+                    import glob
+                    ckpts = sorted(
+                        glob.glob(os.path.join(save_dir, "recovery_step*.pt")),
+                        key=os.path.getmtime
+                    )
+                    while len(ckpts) > keep_checkpoints:
+                        os.remove(ckpts.pop(0))
+
+            # Stop if max steps reached
+            if optimizer_step >= max_steps:
+                break
+
+    elapsed = time.time() - t_start
+
+    # Final summary
+    if verbose:
+        print(f"\n=== Recovery LoRA Results ===")
+        final_loss_str = f"{loss_history[-1]:.4f}" if loss_history else "N/A"
+        print(f"  Final loss: {final_loss_str}")
+        print(f"  Best loss: {best_loss:.4f}")
+        print(f"  Steps: {optimizer_step}")
+        print(f"  Time: {elapsed:.1f}s")
+
+    if use_wandb and wandb_run is not None:
+        wandb.finish()
+
+    return {
+        'best_loss': best_loss,
+        'final_loss': loss_history[-1] if loss_history else None,
+        'best_state': best_state,
+        'steps': optimizer_step,
+        'time_sec': elapsed,
+        'loss_history': loss_history,
+    }

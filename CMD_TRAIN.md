@@ -158,9 +158,10 @@ See [AQ1.md](AQ1.md) for detailed progressive quantization documentation.
 | Script | Description |
 |--------|-------------|
 | `scripts/train_v2_simple.py` | Main V2 training script (V1→V2 conversion, resume, from scratch) |
+| `scripts/train_recovery_lora.py` | Recovery LoRA training (recover, sft, kd modes) |
 | `scripts/run_v2_training.sh` | Full training pipeline (extract, train, save to Drive) |
 | `scripts/pull_cache.sh` | Extract KD cache from Google Drive |
-| `scripts/test_inference.py` | Test model inference (single prompt or interactive) |
+| `scripts/test_inference.py` | Test model inference (single prompt or interactive, with LoRA support) |
 | `scripts/snap_and_test_v2.py` | Snap model to FP16 for ANE export |
 | `scripts/convert_q4_to_q2.py` | Convert Q4 checkpoint to Q2 (progressive quantization) |
 | `scripts/convert_v1_to_v2.py` | Convert V1 checkpoint to V2 format |
@@ -175,6 +176,7 @@ See [AQ1.md](AQ1.md) for detailed progressive quantization documentation.
 | `replace_linear_with_anemll_v2()` | Replace nn.Linear with V2 QAT layers |
 | `freeze_Q_all()` | Freeze quantization indices (before training scales) |
 | `train_e2e()` | End-to-end KD training |
+| `train_recovery_lora()` | Recovery LoRA training (recover, sft, kd modes) |
 | `evaluate_kd_loss()` | Evaluate KD loss on cache |
 | `load_v2_checkpoint()` | Load V2 checkpoint with proper _Q buffer handling |
 | `snap_model_for_ane_v2()` | Snap to FP16 for ANE export |
@@ -182,6 +184,8 @@ See [AQ1.md](AQ1.md) for detailed progressive quantization documentation.
 | `ste_fp16()` | Straight-through FP16 rounding (for STE-FP16 training) |
 | `set_factored_inference_v2()` | Enable/disable rank-by-rank forward |
 | `set_batched_forward_v2()` | Enable/disable batched forward mode |
+| `enable_recovery_lora_all()` | Enable LoRA on all V2 layers |
+| `freeze_for_recovery_training()` | Freeze base, keep LoRA trainable |
 
 ---
 
@@ -310,6 +314,89 @@ python scripts/train_v2_simple.py \
     --wandb-run experiment-1
 ```
 
+## Recovery LoRA Training
+
+Train lightweight LoRA adapters on top of quantized V2 models to recover accuracy.
+
+### Training Modes
+
+| Mode | Loss | Use Case |
+|------|------|----------|
+| `recover` | CE (raw text) | Default. General recovery on any text data |
+| `sft` | CE (supervised) | Supervised fine-tuning on instruction data |
+| `kd` | CE + KL | Knowledge distillation from teacher model |
+
+### Mode 1: recover (default)
+
+Train on raw text with cross-entropy loss:
+
+```bash
+python scripts/train_recovery_lora.py \
+    --model Qwen/Qwen3-0.6B \
+    --checkpoint runs/v2_q4a4_r32/best_state_dict.pt \
+    --train-data data/train.jsonl \
+    --lora-mode recover \
+    --recovery-r 8 \
+    --lr 3e-4 \
+    --max-steps 1000 \
+    --output runs/recovery_r8
+```
+
+### Mode 2: sft (Supervised Fine-Tuning)
+
+Train on instruction/response pairs:
+
+```bash
+python scripts/train_recovery_lora.py \
+    --model Qwen/Qwen3-0.6B \
+    --checkpoint runs/v2_q4a4_r32/best_state_dict.pt \
+    --train-data-hf tatsu-lab/alpaca --dataset-format alpaca \
+    --lora-mode sft \
+    --recovery-r 8 \
+    --lr 3e-4 \
+    --max-steps 1000 \
+    --output runs/recovery_sft
+```
+
+### Mode 3: kd (Knowledge Distillation)
+
+Distill from a larger teacher model:
+
+```bash
+python scripts/train_recovery_lora.py \
+    --model Qwen/Qwen3-0.6B \
+    --checkpoint runs/v2_q4a4_r32/best_state_dict.pt \
+    --train-data data/train.jsonl \
+    --lora-mode kd \
+    --teacher Qwen/Qwen3-4B-Instruct \
+    --kd-temperature 2.0 \
+    --kd-alpha 0.5 \
+    --recovery-r 8 \
+    --lr 3e-4 \
+    --max-steps 1000 \
+    --output runs/recovery_kd
+```
+
+### Recovery LoRA Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--checkpoint` | Required | V2 QAT checkpoint |
+| `--recovery-r` | 8 | LoRA rank |
+| `--lora-mode` | recover | Training mode: recover, sft, kd |
+| `--teacher` | None | Teacher model for KD mode |
+| `--kd-temperature` | 2.0 | KD softmax temperature |
+| `--kd-alpha` | 0.5 | KD loss weight (alpha*KD + (1-alpha)*CE) |
+| `--mlp-only` | False | Only add LoRA to MLP layers |
+| `--skip-k-proj` | True | Skip K projection (standard LoRA practice) |
+| `--lr` | 3e-4 | Learning rate |
+| `--max-steps` | 1000 | Training steps |
+| `--seq-len` | 2048 | Sequence length |
+| `--batch-size` | 4 | Batch size |
+| `--save-lora-only` | False | Save only LoRA weights (smaller file) |
+
+---
+
 ## Inference Testing
 
 ### Single Prompt
@@ -336,6 +423,19 @@ python scripts/test_inference.py checkpoint.pt \
     --interactive
 ```
 
+### With LoRA Adapter
+
+```bash
+# Option A: Separate LoRA file
+python scripts/test_inference.py checkpoint.pt \
+    --lora lora_adapter.pt \
+    --lora-r 8 \
+    --interactive
+
+# Option B: Checkpoint with embedded LoRA (auto-detected)
+python scripts/test_inference.py full_checkpoint_with_lora.pt --interactive
+```
+
 ### Inference Options
 
 | Flag | Default | Description |
@@ -345,6 +445,8 @@ python scripts/test_inference.py checkpoint.pt \
 | `--attn-lut-bits` | auto | LUT bits for attention |
 | `--scale-rank` | auto | Scale rank for MLP |
 | `--attn-scale-rank` | auto | Scale rank for attention |
+| `--lora` | None | Path to LoRA adapter checkpoint |
+| `--lora-r` | 8 | LoRA rank (must match saved adapter) |
 | `--max-tokens` | 512 | Max new tokens to generate |
 | `--temperature` | 0.6 | Sampling temperature |
 | `--repetition-penalty` | 1.1 | Repetition penalty |

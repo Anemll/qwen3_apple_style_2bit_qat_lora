@@ -484,6 +484,272 @@ V2's rank-by-rank forward:
 
 ---
 
+## 15. V3: Recovery LoRA Adapters
+
+V3 extends V2 with **recovery LoRA adapters** to recover accuracy lost during quantization, similar to Apple's Foundation model approach.
+
+### The Problem
+
+After QAT, quantized models may still have accuracy gaps compared to the original FP model. Additional fine-tuning with KD is expensive and requires the teacher model.
+
+### The Solution
+
+Add lightweight LoRA adapters that are trained **without distillation** using standard next-token prediction:
+
+```
+W_eff = W_q + LoRA_B @ LoRA_A × scaling
+```
+
+Where:
+- `W_q`: Frozen quantized weights from V2
+- `LoRA_A`: [rank, in_features] - FP32 adapter
+- `LoRA_B`: [out_features, rank] - FP32 adapter
+- `scaling = alpha / rank`
+
+### Apple-Style Adapter Placement
+
+Following Apple's Foundation model, we use a selective mask:
+
+| Component | LoRA? | Rationale |
+|-----------|-------|-----------|
+| Query (Q) | Yes | High impact on attention |
+| Key (K) | **No** | Diminishing returns |
+| Value (V) | Yes | High impact on output |
+| Attn Output (O) | Yes | Controls projection |
+| gate_proj | Yes | MLP expansion |
+| up_proj | Yes | MLP expansion |
+| down_proj | Yes | MLP compression |
+
+### Training Pipeline
+
+**Phase 1: QAT (existing)** - Train V2 model with KD loss
+
+**Phase 2: Recovery LoRA (new)** - Train LoRA adapters with CE loss
+
+```python
+# CRITICAL ORDER (avoid DDP/optimizer bugs):
+model = load_model(...)
+model.load_state_dict(qat_checkpoint)
+
+# 1. Enable LoRA BEFORE optimizer/DDP
+enable_recovery_lora_all(model, r=8, mlp_only=True)
+
+# 2. Freeze base, keep only LoRA trainable
+freeze_for_recovery_training(model)
+
+# 3. Create optimizer (only sees LoRA params)
+optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=3e-4)
+
+# 4. Train with CE loss (no KD needed!)
+for batch in dataloader:
+    logits = model(batch['input_ids'])
+    loss = cross_entropy(logits, batch['labels'])
+    loss.backward()
+    optimizer.step()
+```
+
+### Key Design Decisions
+
+| Decision | Choice | Why |
+|----------|--------|-----|
+| LoRA dtype | FP32 | Optimizer stability (cast to input dtype in forward) |
+| Start rank | 8 | ~4M params, increase to 16/32 if needed |
+| Sequence length | 4K-8K | Longer than QAT (only LoRA trainable) |
+| Loss | CE | No KD needed - smoothing quantization errors |
+| K projection | Skip | Standard LoRA practice, diminishing returns |
+
+### Hyperparameters
+
+| Param | Start Value | Notes |
+|-------|-------------|-------|
+| r | 8 | Start small, increase if needed |
+| lr | 3e-4 | LoRA tolerates higher LR |
+| weight_decay | 0 | Very small for LoRA |
+| grad_clip | 1.0 | |
+| warmup_steps | 100 | |
+
+### Optional: Anchor KL Regularizer
+
+To prevent drift from the base model:
+
+```python
+# Save base logits on anchor samples (before training)
+anchor_logits = model(anchor_batch).detach()
+
+# During training, add small KL penalty
+loss = loss_ce + 0.01 * kl_div(current_logits, anchor_logits)
+```
+
+### Export Modes
+
+**Mode 1: Adapter-on** (for iteration)
+- Export base + LoRA separately
+- Runtime: `y = quant_forward(x) + lora_forward(x)`
+- Simple but adds 2 matmuls per layer
+
+**Mode 2: Merged/Resnap** (for ANE deployment)
+- Merge LoRA into effective weights
+- Re-quantize to new indices
+- Export pure V2 model (no LoRA ops)
+
+```python
+# Merge LoRA and re-quantize
+resnap_with_lora(model)
+# Now model is LoRA-free, ready for ANE
+```
+
+### API Reference
+
+```python
+from qat_lora.ane_qat_linear_v2 import (
+    enable_recovery_lora_all,    # Enable LoRA on all V2 layers
+    freeze_for_recovery_training, # Freeze base, keep LoRA trainable
+    get_recovery_lora_params,     # Count trainable params
+    get_recovery_lora_stats,      # Detailed statistics
+    disable_recovery_lora_all,    # Disable LoRA
+    resnap_with_lora,             # Merge LoRA and re-quantize
+)
+
+from qat_lora.layer_qat import (
+    train_recovery_lora,          # Training function
+)
+```
+
+### Training Modes
+
+Recovery LoRA supports three training modes via `--lora-mode`:
+
+| Mode | Loss | Description |
+|------|------|-------------|
+| `recover` | CE (raw text) | Default. Model generates its own response, train on full sequence |
+| `sft` | CE (supervised) | Standard supervised fine-tuning on instruction/response pairs |
+| `kd` | CE + KL | Knowledge distillation from a teacher model |
+
+**Mode: recover (default)**
+- Train on raw text with cross-entropy loss
+- No special formatting required
+- Good for general language modeling recovery
+
+**Mode: sft**
+- Standard supervised fine-tuning
+- Uses instruction/response data
+- Same as `recover` for CE loss, but implies instruction-tuning intent
+
+**Mode: kd (Knowledge Distillation)**
+- Requires `--teacher` model (e.g., `Qwen/Qwen3-4B-Instruct`)
+- Combined loss: `alpha * KD_loss + (1-alpha) * CE_loss`
+- KD loss: KL divergence with temperature scaling
+- Best for recovering teacher-level accuracy
+
+### CLI Script
+
+```bash
+# Mode 1: recover (default) - CE on raw text
+python scripts/train_recovery_lora.py \
+    --model Qwen/Qwen3-0.6B \
+    --checkpoint runs/v2_q4a4_r32/best_state_dict.pt \
+    --train-data data/train.jsonl \
+    --recovery-r 8 \
+    --mlp-only \
+    --lr 3e-4 \
+    --max-steps 1000 \
+    --seq-len 4096 \
+    --output runs/recovery_r8
+
+# Mode 2: sft - Supervised fine-tuning
+python scripts/train_recovery_lora.py \
+    --model Qwen/Qwen3-0.6B \
+    --checkpoint runs/v2_q4a4_r32/best_state_dict.pt \
+    --train-data-hf tatsu-lab/alpaca --dataset-format alpaca \
+    --lora-mode sft \
+    --recovery-r 8 \
+    --max-steps 1000 \
+    --output runs/recovery_sft
+
+# Mode 3: kd - Knowledge distillation from teacher
+python scripts/train_recovery_lora.py \
+    --model Qwen/Qwen3-0.6B \
+    --checkpoint runs/v2_q4a4_r32/best_state_dict.pt \
+    --train-data data/train.jsonl \
+    --lora-mode kd \
+    --teacher Qwen/Qwen3-4B-Instruct \
+    --kd-temperature 2.0 \
+    --kd-alpha 0.5 \
+    --recovery-r 8 \
+    --max-steps 1000 \
+    --output runs/recovery_kd
+```
+
+### Recovery LoRA Training Data Format
+
+**Note:** This is for Recovery LoRA training (Phase 2) only. Phase 1 QAT uses pre-computed KD cache (see Section 1).
+
+**Option A: HuggingFace Dataset** (recommended for quick iterations)
+```bash
+# Fast testing with Pile-10k (raw text)
+--train-data-hf NeelNanda/pile-10k
+
+# WikiText-103 (larger)
+--train-data-hf Salesforce/wikitext --hf-subset wikitext-103-v1
+
+# Alpaca with chat template (match KD training)
+--train-data-hf tatsu-lab/alpaca --dataset-format alpaca --template-mode no-think
+
+# Alpaca with thinking tokens (Qwen3)
+--train-data-hf tatsu-lab/alpaca --dataset-format alpaca --template-mode think
+
+# Both variants (more diverse)
+--train-data-hf tatsu-lab/alpaca --dataset-format alpaca --template-mode both
+
+# Limit samples for quick tests
+--train-data-hf NeelNanda/pile-10k --hf-max-samples 1000
+```
+
+**Template modes** (should match KD training):
+| Mode | Description |
+|------|-------------|
+| `none` | Raw text (no template) - default |
+| `no-think` | Chat template without thinking tokens |
+| `think` | Chat template with thinking enabled (Qwen3) |
+| `both` | Mix of no-think and think variants |
+
+**Dataset formats**:
+| Format | Fields |
+|--------|--------|
+| `text` | `text` or `content` field |
+| `alpaca` | `instruction`, `input`, `output` |
+| `sharegpt` | `conversations` with `from`/`value` |
+
+**Option B: Local JSONL file** (`.jsonl`)
+```json
+{"text": "This is a training sample..."}
+{"text": "Another training sample..."}
+```
+
+Or with `content` field:
+```json
+{"content": "This is a training sample..."}
+```
+
+**Option C: Pre-tokenized tensor** (`.pt`)
+```python
+# Create pre-tokenized data
+tokens = tokenizer(texts, return_tensors='pt')['input_ids']
+torch.save(tokens, 'data/train.pt')
+```
+
+Pre-tokenized format is fastest (skips tokenization) and recommended for large-scale training.
+
+### Results (Expected)
+
+| Stage | KD Loss |
+|-------|---------|
+| V2 QAT baseline | ~0.53 |
+| + Recovery LoRA (MLP-only, r=8) | ~0.45 |
+| + Recovery LoRA (full, r=16) | ~0.40 |
+
+---
+
 ## References
 
 - See [CMD_TRAIN.md](CMD_TRAIN.md) for training commands

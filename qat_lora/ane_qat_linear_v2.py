@@ -680,6 +680,62 @@ class AnemllQATLinearV2(nn.Module):
         if self._B_idx is not None:
             self._B_idx = self._B_idx.detach()
 
+    def enable_recovery_lora(self, r: int, alpha: float = None, dropout: float = 0.0):
+        """Enable recovery LoRA adapters for post-QAT knowledge recovery.
+
+        This method initializes LoRA parameters to recover accuracy lost during
+        quantization. Call this AFTER loading a QAT checkpoint and BEFORE
+        creating the optimizer (see critical ordering below).
+
+        CRITICAL ORDER for DDP/optimizer compatibility:
+            1. model = load_model(...)
+            2. model.load_state_dict(checkpoint)
+            3. enable_recovery_lora_all(model, r=8)  # <-- enables LoRA
+            4. freeze_for_recovery_training(model)
+            5. optimizer = AdamW([p for p in model.parameters() if p.requires_grad])
+            6. model = DDP(model) / FSDP(model) if distributed
+
+        Args:
+            r: LoRA rank (recommended: start with 8, increase to 16/32 if needed)
+            alpha: LoRA alpha (default: r). Controls scaling = alpha / r
+            dropout: LoRA dropout (default: 0.0)
+
+        Note:
+            - LoRA params are created in FP32 for optimizer stability
+            - Forward pass casts to input dtype automatically
+            - Initialize: A with small random (std=0.02), B with zeros
+        """
+        if self.lora_r > 0:
+            return  # Already enabled
+
+        alpha = alpha if alpha is not None else float(r)
+        self.lora_r = int(r)
+        self.lora_alpha = float(alpha)
+        self.scaling = alpha / r
+        self.lora_dropout = float(dropout)
+
+        # IMPORTANT: Keep LoRA in FP32 even if base is FP16 (optimizer stability)
+        device = self.weight.device
+        self.lora_A = nn.Parameter(
+            torch.zeros(self.lora_r, self.in_features, device=device, dtype=torch.float32)
+        )
+        self.lora_B = nn.Parameter(
+            torch.zeros(self.out_features, self.lora_r, device=device, dtype=torch.float32)
+        )
+        self.lora_drop = nn.Dropout(p=dropout) if dropout > 0 else None
+
+        # Initialize: A with small random, B with zeros (standard LoRA init)
+        nn.init.normal_(self.lora_A, std=0.02)
+        nn.init.zeros_(self.lora_B)
+
+    def disable_recovery_lora(self):
+        """Disable recovery LoRA adapters (for inference without LoRA)."""
+        self.lora_r = 0
+        self.lora_A = None
+        self.lora_B = None
+        self.lora_drop = None
+        self.scaling = 0.0
+
     @torch.no_grad()
     def unfreeze_rank_lut_for_training(self):
         """Clear cached indices to enable STE-based training.
@@ -720,15 +776,30 @@ class AnemllQATLinearV2(nn.Module):
 
         Q = Q.to(x.dtype)
 
-        # Choose forward implementation
-        if self.use_batched_forward:
-            y = self._forward_batched(x, A_dir, B_dir, g, Q)
-        else:
-            y = self._forward_loop(x, A_dir, B_dir, g, Q)
+        # For LoRA training: V2 base doesn't need gradients, only LoRA does
+        # This saves massive memory by not building computation graph for V2
+        # Also use loop-based forward to avoid materializing [batch,seq,rank,out] tensors
+        use_no_grad_base = self.lora_r > 0 and self.training
 
-        # Add bias
-        if self.bias is not None:
-            y = y + self.bias.to(x.dtype)
+        if use_no_grad_base:
+            with torch.no_grad():
+                # ALWAYS use loop-based forward for LoRA training - much more memory efficient
+                # _forward_batched creates [batch,seq,rank,in] and [batch,seq,rank,out] tensors
+                # _forward_loop only keeps [batch,seq,out] accumulator
+                y = self._forward_loop(x, A_dir, B_dir, g, Q)
+                if self.bias is not None:
+                    y = y + self.bias.to(x.dtype)
+            # Detach to ensure no gradients flow back through V2
+            y = y.detach()
+        else:
+            # Choose forward implementation
+            if self.use_batched_forward:
+                y = self._forward_batched(x, A_dir, B_dir, g, Q)
+            else:
+                y = self._forward_loop(x, A_dir, B_dir, g, Q)
+            # Add bias
+            if self.bias is not None:
+                y = y + self.bias.to(x.dtype)
 
         # Add LoRA if enabled (in-place for memory efficiency)
         if self.lora_r > 0:
@@ -1643,3 +1714,371 @@ def get_rank_lut_stats(model: nn.Module) -> dict:
         'lut_memory_kb': total_lut_params * 4 / 1024,  # FP32
         'idx_memory_kb': total_idx_elements * 1 / 1024,  # uint8
     }
+
+
+# =============================================================================
+# RECOVERY LORA MODEL-LEVEL HELPERS
+# =============================================================================
+
+def enable_recovery_lora_all(
+    model: nn.Module,
+    r: int = 8,
+    alpha: float = None,
+    dropout: float = 0.0,
+    skip_k_proj: bool = True,
+    mlp_only: bool = False,
+    verbose: bool = True,
+) -> dict:
+    """Enable recovery LoRA adapters on all V2 layers.
+
+    This function enables LoRA on selected layers following Apple's adapter
+    placement strategy (Q, V, O for attention; gate/up/down for MLP).
+
+    CRITICAL ORDER for DDP/optimizer compatibility:
+        1. model = load_model(...)
+        2. model.load_state_dict(checkpoint)
+        3. enable_recovery_lora_all(model, r=8)  # <-- enables LoRA
+        4. freeze_for_recovery_training(model)
+        5. optimizer = AdamW([p for p in model.parameters() if p.requires_grad])
+        6. model = DDP(model) / FSDP(model) if distributed
+
+    Args:
+        model: Model with V2 layers
+        r: LoRA rank (start with 8, increase to 16/32 if needed)
+        alpha: LoRA alpha (default: r)
+        dropout: LoRA dropout (default: 0.0)
+        skip_k_proj: If True, skip K projection (Apple default)
+        mlp_only: If True, only enable LoRA on MLP layers (recommended first)
+        verbose: Print summary
+
+    Returns:
+        Dictionary with mask info for checkpoint:
+        {
+            'recovery_lora_mask': {'attn': [...], 'mlp': [...]},
+            'recovery_lora_r': r,
+            'recovery_lora_alpha': alpha,
+            'layers_enabled': count
+        }
+    """
+    alpha = alpha if alpha is not None else float(r)
+    mask = {'attn': [], 'mlp': []}
+    count = 0
+    total_params = 0
+
+    attn_names = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
+    mlp_names = ['gate_proj', 'up_proj', 'down_proj']
+
+    for name, module in model.named_modules():
+        if not isinstance(module, AnemllQATLinearV2):
+            continue
+
+        # Determine layer type
+        is_attn = any(a in name for a in attn_names)
+        is_mlp = any(m in name for m in mlp_names)
+        is_k_proj = 'k_proj' in name
+
+        # Apply mask logic
+        if is_k_proj and skip_k_proj:
+            continue
+        if mlp_only and is_attn:
+            continue
+
+        # Enable LoRA
+        module.enable_recovery_lora(r=r, alpha=alpha, dropout=dropout)
+        count += 1
+
+        # Track params
+        if module.lora_A is not None:
+            total_params += module.lora_A.numel() + module.lora_B.numel()
+
+        # Track mask
+        for a in attn_names:
+            if a in name and a not in mask['attn']:
+                mask['attn'].append(a)
+        for m in mlp_names:
+            if m in name and m not in mask['mlp']:
+                mask['mlp'].append(m)
+
+    result = {
+        'recovery_lora_mask': mask,
+        'recovery_lora_r': r,
+        'recovery_lora_alpha': alpha,
+        'layers_enabled': count,
+        'total_lora_params': total_params,
+    }
+
+    if verbose:
+        print(f"\n[Recovery LoRA Enabled]")
+        print(f"  Rank: {r}, Alpha: {alpha}")
+        print(f"  Layers: {count}")
+        print(f"  LoRA params: {total_params:,} ({total_params * 4 / 1024 / 1024:.1f} MB FP32)")
+        print(f"  Attention mask: {mask['attn']}")
+        print(f"  MLP mask: {mask['mlp']}")
+        if mlp_only:
+            print(f"  Mode: MLP-only (attention LoRA disabled)")
+
+    return result
+
+
+def freeze_for_recovery_training(model: nn.Module, verbose: bool = True) -> dict:
+    """Freeze all quantized params, keep only LoRA trainable.
+
+    After calling this, only lora_A and lora_B will have requires_grad=True.
+    All other parameters (weights, scales, Q, rank_magnitude, LUTs) are frozen.
+
+    Args:
+        model: Model with V2 layers (after enable_recovery_lora_all)
+        verbose: Print summary
+
+    Returns:
+        Dictionary with frozen/trainable counts
+    """
+    frozen_count = 0
+    trainable_count = 0
+    lora_params = 0
+
+    for name, module in model.named_modules():
+        if isinstance(module, AnemllQATLinearV2):
+            # Freeze quantized weights
+            if module.weight is not None:
+                module.weight.requires_grad = False
+                frozen_count += 1
+
+            # Freeze scales
+            if module.scale_A is not None:
+                module.scale_A.requires_grad = False
+                frozen_count += 1
+            if module.scale_B is not None:
+                module.scale_B.requires_grad = False
+                frozen_count += 1
+
+            # Freeze rank_magnitude
+            if module.rank_magnitude is not None:
+                module.rank_magnitude.requires_grad = False
+                frozen_count += 1
+
+            # Freeze LUT (if parameter)
+            if isinstance(module.lut, nn.Parameter):
+                module.lut.requires_grad = False
+                frozen_count += 1
+
+            # Freeze rank LUTs (if parameters)
+            if module.A_lut is not None and isinstance(module.A_lut, nn.Parameter):
+                module.A_lut.requires_grad = False
+                module.B_lut.requires_grad = False
+                frozen_count += 2
+
+            # LoRA stays trainable (if enabled)
+            if module.lora_r > 0 and module.lora_A is not None:
+                module.lora_A.requires_grad = True
+                module.lora_B.requires_grad = True
+                trainable_count += 2
+                lora_params += module.lora_A.numel() + module.lora_B.numel()
+
+    # Also freeze non-V2 parameters (embeddings, layernorm, etc.)
+    other_frozen = 0
+    for name, param in model.named_parameters():
+        # Skip V2 LoRA params (already handled)
+        if 'lora_A' in name or 'lora_B' in name:
+            continue
+        # Skip params we've already processed
+        if any(f'.{attr}' in name for attr in ['weight', 'scale_A', 'scale_B', 'rank_magnitude', 'lut', 'A_lut', 'B_lut']):
+            continue
+        # Freeze everything else
+        if param.requires_grad:
+            param.requires_grad = False
+            other_frozen += 1
+
+    stats = {
+        'v2_frozen': frozen_count,
+        'lora_trainable': trainable_count,
+        'other_frozen': other_frozen,
+        'total_lora_params': lora_params,
+    }
+
+    if verbose:
+        print(f"\n[Freeze for Recovery Training]")
+        print(f"  V2 params frozen: {frozen_count}")
+        print(f"  Other params frozen: {other_frozen}")
+        print(f"  LoRA params trainable: {trainable_count}")
+        print(f"  Total LoRA params: {lora_params:,}")
+
+    return stats
+
+
+def get_recovery_lora_params(model: nn.Module) -> int:
+    """Get total number of trainable LoRA parameters.
+
+    Args:
+        model: Model with V2 layers
+
+    Returns:
+        Total number of trainable LoRA parameters
+    """
+    total = 0
+    for module in model.modules():
+        if isinstance(module, AnemllQATLinearV2):
+            if module.lora_r > 0 and module.lora_A is not None:
+                if module.lora_A.requires_grad:
+                    total += module.lora_A.numel()
+                if module.lora_B.requires_grad:
+                    total += module.lora_B.numel()
+    return total
+
+
+def get_recovery_lora_stats(model: nn.Module) -> dict:
+    """Get detailed LoRA statistics for all V2 layers.
+
+    Args:
+        model: Model with V2 layers
+
+    Returns:
+        Dictionary with LoRA statistics
+    """
+    enabled = 0
+    total_params = 0
+    layers_by_type = {'attn': 0, 'mlp': 0, 'other': 0}
+
+    for name, module in model.named_modules():
+        if isinstance(module, AnemllQATLinearV2):
+            if module.lora_r > 0:
+                enabled += 1
+                total_params += module.lora_A.numel() + module.lora_B.numel()
+
+                # Categorize
+                if any(a in name for a in ['q_proj', 'k_proj', 'v_proj', 'o_proj']):
+                    layers_by_type['attn'] += 1
+                elif any(m in name for m in ['gate_proj', 'up_proj', 'down_proj']):
+                    layers_by_type['mlp'] += 1
+                else:
+                    layers_by_type['other'] += 1
+
+    return {
+        'enabled': enabled,
+        'total_params': total_params,
+        'memory_mb': total_params * 4 / 1024 / 1024,  # FP32
+        'layers_by_type': layers_by_type,
+    }
+
+
+def disable_recovery_lora_all(model: nn.Module, verbose: bool = True) -> int:
+    """Disable recovery LoRA on all V2 layers.
+
+    Args:
+        model: Model with V2 layers
+        verbose: Print summary
+
+    Returns:
+        Number of layers with LoRA disabled
+    """
+    count = 0
+    for module in model.modules():
+        if isinstance(module, AnemllQATLinearV2):
+            if module.lora_r > 0:
+                module.disable_recovery_lora()
+                count += 1
+
+    if verbose:
+        print(f"[Recovery LoRA Disabled] {count} layers")
+
+    return count
+
+
+@torch.no_grad()
+def resnap_with_lora(
+    model: nn.Module,
+    verbose: bool = True,
+) -> dict:
+    """Merge LoRA into effective weights and re-quantize.
+
+    IMPORTANT: This is a NON-TRIVIAL operation with LUT quantization.
+    It computes W_eff = W_q + LoRA_delta, then re-quantizes to new indices.
+
+    Use this to export a LoRA-free model for ANE deployment when LoRA
+    matmuls hurt inference performance.
+
+    Pipeline:
+        1. Compute effective FP weight with LoRA applied
+        2. Recompute LUT indices
+        3. Update _Q buffer
+        4. Clear LoRA params
+
+    Args:
+        model: Model with V2 layers (with LoRA enabled)
+        verbose: Print summary
+
+    Returns:
+        Dictionary with resnap statistics
+    """
+    count = 0
+    total_error = 0.0
+
+    for name, module in model.named_modules():
+        if not isinstance(module, AnemllQATLinearV2):
+            continue
+        if module.lora_r <= 0 or module.lora_A is None:
+            continue
+
+        # Get current effective weight (Q * scales)
+        if module._Q is not None:
+            scales = module._compute_full_scales()
+            W_base = module._Q * scales
+        else:
+            # No frozen Q - use fake_quant path (shouldn't happen in trained model)
+            continue
+
+        # Compute LoRA delta: LoRA_B @ LoRA_A * scaling
+        lora_delta = (module.lora_B @ module.lora_A) * module.scaling
+
+        # New effective weight
+        W_eff = W_base + lora_delta.to(W_base.dtype)
+
+        # Recompute scales from new effective weight
+        # (Use existing scales - they're still valid, just re-quantize)
+        scales_new = scales  # Keep existing scales
+
+        # Normalize and re-quantize
+        normalized = W_eff / scales_new
+        indices_new = quantize_to_lut_indices(
+            normalized,
+            lut_size=module.lut.size(0),
+            include_zero=module.config.lut_include_zero,
+        )
+
+        # Update Q buffer
+        lut = module.lut.to(W_eff.dtype)
+        Q_new = lut[indices_new]
+
+        # Compute error
+        W_reconstructed = Q_new * scales_new
+        error = (W_eff - W_reconstructed).abs().mean() / W_eff.abs().mean()
+        total_error += error.item()
+
+        # Update buffers
+        module._Q = Q_new
+        module._indices = indices_new
+
+        # Clear LoRA
+        module.lora_r = 0
+        module.lora_A = None
+        module.lora_B = None
+        module.lora_drop = None
+        module.scaling = 0.0
+
+        count += 1
+
+        if verbose and count <= 3:
+            print(f"  [resnap] {name}: rel_error={error.item():.6f}")
+
+    stats = {
+        'layers_resnapped': count,
+        'avg_rel_error': total_error / max(count, 1),
+    }
+
+    if verbose:
+        print(f"\n[Resnap with LoRA]")
+        print(f"  Layers resnapped: {count}")
+        print(f"  Avg rel error: {stats['avg_rel_error']:.6f}")
+        print(f"  LoRA params cleared - model is now LoRA-free")
+
+    return stats
