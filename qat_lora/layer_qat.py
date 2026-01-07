@@ -2279,9 +2279,12 @@ def train_recovery_lora(
                         rendered.append(text)
                     break  # Only add once if enable_thinking not supported
         elif template_mode == "all":
-            # Randomly select from none/no-think/think for each sample
-            import random
-            mode_choice = random.choice(["none", "no-think", "think"])
+            # Sequential round-robin based on content hash: none -> no-think -> think
+            # Each unique sample gets deterministic mode, ensures even distribution
+            content_str = "".join(m.get("content", "") for m in messages)
+            mode_idx = hash(content_str) % 3
+            mode_choices = ["none", "no-think", "think"]
+            mode_choice = mode_choices[mode_idx]
             if mode_choice == "none":
                 # Raw text - no template
                 text = "\n\n".join(m.get("content", "") for m in messages if m.get("content"))

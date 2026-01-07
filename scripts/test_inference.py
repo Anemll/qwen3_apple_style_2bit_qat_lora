@@ -44,7 +44,13 @@ def parse_args():
     parser.add_argument('--repetition-penalty', type=float, default=1.1,
                         help='Repetition penalty (default: 1.1)')
     parser.add_argument('--no-thinking', action='store_true',
-                        help='Disable thinking mode')
+                        help='Disable thinking mode (use chat template without <think>)')
+    parser.add_argument('--no-template', action='store_true',
+                        help='Disable chat template entirely (raw text)')
+    parser.add_argument('--test-all-modes', action='store_true',
+                        help='Test prompt with all 3 modes: no-template, no-think, think')
+    parser.add_argument('--debug', action='store_true',
+                        help='Print full prompt template for debugging')
 
     # Quantization config (overrides config.json if specified)
     parser.add_argument('--lut-bits', type=int, default=None,
@@ -320,20 +326,57 @@ def load_model(args):
     return model, tokenizer, device
 
 
-def generate(model, tokenizer, device, prompt, args):
-    """Generate response for a prompt."""
-    messages = [{'role': 'user', 'content': prompt}]
+def generate(model, tokenizer, device, prompt, args, template_mode=None):
+    """Generate response for a prompt.
 
-    # Apply chat template
-    template_kwargs = {
-        'tokenize': False,
-        'add_generation_prompt': True,
-    }
-    if not args.no_thinking:
-        template_kwargs['enable_thinking'] = True
+    Args:
+        template_mode: Override template mode ('none', 'no-think', 'think')
+                      If None, uses args.no_template / args.no_thinking
+    """
+    # Determine template mode
+    if template_mode is not None:
+        use_template = template_mode != 'none'
+        use_thinking = template_mode == 'think'
+        mode_str = template_mode
+    else:
+        use_template = not args.no_template
+        use_thinking = not args.no_thinking and use_template
+        mode_str = 'none' if not use_template else ('think' if use_thinking else 'no-think')
 
-    text = tokenizer.apply_chat_template(messages, **template_kwargs)
+    # Build prompt text
+    if not use_template:
+        # Raw text - no chat template
+        text = prompt
+    else:
+        # Apply chat template
+        messages = [{'role': 'user', 'content': prompt}]
+        template_kwargs = {
+            'tokenize': False,
+            'add_generation_prompt': True,
+        }
+        if use_thinking:
+            template_kwargs['enable_thinking'] = True
+        else:
+            template_kwargs['enable_thinking'] = False
+
+        try:
+            text = tokenizer.apply_chat_template(messages, **template_kwargs)
+        except TypeError:
+            # Tokenizer doesn't support enable_thinking
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    # Debug: print full template
+    if args.debug:
+        print(f"\n[DEBUG] Template mode: {mode_str}")
+        print(f"[DEBUG] Full prompt ({len(text)} chars):")
+        print("-" * 40)
+        print(text)
+        print("-" * 40)
+
     inputs = tokenizer(text, return_tensors='pt').to(device)
+
+    if args.debug:
+        print(f"[DEBUG] Input tokens: {inputs['input_ids'].shape[1]}")
 
     with torch.no_grad():
         output = model.generate(
@@ -351,11 +394,39 @@ def generate(model, tokenizer, device, prompt, args):
         skip_special_tokens=False
     )
 
+    if args.debug:
+        print(f"[DEBUG] Raw response ({len(response)} chars):")
+        print("-" * 40)
+        print(repr(response[:500]))  # First 500 chars, repr to show special chars
+        print("-" * 40)
+        print(f"[DEBUG] Output tokens: {output[0].shape[0] - inputs['input_ids'].shape[1]}")
+
     # Clean up common artifacts
     response = response.replace('<|im_end|>', '').strip()
     response = response.replace('<think>\n<think>', '<think>')  # Fix double think
 
     return response
+
+
+def run_all_modes(model, tokenizer, device, prompt, args):
+    """Test a prompt with all 3 template modes."""
+    modes = [
+        ('none', 'No Template (raw text)'),
+        ('no-think', 'Chat Template (no thinking)'),
+        ('think', 'Chat Template (with thinking)'),
+    ]
+
+    print(f"\nPrompt: {prompt}")
+    print("=" * 60)
+
+    for mode, mode_desc in modes:
+        print(f"\n[{mode_desc}]")
+        response = generate(model, tokenizer, device, prompt, args, template_mode=mode)
+        # Truncate long responses for comparison
+        if len(response) > 500:
+            response = response[:500] + "..."
+        print(f"Response: {response}")
+        print("-" * 60)
 
 
 def run_default_prompts(model, tokenizer, device, args):
@@ -409,7 +480,11 @@ def main():
     model, tokenizer, device = load_model(args)
 
     # Run inference
-    if args.prompt:
+    if args.test_all_modes:
+        # Test all 3 template modes
+        prompt = args.prompt or "What is the capital of France?"
+        run_all_modes(model, tokenizer, device, prompt, args)
+    elif args.prompt:
         # Single prompt
         print(f"Prompt: {args.prompt}")
         response = generate(model, tokenizer, device, args.prompt, args)
