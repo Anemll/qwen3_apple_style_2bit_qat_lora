@@ -2739,8 +2739,23 @@ def train_recovery_lora(
                 tokens_processed = optimizer_step * batch_size * seq_len * accumulation_steps
                 tok_per_sec = tokens_processed / elapsed
 
+                # Calculate ETA
+                steps_remaining = max_steps - optimizer_step
+                if optimizer_step > 0:
+                    sec_per_step = elapsed / optimizer_step
+                    eta_sec = steps_remaining * sec_per_step
+                    eta_min = eta_sec / 60
+                    eta_str = f"{eta_min:.1f}m" if eta_min < 60 else f"{eta_min/60:.1f}h"
+                else:
+                    eta_str = "..."
+
+                # Current time in PST
+                from datetime import datetime, timezone, timedelta
+                pst = timezone(timedelta(hours=-8))
+                now_pst = datetime.now(pst).strftime("%H:%M:%S")
+
                 if verbose:
-                    print(f"  Step {optimizer_step}/{max_steps}: loss={avg_loss:.4f}, lr={current_lr:.2e}, tok/s={tok_per_sec:.0f}")
+                    print(f"  Step {optimizer_step}/{max_steps}: loss={avg_loss:.4f}, lr={current_lr:.2e}, tok/s={tok_per_sec:.0f}, ETA={eta_str}, time={now_pst} PST")
 
                 if use_wandb and wandb_run is not None:
                     wandb.log({
