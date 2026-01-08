@@ -3142,7 +3142,10 @@ def train_recovery_lora(
                     torch.nn.utils.clip_grad_norm_(params, grad_clip)
                 optimizer.step()
             scheduler.step()
-            optimizer.zero_grad()
+            # TPU: use set_to_none=False to avoid grad None->Tensor recompilation
+            # When set_to_none=True, step 1 has None grads, step 2 has Tensor grads
+            # This causes XLA to see different graphs and recompile
+            optimizer.zero_grad(set_to_none=not use_tpu)
             optimizer_step += 1
 
             # TPU: mark_step after optimizer to ensure execution

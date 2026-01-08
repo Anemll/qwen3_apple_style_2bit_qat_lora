@@ -104,8 +104,27 @@ Look for "Compilation Analysis" messages. If you see them, compilation is happen
 1. Different batch sizes between steps
 2. Dynamic tensor shapes
 3. Missing `mark_step()` between operations
+4. `optimizer.zero_grad(set_to_none=True)` causing grad None→Tensor transition
 
 **Debug**: Look for multiple "Graph Hash" values in the debug output. Each unique hash is a separate compilation.
+
+### Step 2 Recompilation (grad None→Tensor)
+
+**Symptoms**: Step 1 backward compiles, Step 2 backward compiles again with different graph hash
+
+**Cause**: When using `optimizer.zero_grad(set_to_none=True)`:
+- Step 1: grad fields are `None`
+- Step 2: grad fields become `Tensor` (created during backward)
+
+This changes the optimizer graph, causing XLA to recompile.
+
+**Solution**: Use `set_to_none=False` on TPU:
+```python
+# TPU: keep grads as zero tensors to avoid recompilation
+optimizer.zero_grad(set_to_none=not is_tpu)
+```
+
+Already fixed in our code - `train_recovery_lora()` uses `set_to_none=False` when `use_tpu=True`.
 
 ### Out of Memory (OOM)
 
