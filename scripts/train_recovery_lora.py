@@ -82,6 +82,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # =============================================================================
 # TPU SUPPORT
+# See docs/TPU.md for debugging and troubleshooting guide
 # =============================================================================
 
 def get_tpu_device():

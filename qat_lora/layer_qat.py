@@ -31,6 +31,7 @@ from .ane_qat_linear import AnemllQATLinear
 
 # ==============================================================================
 # TPU/XLA SUPPORT
+# See docs/TPU.md for debugging and troubleshooting guide
 # ==============================================================================
 
 def is_xla_device(device) -> bool:
