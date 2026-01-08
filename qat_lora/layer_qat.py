@@ -30,6 +30,38 @@ from .ane_qat_linear import AnemllQATLinear
 
 
 # ==============================================================================
+# SAFE KD LOSS (TPU/XLA compatible - avoids aten::kl_div)
+# ==============================================================================
+
+def kd_soft_ce(student_logits: torch.Tensor, teacher_logits: torch.Tensor,
+               temperature: float = 1.0) -> torch.Tensor:
+    """Soft cross-entropy loss for knowledge distillation.
+
+    This is equivalent to KL divergence but uses only ops that XLA handles well
+    (log_softmax, softmax, mul, sum) instead of aten::kl_div which may have
+    incorrect autograd behavior on TPU.
+
+    Args:
+        student_logits: Student model logits [B, L, V] or [B, L, K]
+        teacher_logits: Teacher model logits (same shape as student)
+        temperature: Distillation temperature (default 1.0)
+
+    Returns:
+        Scalar loss (mean over all positions)
+    """
+    T = float(temperature)
+    # Student log probabilities (differentiable)
+    logp_student = F.log_softmax(student_logits / T, dim=-1)
+    # Teacher probabilities (constant, no gradient)
+    with torch.no_grad():
+        p_teacher = F.softmax(teacher_logits / T, dim=-1)
+    # Cross-entropy: -sum(p * log_q)
+    loss = -(p_teacher * logp_student).sum(dim=-1)
+    # T^2 scaling (standard distillation)
+    return loss.mean() * (T * T)
+
+
+# ==============================================================================
 # LOCAL MLP RECONSTRUCTION LOSS
 # ==============================================================================
 
@@ -2968,17 +3000,13 @@ def train_recovery_lora(
                 )
 
                 if lora_mode == "kd" and teacher is not None:
-                    # Knowledge distillation: combine CE + KL from teacher
+                    # Knowledge distillation: combine CE + soft CE from teacher
                     with torch.no_grad():
                         teacher_outputs = teacher(input_batch)
                         teacher_logits = teacher_outputs.logits[:, :-1, :].contiguous()
 
-                    # KL divergence with temperature
-                    kd_loss = F.kl_div(
-                        F.log_softmax(shift_logits / kd_temperature, dim=-1),
-                        F.softmax(teacher_logits / kd_temperature, dim=-1),
-                        reduction='batchmean',
-                    ) * (kd_temperature ** 2)
+                    # Soft cross-entropy (TPU/XLA safe, avoids aten::kl_div)
+                    kd_loss = kd_soft_ce(shift_logits, teacher_logits, kd_temperature)
 
                     # Combined loss: alpha * KD + (1 - alpha) * CE
                     loss = kd_alpha * kd_loss + (1 - kd_alpha) * ce_loss
@@ -3004,7 +3032,7 @@ def train_recovery_lora(
                         print(f"    Predicted: {repr(pred_text)}")
                         print(f"    Actual:    {repr(actual_text)}")
 
-        # Optional anchor KL regularizer
+        # Optional anchor KL regularizer (soft CE, TPU/XLA safe)
         if anchor_kl_weight > 0 and anchor_logits is not None and anchor_input_ids is not None:
             # Use pre-computed anchor samples for KL
             anchor_idx = (step - 1) % anchor_samples
@@ -3012,12 +3040,9 @@ def train_recovery_lora(
             current_logits = model(anchor_input)
             if hasattr(current_logits, 'logits'):
                 current_logits = current_logits.logits
-            kl_loss = F.kl_div(
-                F.log_softmax(current_logits, dim=-1),
-                F.softmax(anchor_logits[anchor_idx:anchor_idx+1], dim=-1),
-                reduction='batchmean',
-            )
-            loss = loss + anchor_kl_weight * kl_loss
+            # Soft cross-entropy (avoids aten::kl_div for TPU compatibility)
+            anchor_loss = kd_soft_ce(current_logits, anchor_logits[anchor_idx:anchor_idx+1], temperature=1.0)
+            loss = loss + anchor_kl_weight * anchor_loss
 
         # Scale loss for accumulation
         loss = loss / accumulation_steps
