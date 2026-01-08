@@ -175,10 +175,10 @@ PJRT_DEVICE=TPU python scripts/train_recovery_lora.py ...
 
 ## Memory Guide (TPU v6e-1)
 
-| Config | Batch | Seq Len | Accum | Memory |
-|--------|-------|---------|-------|--------|
-| Qwen3-0.6B + LoRA r=8 | 4 | 1024 | 8 | ~8GB |
-| Qwen3-0.6B + LoRA r=16 | 4 | 1024 | 8 | ~10GB |
-| Qwen3-0.6B + LoRA r=8 | 8 | 1024 | 4 | ~12GB |
+| Config | Batch | Seq Len | Accum | Peak Memory |
+|--------|-------|---------|-------|-------------|
+| Qwen3-0.6B + LoRA r=8 | 4 | 1024 | 8 | ~22GB |
+| Qwen3-0.6B + LoRA r=16 | 4 | 1024 | 8 | ~24GB |
+| Qwen3-0.6B + LoRA r=8 | 8 | 1024 | 4 | ~28GB |
 
-TPU v6e-1 has ~16GB HBM per chip.
+TPU v6e-1 has **32GB HBM** per chip.
