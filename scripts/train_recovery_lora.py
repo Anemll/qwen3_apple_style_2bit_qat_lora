@@ -7,12 +7,27 @@ Training Modes (--lora-mode):
     - sft: Supervised fine-tuning on instruction/response pairs
     - kd: Knowledge distillation from teacher model (requires --teacher)
 
+Generate Targets (--generate-targets):
+    When enabled, uses a reference model (base or --teacher) to generate
+    training targets. Essential for think mode with text datasets:
+    - Reference model generates responses with <think>...</think> content
+    - Quantized model learns to match these generated responses
+    - Slower but produces proper thinking tokens in training data
+
 Usage:
     # Mode: recover (default) - CE on raw text
     python scripts/train_recovery_lora.py \
         --model Qwen/Qwen3-0.6B \
         --v2-checkpoint runs/v2_q4a4_r32/best_state_dict.pt \
         --train-data-hf NeelNanda/pile-10k \
+        --recovery-r 8 --max-steps 500
+
+    # Mode: recover with think template + generated targets
+    python scripts/train_recovery_lora.py \
+        --model Qwen/Qwen3-0.6B \
+        --v2-checkpoint runs/v2_q4a4_r32/best_state_dict.pt \
+        --train-data-hf NeelNanda/pile-10k \
+        --template-mode think --generate-targets \
         --recovery-r 8 --max-steps 500
 
     # Mode: sft - Supervised fine-tuning
@@ -106,6 +121,16 @@ def main():
     parser.add_argument("--dataset-format", type=str, default="text",
                        choices=["text", "alpaca", "sharegpt"],
                        help="Dataset format for template parsing (default: text)")
+    parser.add_argument("--generate-targets", action="store_true",
+                       help="Generate training targets using reference model (base or --teacher). "
+                            "Useful with think mode: model generates <think>...</think> content. "
+                            "Slower but produces proper thinking tokens in training data.")
+    parser.add_argument("--gen-max-tokens", type=int, default=512,
+                       help="Max tokens to generate for --generate-targets (default: 512)")
+    parser.add_argument("--gen-temperature", type=float, default=0.7,
+                       help="Temperature for --generate-targets (default: 0.7)")
+    parser.add_argument("--gen-top-p", type=float, default=0.9,
+                       help="Top-p for --generate-targets (default: 0.9)")
 
     # LoRA args
     parser.add_argument("--recovery-r", type=int, default=8,
@@ -127,8 +152,17 @@ def main():
                        help="Teacher model for KD mode (e.g., Qwen/Qwen3-4B-Instruct)")
     parser.add_argument("--kd-temperature", type=float, default=2.0,
                        help="KD temperature for softening logits (default: 2.0)")
+    parser.add_argument("--kd-cache-dir", type=str, default=None,
+                       help="Path to precomputed KD cache directory (fast, no teacher needed). "
+                            "Overrides --train-data-hf when specified.")
     parser.add_argument("--kd-alpha", type=float, default=0.5,
                        help="KD loss weight: total = alpha*KD + (1-alpha)*CE (default: 0.5)")
+    parser.add_argument("--hard-top1", type=float, default=0.0,
+                       help="Hard label top-1 weight for KD cache mode (default: 0.0)")
+    parser.add_argument("--hard-top1-end", type=float, default=None,
+                       help="Hard label top-1 end weight for annealing (default: same as --hard-top1)")
+    parser.add_argument("--hard-full", type=float, default=0.0,
+                       help="Hard label full vocab weight for KD cache mode (default: 0.0)")
 
     # Training args
     parser.add_argument("--lr", type=float, default=3e-4,
@@ -141,12 +175,20 @@ def main():
                        help="Sequence length (4K-8K recommended)")
     parser.add_argument("--warmup-steps", type=int, default=100,
                        help="Warmup steps")
+    parser.add_argument("--constant-lr", action="store_true",
+                       help="Use constant LR after warmup (no cosine decay)")
+    parser.add_argument("--min-lr-ratio", type=float, default=0.1,
+                       help="Minimum LR ratio for cosine decay (default: 0.1)")
     parser.add_argument("--weight-decay", type=float, default=0.0,
                        help="Weight decay (0 or small for LoRA)")
-    parser.add_argument("--grad-clip", type=float, default=1.0,
-                       help="Gradient clipping")
+    parser.add_argument("--grad-clip", "--clip-grad-norm", type=float, default=1.0,
+                       help="Max gradient norm for clipping (default: 1.0, 0=disable)")
+    parser.add_argument("--dropout", type=float, default=0.0,
+                       help="Dropout rate (default: 0.0, try 0.1)")
     parser.add_argument("--accumulation-steps", type=int, default=1,
                        help="Gradient accumulation steps")
+    parser.add_argument("--mixed-precision", action="store_true",
+                       help="Use mixed precision training (BF16 on CUDA, FP16 on MPS)")
 
     # Anchor KL regularizer
     parser.add_argument("--anchor-kl-weight", type=float, default=0.0,
@@ -195,18 +237,35 @@ def main():
     args = parser.parse_args()
 
     # Validate data args
-    if args.train_data is None and args.train_data_hf is None:
-        parser.error("One of --train-data or --train-data-hf is required")
+    if args.kd_cache_dir:
+        # KD cache mode - no other data source needed
+        if not os.path.exists(args.kd_cache_dir):
+            parser.error(f"KD cache directory not found: {args.kd_cache_dir}")
+        print(f"Using KD cache: {args.kd_cache_dir}")
+        # Auto-set lora_mode to kd if using cache
+        if args.lora_mode != "kd":
+            print(f"Note: Setting --lora-mode=kd for cache-based training")
+            args.lora_mode = "kd"
+    elif args.train_data is None and args.train_data_hf is None:
+        parser.error("One of --train-data, --train-data-hf, or --kd-cache-dir is required")
     if args.train_data is not None and args.train_data_hf is not None:
         parser.error("Cannot specify both --train-data and --train-data-hf")
 
     # Validate lora-mode args
-    if args.lora_mode == "kd" and args.teacher is None:
-        parser.error("--teacher is required for --lora-mode=kd")
+    if args.lora_mode == "kd" and args.teacher is None and args.kd_cache_dir is None:
+        parser.error("--teacher or --kd-cache-dir is required for --lora-mode=kd")
     if args.teacher is not None and args.lora_mode != "kd":
         print(f"Warning: --teacher is ignored when --lora-mode={args.lora_mode}")
     if args.lora_mode == "sft" and args.dataset_format == "text":
         print("Warning: --lora-mode=sft works best with --dataset-format=alpaca or sharegpt")
+
+    # Auto-enable generate_targets for think mode with text format
+    # Without this, training data won't contain <think> tokens
+    if args.template_mode in ["think", "both", "all"] and args.dataset_format == "text":
+        if not args.generate_targets:
+            print(f"Note: Auto-enabling --generate-targets for {args.template_mode} mode with text format")
+            print("      (Required for <think> tokens in training data)")
+            args.generate_targets = True
 
     # Determine device
     if args.device == "auto":
@@ -342,6 +401,7 @@ def main():
         recovery_config['teacher'] = args.teacher
         recovery_config['kd_temperature'] = args.kd_temperature
         recovery_config['kd_alpha'] = args.kd_alpha
+        recovery_config['kd_cache_dir'] = args.kd_cache_dir
 
     print(f"\nStarting recovery LoRA training (mode={args.lora_mode})...")
     results = train_recovery_lora(
@@ -354,6 +414,12 @@ def main():
         hf_max_samples=args.hf_max_samples,
         template_mode=args.template_mode,
         dataset_format=args.dataset_format,
+        generate_targets=args.generate_targets,
+        gen_max_tokens=args.gen_max_tokens,
+        gen_temperature=args.gen_temperature,
+        gen_top_p=args.gen_top_p,
+        reference_model_id=args.teacher or args.model,  # Use teacher if specified, else base
+        kd_cache_dir=args.kd_cache_dir,
         device=device,
         tokenizer=tokenizer,
         recovery_r=args.recovery_r,
@@ -365,9 +431,13 @@ def main():
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         warmup_steps=args.warmup_steps,
+        constant_lr=args.constant_lr,
+        min_lr_ratio=args.min_lr_ratio,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
         accumulation_steps=args.accumulation_steps,
+        mixed_precision=args.mixed_precision,
+        dropout=args.dropout,
         log_interval=args.log_interval,
         save_dir=args.output,
         save_steps=args.save_steps,
@@ -381,6 +451,9 @@ def main():
         teacher_model=args.teacher,
         kd_temperature=args.kd_temperature,
         kd_alpha=args.kd_alpha,
+        hard_top1_weight=args.hard_top1,
+        hard_top1_end=args.hard_top1_end,
+        hard_full_weight=args.hard_full,
         use_wandb=args.wandb,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run,
