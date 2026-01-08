@@ -2688,12 +2688,24 @@ def train_recovery_lora(
 
     # Compute anchor logits if KL regularizer enabled
     anchor_logits = None
+    anchor_input_ids = None
     if anchor_kl_weight > 0 and anchor_samples > 0:
         if verbose:
             print(f"  Computing anchor logits ({anchor_samples} samples)...")
         model.eval()
 
-        if streaming_tokenizer is not None:
+        if use_kd_cache:
+            # Use samples from KD cache for anchors
+            anchor_batches = []
+            temp_iter = iter(kd_cache_dataset)
+            while len(anchor_batches) < anchor_samples:
+                try:
+                    batch = next(temp_iter)
+                    anchor_batches.append(batch['input_ids'])
+                except StopIteration:
+                    temp_iter = iter(kd_cache_dataset)
+            anchor_batch = torch.stack(anchor_batches[:anchor_samples], dim=0).to(device)
+        elif streaming_tokenizer is not None:
             # Use streaming tokenizer to get anchor samples
             anchor_batch = streaming_tokenizer.get_batch().to(device)
             # Get more samples if needed
@@ -2701,7 +2713,7 @@ def train_recovery_lora(
             while sum(b.shape[0] for b in anchor_batches) < anchor_samples:
                 anchor_batches.append(streaming_tokenizer.get_batch().to(device))
             anchor_batch = torch.cat(anchor_batches, dim=0)[:anchor_samples]
-        else:
+        elif input_ids is not None:
             # Use pre-tokenized input_ids
             total_tokens = input_ids.numel()
             anchor_inputs = []
@@ -2710,12 +2722,19 @@ def train_recovery_lora(
                 end = start + seq_len
                 anchor_inputs.append(input_ids[start:end].unsqueeze(0))
             anchor_batch = torch.cat(anchor_inputs, dim=0).to(device)
+        else:
+            if verbose:
+                print(f"  Warning: No data source for anchor samples, skipping anchor KL")
+            anchor_kl_weight = 0.0
+            anchor_batch = None
 
-        with torch.no_grad():
-            anchor_logits = model(anchor_batch).logits.detach()
+        if anchor_batch is not None:
+            anchor_input_ids = anchor_batch  # Save for later use in training loop
+            with torch.no_grad():
+                anchor_logits = model(anchor_batch).logits.detach()
+            if verbose:
+                print(f"  Anchor logits computed: {anchor_logits.shape}")
         model.train()
-        if verbose:
-            print(f"  Anchor logits computed: {anchor_logits.shape}")
 
     # Load teacher model for KD mode
     teacher = None
@@ -2986,11 +3005,13 @@ def train_recovery_lora(
                         print(f"    Actual:    {repr(actual_text)}")
 
         # Optional anchor KL regularizer
-        if anchor_kl_weight > 0 and anchor_logits is not None:
-            # Use first anchor_samples batches for KL
+        if anchor_kl_weight > 0 and anchor_logits is not None and anchor_input_ids is not None:
+            # Use pre-computed anchor samples for KL
             anchor_idx = (step - 1) % anchor_samples
-            anchor_input = input_ids[anchor_idx * seq_len:(anchor_idx + 1) * seq_len].unsqueeze(0).to(device)
+            anchor_input = anchor_input_ids[anchor_idx:anchor_idx+1].to(device)
             current_logits = model(anchor_input)
+            if hasattr(current_logits, 'logits'):
+                current_logits = current_logits.logits
             kl_loss = F.kl_div(
                 F.log_softmax(current_logits, dim=-1),
                 F.softmax(anchor_logits[anchor_idx:anchor_idx+1], dim=-1),
