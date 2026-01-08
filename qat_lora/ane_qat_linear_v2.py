@@ -403,9 +403,23 @@ class AnemllQATLinearV2(nn.Module):
 
         # Flag: scales are already baked (magnitude in A, B is unit, g=1)
         # When True, _get_normalized_scales() returns raw params without re-normalizing
-        self._scales_baked = False
+        # Registered as buffer so it's saved/loaded with the model
+        self.register_buffer("_scales_baked_flag", torch.tensor(0, dtype=torch.int8))
 
         self.reset_parameters()
+
+    @property
+    def _scales_baked(self) -> bool:
+        """Check if scales are already baked (magnitude in A, g=1)."""
+        if self._scales_baked_flag is not None:
+            return bool(self._scales_baked_flag.item())
+        return False
+
+    @_scales_baked.setter
+    def _scales_baked(self, value: bool):
+        """Set the scales_baked flag."""
+        if self._scales_baked_flag is not None:
+            self._scales_baked_flag.fill_(1 if value else 0)
 
     def reset_parameters(self):
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
@@ -485,8 +499,19 @@ class AnemllQATLinearV2(nn.Module):
         """
         # Fast path: scales already baked (after snap_for_ane/snap_for_export)
         # Return raw params without re-normalizing
-        if getattr(self, '_scales_baked', False):
+        if self._scales_baked:
             return self.scale_A, self.scale_B, self.rank_magnitude
+
+        # Auto-detect baked scales for old checkpoints without _scales_baked_flag
+        # If rank_magnitude is all ones, scales were likely baked (magnitude in scale_A)
+        # This prevents double-normalization when loading snapped checkpoints
+        if self.rank_magnitude is not None:
+            with torch.no_grad():
+                g = self.rank_magnitude
+                if g.numel() > 0 and torch.allclose(g, torch.ones_like(g), atol=1e-5):
+                    # Auto-set the flag so we don't check every forward pass
+                    self._scales_baked = True
+                    return self.scale_A, self.scale_B, self.rank_magnitude
 
         # Use config-driven eps (1e-6 is FP16-safe, 1e-8 underflows in FP16)
         eps = getattr(self.config, 'norm_eps', 1e-6)
@@ -754,10 +779,21 @@ class AnemllQATLinearV2(nn.Module):
         """
         # Fast path for cached full weights (single matmul inference)
         # Skip if use_factored_inference=True (for ANE export testing)
+        # NOTE: This path still needs to add LoRA if enabled
         if self._cached_weight_q is not None and not self.use_factored_inference:
             w_q = self._cached_weight_q.to(x.dtype)
             bias = self.bias.to(x.dtype) if self.bias is not None else None
-            return F.linear(x, w_q, bias)
+            y = F.linear(x, w_q, bias)
+
+            # Add LoRA if enabled (don't skip!)
+            if self.lora_r > 0 and self.lora_A is not None:
+                x_d = self.lora_drop(x) if self.lora_drop is not None else x
+                lora_A = self.lora_A.to(x.dtype)
+                lora_B = self.lora_B.to(x.dtype)
+                hidden = x_d @ lora_A.t()
+                y = y + (hidden @ lora_B.t()) * self.scaling
+
+            return y
 
         # Get normalized scales
         A_dir, B_dir, g = self._get_normalized_scales()
@@ -1033,6 +1069,13 @@ class AnemllQATLinearV2(nn.Module):
         if self.bias is not None:
             self.bias.data = self.bias.data.to(fp16)
 
+        # Convert LoRA adapters to FP16 (if present)
+        # Note: For ANE deployment, consider using resnap_with_lora() first
+        # to merge LoRA into weights and avoid extra matmuls at inference.
+        if self.lora_r > 0 and self.lora_A is not None:
+            self.lora_A.data = self.lora_A.data.to(fp16)
+            self.lora_B.data = self.lora_B.data.to(fp16)
+
         # Clear cached weight (force factored forward)
         self._cached_weight_q = None
 
@@ -1073,6 +1116,11 @@ class AnemllQATLinearV2(nn.Module):
         # Recompute Q in FP16 (if already frozen)
         if self._Q is not None:
             self._Q = self.lut[self._indices]
+
+        # Convert LoRA adapters to FP16 (if present)
+        if self.lora_r > 0 and self.lora_A is not None:
+            self.lora_A.data = self.lora_A.data.to(fp16)
+            self.lora_B.data = self.lora_B.data.to(fp16)
 
         # Clear cached weight
         self._cached_weight_q = None
@@ -1370,6 +1418,10 @@ def snap_model_for_ane_v2(
     This converts the model to FP16 and recomputes quantization indices
     to match ANE's FP16 precision, avoiding BF16/FP16 mismatch issues.
 
+    If LoRA adapters are present, they will be converted to FP16.
+    For best ANE performance, consider calling resnap_with_lora() first
+    to merge LoRA into the quantized weights (avoids extra matmuls).
+
     Args:
         model: The model containing V2 layers
         recompute_indices: If True, recompute indices in FP16 (recommended)
@@ -1379,8 +1431,12 @@ def snap_model_for_ane_v2(
         Number of layers snapped
     """
     count = 0
+    lora_count = 0
     for name, module in model.named_modules():
         if isinstance(module, AnemllQATLinearV2):
+            # Check for LoRA before snapping
+            if module.lora_r > 0 and module.lora_A is not None:
+                lora_count += 1
             module.snap_for_ane(recompute_indices=recompute_indices)
             count += 1
             if verbose and count <= 3:
@@ -1391,6 +1447,10 @@ def snap_model_for_ane_v2(
         print(f"  Snapped {count} V2 layers to FP16")
         print(f"  Recomputed indices: {recompute_indices}")
         print(f"  All weights, scales, LUT, Q now in FP16")
+        if lora_count > 0:
+            print(f"\n  [LoRA] {lora_count} layers have LoRA adapters (converted to FP16)")
+            print(f"  [LoRA] For best ANE perf, consider: resnap_with_lora(model) first")
+            print(f"         This merges LoRA into weights, avoiding 2 extra matmuls/layer")
 
     return count
 

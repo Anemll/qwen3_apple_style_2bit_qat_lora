@@ -709,3 +709,60 @@ python scripts/test_inference.py runs/export/model_fp16.pt \
 | `use_ste_fp16` | True | STE for FP16 rounding in forward |
 | `norm_eps` | 1e-6 | Epsilon for normalization (FP16-safe) |
 
+---
+
+## 14. Mixed Precision Training
+
+See `qat_lora/mixed_precision.py` for implementation details.
+
+### 14.1 Dtype Options by Script
+
+| Script | Parameter | Default | Options | Description |
+|--------|-----------|---------|---------|-------------|
+| train_v2_simple.py | `--dtype` | fp32 | fp32, bf16, fp16 | Model dtype (TPU auto-switches to bf16) |
+| train_recovery_lora_multi.py | `--dtype` | fp32 | fp32, bf16 | Master weight dtype |
+| train_anemll_qat.py | `--dtype` | bf16 | fp32, bf16, fp16 | Model dtype |
+| train_qat_progressive.py | `--amp_dtype` | auto | auto, no, bf16, fp16 | Autocast dtype |
+| train_qat_progressive.py | `--param_dtype` | auto | auto, fp32, bf16, fp16 | Parameter dtype |
+
+### 14.2 Mixed Precision Modes
+
+**AQ1/QAT Training (train_v2_simple.py):**
+```bash
+# Default: FP32 with STE (ANE-safe)
+python scripts/train_v2_simple.py --dtype fp32 ...
+
+# BF16 (faster, TPU auto-enables this)
+python scripts/train_v2_simple.py --dtype bf16 ...
+```
+
+**Recovery LoRA Multi-chip (TPU):**
+```bash
+# Default: FP32 master weights + BF16 autocast
+python scripts/train_recovery_lora_multi.py --dtype fp32 ...
+
+# BF16 master weights (faster, ~2x less memory)
+python scripts/train_recovery_lora_multi.py --dtype bf16 ...
+```
+
+### 14.3 Device-Specific Behavior
+
+| Device | Default amp_dtype | Default param_dtype | GradScaler |
+|--------|-------------------|---------------------|------------|
+| CUDA | bf16 | bf16 | fp16 only |
+| TPU/XLA | bf16 | bf16 | No |
+| MPS | bf16 or fp16 | bf16 or fp16 | No |
+| CPU | bf16 | bf16 | No |
+
+### 14.4 Recommendations
+
+| Use Case | Config | Notes |
+|----------|--------|-------|
+| QAT Training (ANE target) | `--dtype fp32` | STE ensures FP16 matching |
+| QAT Training (speed) | `--dtype bf16` | 2x faster, slightly less ANE-accurate |
+| Recovery LoRA (stability) | `--dtype fp32` | FP32 master weights |
+| Recovery LoRA (memory) | `--dtype bf16` | ~2x less memory for optimizer states |
+| Debug/Testing | `--dtype fp32` | Full precision |
+
+**Note:** All training uses BF16 autocast for forward/backward. The `--dtype` flag controls master weight storage (affects optimizer state memory).
+

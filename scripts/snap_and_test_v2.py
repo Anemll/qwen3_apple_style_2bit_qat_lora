@@ -3,7 +3,17 @@
 Snap V2 checkpoint for export and test inference.
 
 Usage:
+    # Basic snap (no LoRA)
     python scripts/snap_and_test_v2.py --checkpoint /path/to/model_state_dict.pt
+
+    # Snap with LoRA (keep adapters separate)
+    python scripts/snap_and_test_v2.py --checkpoint /path/to/recovery_lora.pt --lora-r 8
+
+    # Snap with LoRA merged (best for ANE)
+    python scripts/snap_and_test_v2.py --checkpoint /path/to/recovery_lora.pt --lora-r 8 --merge-lora
+
+    # Full ANE export with LoRA merged
+    python scripts/snap_and_test_v2.py --checkpoint /path/to/recovery_lora.pt --lora-r 8 --merge-lora --fp16 --output model_ane.pt
 """
 
 import argparse
@@ -22,6 +32,12 @@ from qat_lora import (
     freeze_model_for_inference_v2,
     get_inference_mode_v2,
     snap_model_for_ane_v2,
+)
+from qat_lora.ane_qat_linear_v2 import (
+    enable_recovery_lora_all,
+    freeze_for_recovery_training,
+    resnap_with_lora,
+    get_recovery_lora_params,
 )
 
 
@@ -49,7 +65,51 @@ def main():
                         help='Snap for ANE export (FP16 precision)')
     parser.add_argument('--recompute-indices', action='store_true',
                         help='Recompute quantization indices in FP16 (not recommended, use existing _Q)')
+    # LoRA options
+    parser.add_argument('--lora-r', type=int, default=0,
+                        help='LoRA rank (0=no LoRA, >0=enable LoRA)')
+    parser.add_argument('--lora-alpha', type=float, default=None,
+                        help='LoRA alpha (default: lora_r, i.e. scaling=1.0)')
+    parser.add_argument('--mlp-only', action='store_true',
+                        help='Apply LoRA to MLP layers only')
+    parser.add_argument('--merge-lora', action='store_true',
+                        help='Merge LoRA into quantized weights (best for ANE, removes adapter ops)')
     args = parser.parse_args()
+
+    # Try to auto-detect config from checkpoint directory
+    ckpt_path = Path(args.checkpoint)
+    config_path = ckpt_path.parent / 'config.json'
+    auto_config = {}
+    if config_path.exists():
+        with open(config_path) as f:
+            auto_config = json.load(f)
+        print(f"[Auto-config] Found {config_path}")
+
+    # Use auto-detected values if not explicitly set (check if using defaults)
+    if auto_config:
+        if args.lut_bits == 2 and 'lut_bits' in auto_config:
+            args.lut_bits = auto_config['lut_bits']
+            print(f"  Using lut_bits={args.lut_bits} from config")
+        if args.attn_lut_bits == 4 and 'attn_lut_bits' in auto_config:
+            args.attn_lut_bits = auto_config['attn_lut_bits']
+            print(f"  Using attn_lut_bits={args.attn_lut_bits} from config")
+        if args.scale_rank == 32 and 'scale_rank' in auto_config:
+            args.scale_rank = auto_config['scale_rank']
+            print(f"  Using scale_rank={args.scale_rank} from config")
+        if args.attn_scale_rank == 8 and 'attn_scale_rank' in auto_config:
+            args.attn_scale_rank = auto_config['attn_scale_rank']
+            print(f"  Using attn_scale_rank={args.attn_scale_rank} from config")
+        # LoRA config from file
+        if args.lora_r == 0 and 'lora_r' in auto_config and auto_config['lora_r'] > 0:
+            args.lora_r = auto_config['lora_r']
+            print(f"  Using lora_r={args.lora_r} from config")
+        if args.lora_alpha is None and 'lora_alpha' in auto_config:
+            args.lora_alpha = auto_config['lora_alpha']
+            print(f"  Using lora_alpha={args.lora_alpha} from config")
+        if not args.mlp_only and 'lora_mlp_only' in auto_config:
+            args.mlp_only = auto_config['lora_mlp_only']
+            if args.mlp_only:
+                print(f"  Using mlp_only={args.mlp_only} from config")
 
     # Set attn defaults to MLP values if not specified
     if args.attn_lut_bits is None:
@@ -110,8 +170,8 @@ def main():
     )
     print(f"  Replaced {count} layers")
 
-    # Load checkpoint
-    print(f"Loading checkpoint from {args.checkpoint}...")
+    # Load checkpoint FIRST to detect LoRA config
+    print(f"\nLoading checkpoint from {args.checkpoint}...")
     checkpoint = torch.load(args.checkpoint, map_location='cpu')
 
     # Handle both raw state dict and wrapped dict
@@ -121,6 +181,37 @@ def main():
     else:
         state_dict = checkpoint
         print("  Using raw state dict")
+
+    # Auto-detect LoRA config from checkpoint BEFORE enabling LoRA
+    ckpt_lora_keys = [k for k in state_dict.keys() if 'lora_' in k]
+    if ckpt_lora_keys:
+        print(f"  Checkpoint has {len(ckpt_lora_keys)} LoRA keys")
+        # Auto-detect rank
+        if args.lora_r == 0:
+            for k in ckpt_lora_keys:
+                if 'lora_A' in k:
+                    args.lora_r = state_dict[k].shape[0]
+                    print(f"  [Auto-detect] LoRA rank={args.lora_r}")
+                    break
+        # Auto-detect mlp_only
+        has_attn_lora = any('q_proj.lora' in k or 'v_proj.lora' in k for k in ckpt_lora_keys)
+        if not has_attn_lora and not args.mlp_only:
+            args.mlp_only = True
+            print(f"  [Auto-detect] mlp_only=True (no attention LoRA)")
+
+    # Enable LoRA with detected/specified config
+    lora_alpha = None  # Will be set if LoRA is enabled
+    if args.lora_r > 0:
+        # Default alpha=r (scaling=1.0) matches training default in layer_qat.py
+        lora_alpha = args.lora_alpha if args.lora_alpha else float(args.lora_r)
+        print(f"\nEnabling LoRA adapters...")
+        print(f"  r={args.lora_r}, alpha={lora_alpha}, scaling={lora_alpha/args.lora_r:.2f}, mlp_only={args.mlp_only}")
+        enable_recovery_lora_all(
+            model, r=args.lora_r, alpha=lora_alpha,
+            mlp_only=args.mlp_only, skip_k_proj=True,
+        )
+        lora_params = get_recovery_lora_params(model)
+        print(f"  LoRA params: {lora_params/1e6:.2f}M")
 
     # Debug: analyze keys
     if args.debug:
@@ -184,14 +275,26 @@ def main():
     # Check _Q status after loading
     q_loaded = 0
     q_none = 0
+    baked_count = 0
     for name, module in model.named_modules():
         if type(module).__name__ == 'AnemllQATLinearV2':
             if module._Q is not None:
                 q_loaded += 1
             else:
                 q_none += 1
+
+            # Check if this layer has baked scales (for informational output)
+            # The layer itself auto-detects this in _get_normalized_scales()
+            if module.rank_magnitude is not None:
+                g = module.rank_magnitude
+                if torch.allclose(g, torch.ones_like(g), atol=1e-5):
+                    baked_count += 1
+
     print(f"  V2 layers with _Q loaded: {q_loaded}")
     print(f"  V2 layers with _Q=None: {q_none}")
+    if baked_count > 0:
+        print(f"  [Info] {baked_count} layers have pre-baked scales (rank_magnitude=1)")
+        print(f"         Auto-detection in forward() will handle correctly")
 
     # Decision: freeze_Q or use loaded _Q
     if q_none > 0 and not has_Q_buffers:
@@ -208,6 +311,18 @@ def main():
                 print(f"    Computed _Q for: {name}")
     else:
         print("\nUsing _Q from checkpoint (not recomputing)")
+
+    # Handle LoRA: merge into weights or keep separate
+    if args.lora_r > 0 and args.merge_lora:
+        print("\nMerging LoRA into quantized weights (resnap)...")
+        print("  This re-quantizes W_eff = W_q + LoRA_delta")
+        resnap_stats = resnap_with_lora(model, verbose=True)
+        print(f"  Merged {resnap_stats.get('count', 0)} layers")
+        print(f"  Avg quantization error: {resnap_stats.get('avg_error', 0):.4f}")
+        print("  LoRA adapters cleared - model is now LoRA-free")
+    elif args.lora_r > 0:
+        print("\nKeeping LoRA adapters separate (no merge)")
+        print("  For best ANE perf, consider --merge-lora")
 
     # Snap for inference
     if args.fp16:
@@ -268,6 +383,11 @@ def main():
             'magnitude_activation': 'identity',
             'checkpoint': output_path.name,
             'fp16': args.fp16,
+            # LoRA info
+            'lora_r': args.lora_r if not args.merge_lora else 0,  # 0 if merged
+            'lora_alpha': lora_alpha if args.lora_r > 0 and not args.merge_lora else None,
+            'lora_merged': args.merge_lora if args.lora_r > 0 else False,
+            'lora_mlp_only': args.mlp_only if args.lora_r > 0 else False,
         }
         with open(config_path, 'w') as f:
             json.dump(config_data, f, indent=2)

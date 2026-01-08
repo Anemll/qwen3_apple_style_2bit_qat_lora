@@ -201,3 +201,110 @@ PJRT_DEVICE=TPU python scripts/train_recovery_lora.py ...
 | Qwen3-0.6B + LoRA r=8 | 8 | 1024 | 4 | ~28GB |
 
 TPU v6e-1 has **32GB HBM** per chip.
+
+---
+
+## Multi-Chip TPU Training (v6e-4, v6e-8)
+
+For larger TPU configurations with multiple chips, use data parallelism.
+
+### Quick Start (Quad TPU)
+
+```bash
+# Recovery LoRA on TPU v6e-4 (4 chips)
+python scripts/train_recovery_lora_multi.py \
+    --model Qwen/Qwen3-0.6B \
+    --checkpoint runs/v2_q4/best.pt \
+    --kd-cache-dir caches/wikitext103_L1024_K128 \
+    --recovery-r 8 \
+    --batch-size 4 \
+    --accumulation-steps 8 \
+    --max-steps 1000
+
+# QAT on TPU v6e-4
+python scripts/train_v2_tpu_multi.py \
+    --from-scratch \
+    --cache-dir caches/openhermes_L128_K128_N50K \
+    --config q4_r32 \
+    --batch-size 8 \
+    --accumulation-steps 4 \
+    --max-steps 3000
+```
+
+### Effective Batch Size
+
+```
+effective_batch = batch_size × accumulation_steps × num_chips
+```
+
+| Config | Batch | Accum | Chips | Effective |
+|--------|-------|-------|-------|-----------|
+| v6e-1 | 4 | 8 | 1 | 32 |
+| v6e-4 | 4 | 8 | 4 | 128 |
+| v6e-8 | 4 | 4 | 8 | 128 |
+
+### Key Differences from Single-Chip
+
+| Feature | Single Chip | Multi-Chip |
+|---------|-------------|------------|
+| Launch | Direct call | `xmp.spawn(train_worker, ...)` |
+| Dataset | Single loader | Sharded across workers |
+| Gradients | `optimizer.step()` | `xm.reduce_gradients()` + `xm.optimizer_step()` |
+| Sync | `torch_xla.sync()` | Same + `xm.rendezvous()` for barriers |
+| Checkpoints | `torch.save()` | `xm.save()` (all workers call) |
+
+### Dataset Sharding
+
+Files are automatically sharded across workers:
+```python
+# Worker k gets files [k, k+world_size, k+2*world_size, ...]
+self.files = [f for i, f in enumerate(all_files) if i % world_size == rank]
+```
+
+Ensure your KD cache has enough shard files for even distribution.
+
+### Gradient Synchronization
+
+Multi-chip training requires explicit gradient sync:
+```python
+# After backward, before optimizer step
+xm.reduce_gradients(optimizer)  # All-reduce gradients across chips
+xm.optimizer_step(optimizer)    # TPU-specific optimizer step
+```
+
+### Rendezvous (Barriers)
+
+Use `xm.rendezvous()` to synchronize all workers:
+```python
+xm.rendezvous("model_download")   # Wait for rank 0 to download
+xm.rendezvous("before_warmup")    # Sync before XLA warmup
+xm.rendezvous("before_final_save") # Sync before final checkpoint
+```
+
+### Checkpointing
+
+`xm.save()` must be called by ALL workers (not just master):
+```python
+# All workers call this - only master writes, but all must sync
+xm.save(model.state_dict(), save_path)
+```
+
+### Memory Guide (Multi-Chip)
+
+| TPU | Chips | Total HBM | Recommended Batch |
+|-----|-------|-----------|-------------------|
+| v6e-1 | 1 | 32GB | batch=4, accum=8 |
+| v6e-4 | 4 | 128GB | batch=4-8, accum=4-8 |
+| v6e-8 | 8 | 256GB | batch=8, accum=4 |
+
+### Limiting Number of Chips
+
+```bash
+# Use only 2 of 4 available chips
+python scripts/train_recovery_lora_multi.py --num-chips 2 ...
+```
+
+Or via environment variable:
+```bash
+TPU_NUM_DEVICES=2 python scripts/train_recovery_lora_multi.py ...
+```

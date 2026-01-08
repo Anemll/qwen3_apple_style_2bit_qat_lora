@@ -1654,7 +1654,8 @@ def train_e2e(
         last_log_time = time.time()
 
     # Initialize gradients before training loop
-    optimizer.zero_grad(set_to_none=True)
+    # TPU: use set_to_none=False to avoid grad None->Tensor recompilation on step 2
+    optimizer.zero_grad(set_to_none=not is_tpu)
 
     # With accumulation, we need max_steps * accumulation_steps micro-batches
     # to achieve max_steps optimizer steps
@@ -1770,7 +1771,8 @@ def train_e2e(
 
                 if scheduler is not None:
                     scheduler.step()
-                optimizer.zero_grad(set_to_none=True)  # set_to_none more efficient
+                # TPU: use set_to_none=False to avoid grad None->Tensor recompilation
+                optimizer.zero_grad(set_to_none=not is_tpu)
                 optimizer_step += 1  # Track for display
 
             # TPU: mark_step to execute graph (required for progress)
@@ -1889,15 +1891,24 @@ def train_e2e(
                     # Add TPU memory stats if available
                     if is_tpu and xm is not None:
                         try:
+                            # Try new API first (no device arg, returns object)
                             mem = xm.get_memory_info(device)
-                            if "kb_total" in mem:
-                                log_dict['tpu/memory_used_gb'] = (mem["kb_total"] - mem.get("kb_free", 0)) / 1024 / 1024
-                                log_dict['tpu/memory_total_gb'] = mem["kb_total"] / 1024 / 1024
-                            elif "bytes_used" in mem:
-                                log_dict['tpu/memory_used_gb'] = mem["bytes_used"] / 1e9
-                                log_dict['tpu/memory_total_gb'] = mem.get("bytes_limit", 0) / 1e9
-                        except Exception:
-                            pass
+                            if hasattr(mem, 'bytes_limit'):
+                                # New API: object with bytes_limit/bytes_used attributes
+                                log_dict['tpu/memory_total_gb'] = getattr(mem, 'bytes_limit', 0) / 1e9
+                                log_dict['tpu/memory_used_gb'] = getattr(mem, 'bytes_used', 0) / 1e9
+                            elif isinstance(mem, dict):
+                                # Old API: dict with kb_total or bytes_used
+                                if "kb_total" in mem:
+                                    log_dict['tpu/memory_used_gb'] = (mem["kb_total"] - mem.get("kb_free", 0)) / 1024 / 1024
+                                    log_dict['tpu/memory_total_gb'] = mem["kb_total"] / 1024 / 1024
+                                elif "bytes_used" in mem:
+                                    log_dict['tpu/memory_used_gb'] = mem["bytes_used"] / 1e9
+                                    log_dict['tpu/memory_total_gb'] = mem.get("bytes_limit", 0) / 1e9
+                        except Exception as e:
+                            # Log first failure for debugging
+                            if optimizer_step == log_interval:
+                                print(f"  [TPU memory] get_memory_info failed: {e}")
                     wandb.log(log_dict, step=optimizer_step)
                 last_log_time = time.time()
                 loss_history.append(avg_loss)
@@ -2877,6 +2888,12 @@ def train_recovery_lora(
     loss_history = []
     optimizer_step = 0
 
+    # For smoothed ETA: track (optimizer_step, time) pairs from last N logs
+    # This avoids XLA compile time skewing the ETA
+    from collections import deque
+    eta_history = deque(maxlen=5)
+    last_log_time = time.time()
+
     # Sanity check: compare eval vs train mode CE loss
     if debug and (streaming_tokenizer is not None or input_ids is not None):
         print(f"\n  [DEBUG] Sanity check - eval vs train mode:")
@@ -3123,6 +3140,7 @@ def train_recovery_lora(
             _bwd_time = _step_times[f's{step}_bwd_end'] - _step_times[f's{step}_bwd_start']
             print(f"  [Step {step}] Backward pass done ({_bwd_time:.1f}s)", flush=True)
 
+        # Accumulate loss - on TPU this causes device->host sync but mark_step mitigates it
         total_loss += loss.item() * accumulation_steps
 
         # Optimizer step
@@ -3162,26 +3180,40 @@ def train_recovery_lora(
             if optimizer_step % log_interval == 0:
                 avg_loss = total_loss / log_interval
                 elapsed = time.time() - t_start
+                current_time = time.time()
                 current_lr = scheduler.get_last_lr()[0]
-                tokens_processed = optimizer_step * batch_size * seq_len * accumulation_steps
-                tok_per_sec = tokens_processed / elapsed
 
-                # Calculate ETA
-                steps_remaining = max_steps - optimizer_step
-                if optimizer_step > 0:
-                    sec_per_step = elapsed / optimizer_step
-                    eta_sec = steps_remaining * sec_per_step
-                    eta_min = eta_sec / 60
-                    eta_str = f"{eta_min:.1f}m" if eta_min < 60 else f"{eta_min/60:.1f}h"
+                # Smoothed ETA and tok/s using rolling window (avoids XLA compile time skew)
+                eta_history.append((optimizer_step, current_time))
+                if len(eta_history) >= 2:
+                    old_step, old_time = eta_history[0]
+                    recent_elapsed = current_time - old_time
+                    recent_steps = optimizer_step - old_step
+                    if recent_steps > 0 and recent_elapsed > 0:
+                        sec_per_step = recent_elapsed / recent_steps
+                        steps_remaining = max_steps - optimizer_step
+                        eta_sec = steps_remaining * sec_per_step
+                        # tok/s based on recent window
+                        tok_per_sec = (recent_steps * batch_size * seq_len * accumulation_steps) / recent_elapsed
+                    else:
+                        eta_sec = 0
+                        tok_per_sec = 0
                 else:
-                    eta_str = "..."
+                    # Fallback for first log
+                    if optimizer_step > 0:
+                        sec_per_step = elapsed / optimizer_step
+                        steps_remaining = max_steps - optimizer_step
+                        eta_sec = steps_remaining * sec_per_step
+                        tok_per_sec = (optimizer_step * batch_size * seq_len * accumulation_steps) / elapsed
+                    else:
+                        eta_sec = 0
+                        tok_per_sec = 0
 
-                # Format elapsed time
+                # Format times
+                eta_min = eta_sec / 60
+                eta_str = f"{eta_min:.1f}m" if eta_min < 60 else f"{eta_min/60:.1f}h"
                 elapsed_min = elapsed / 60
-                if elapsed_min < 60:
-                    elapsed_str = f"{elapsed_min:.1f}m"
-                else:
-                    elapsed_str = f"{elapsed_min/60:.1f}h"
+                elapsed_str = f"{elapsed_min:.1f}m" if elapsed_min < 60 else f"{elapsed_min/60:.1f}h"
 
                 if verbose:
                     print(f"  Step {optimizer_step}/{max_steps}: loss={avg_loss:.4f}, lr={current_lr:.2e}, tok/s={tok_per_sec:.0f}, elapsed={elapsed_str}, ETA={eta_str}")
