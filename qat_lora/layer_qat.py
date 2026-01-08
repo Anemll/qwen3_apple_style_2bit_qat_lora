@@ -2679,11 +2679,12 @@ def train_recovery_lora(
         raise ValueError("One of train_data or train_data_hf must be provided")
 
     # Summary
-    effective_batch_tokens = batch_size * seq_len
+    tokens_per_step = batch_size * seq_len
+    tokens_per_update = tokens_per_step * accumulation_steps
     if verbose:
         if input_ids is not None:
             print(f"  Total tokens: {input_ids.numel():,}")
-        print(f"  Effective batch: {effective_batch_tokens:,} tokens")
+        print(f"  Tokens/step: {tokens_per_step:,}, Tokens/update: {tokens_per_update:,} (batch={batch_size}x{accumulation_steps})")
 
     # Compute anchor logits if KL regularizer enabled
     anchor_logits = None
