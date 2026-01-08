@@ -206,7 +206,40 @@ def load_model(args):
         state_dict = state_dict['model_state_dict']
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    print(f"  Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+
+    # Categorize missing/unexpected keys for clearer diagnostics
+    # Expected missing: _scales_baked_flag (new buffer, defaults to 0=False)
+    # Expected unexpected: _Q (loaded manually), lora_* (loaded after LoRA enabled)
+    missing_baked_flag = [k for k in missing if '_scales_baked_flag' in k]
+    missing_other = [k for k in missing if '_scales_baked_flag' not in k]
+
+    unexpected_Q = [k for k in unexpected if '._Q' in k]
+    unexpected_lora = [k for k in unexpected if 'lora_' in k]
+    unexpected_other = [k for k in unexpected if '._Q' not in k and 'lora_' not in k]
+
+    # Print summary with explanations
+    print(f"  Load results:")
+    if missing_baked_flag:
+        print(f"    Missing: {len(missing_baked_flag)} _scales_baked_flag (OK: new buffer, defaults to False)")
+    if missing_other:
+        print(f"    Missing: {len(missing_other)} other keys (WARNING: may cause issues)")
+        for k in missing_other[:5]:
+            print(f"      - {k}")
+        if len(missing_other) > 5:
+            print(f"      ... and {len(missing_other) - 5} more")
+    if unexpected_Q:
+        print(f"    Unexpected: {len(unexpected_Q)} _Q buffers (OK: will load manually)")
+    if unexpected_lora:
+        print(f"    Unexpected: {len(unexpected_lora)} LoRA keys (OK: will load after LoRA enabled)")
+    if unexpected_other:
+        print(f"    Unexpected: {len(unexpected_other)} other keys (WARNING: not loaded)")
+        for k in unexpected_other[:5]:
+            print(f"      - {k}")
+        if len(unexpected_other) > 5:
+            print(f"      ... and {len(unexpected_other) - 5} more")
+
+    if not missing_other and not unexpected_other:
+        print(f"    All keys accounted for!")
 
     # V2: Manually load _Q buffers if they weren't loaded (None buffers issue)
     if version == 'v2':
@@ -229,7 +262,7 @@ def load_model(args):
                         baked_detected += 1
 
         if q_loaded > 0:
-            print(f"  Manually loaded {q_loaded} _Q buffers")
+            print(f"  Loaded {q_loaded} _Q buffers (manual registration)")
         if baked_detected > 0:
             print(f"  Detected {baked_detected} layers with baked scales (FP16 snap)")
 
