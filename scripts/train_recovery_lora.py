@@ -80,6 +80,31 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+# =============================================================================
+# TPU SUPPORT
+# =============================================================================
+
+def get_tpu_device():
+    """Get TPU device if available, else None."""
+    try:
+        import torch_xla
+        return torch_xla.device()
+    except ImportError:
+        return None
+    except RuntimeError as e:
+        print(f"[WARN] TPU init failed: {e}")
+        return None
+
+
+def is_tpu_device(device) -> bool:
+    """Check if device is TPU/XLA."""
+    return 'xla' in str(device).lower()
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train recovery LoRA adapters on quantized model",
@@ -223,7 +248,9 @@ def main():
 
     # Device
     parser.add_argument("--device", type=str, default="auto",
-                       help="Device (auto, cuda, mps, cpu)")
+                       help="Device (auto, cuda, mps, cpu, tpu)")
+    parser.add_argument("--tpu", action="store_true",
+                       help="Use TPU (sets PJRT_DEVICE=TPU, requires torch_xla)")
 
     # Debug
     parser.add_argument("--debug", action="store_true",
@@ -268,17 +295,38 @@ def main():
             args.generate_targets = True
 
     # Determine device
-    if args.device == "auto":
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = torch.device("mps")
+    if args.tpu or args.device == "tpu":
+        # TPU mode - use torch_xla
+        device = get_tpu_device()
+        if device is None:
+            print("ERROR: TPU requested but torch_xla not available or TPU init failed")
+            print("  Install with: pip install torch_xla[tpu] -f https://storage.googleapis.com/libtpu-releases/index.html")
+            sys.exit(1)
+        print(f"Using device: TPU ({device})")
+    elif args.device == "auto":
+        # Try TPU first if PJRT_DEVICE is set
+        if os.environ.get("PJRT_DEVICE") == "TPU":
+            device = get_tpu_device()
+            if device:
+                print(f"Using device: TPU ({device})")
+            else:
+                print("PJRT_DEVICE=TPU set but torch_xla not available, falling back...")
+                device = None
         else:
-            device = torch.device("cpu")
+            device = None
+
+        # Fallback chain: CUDA > MPS > CPU
+        if device is None:
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = torch.device("mps")
+            else:
+                device = torch.device("cpu")
+            print(f"Using device: {device}")
     else:
         device = torch.device(args.device)
-
-    print(f"Using device: {device}")
+        print(f"Using device: {device}")
 
     # Helper to print memory usage
     def print_mem(label=""):
