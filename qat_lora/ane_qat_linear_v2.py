@@ -1549,11 +1549,17 @@ def load_v2_checkpoint(
     # Move to device
     model.to(device)
 
+    # Filter out expected missing keys (new buffers not in old checkpoints)
+    expected_missing = {'_scales_baked_flag'}
+    actual_missing = [k for k in result.missing_keys
+                      if not any(exp in k for exp in expected_missing)]
+
     stats = {
         'v2_layers': len(v2_layers),
         'q_loaded': q_loaded,
         'indices_loaded': indices_loaded,
-        'missing_keys': len(result.missing_keys),
+        'missing_keys': len(actual_missing),
+        'missing_keys_expected': len(result.missing_keys) - len(actual_missing),
         'unexpected_keys': len(result.unexpected_keys),
     }
 
@@ -1563,6 +1569,8 @@ def load_v2_checkpoint(
         print(f"  _Q loaded: {stats['q_loaded']}")
         print(f"  _indices loaded: {stats['indices_loaded']}")
         print(f"  Missing keys: {stats['missing_keys']}")
+        if stats['missing_keys_expected'] > 0:
+            print(f"  Missing (expected, new buffers): {stats['missing_keys_expected']}")
         # Unexpected should be 0 now since we pre-loaded _Q and _indices
         remaining_unexpected = stats['unexpected_keys'] - (q_loaded + indices_loaded)
         print(f"  Unexpected keys (other): {max(0, remaining_unexpected)}")
