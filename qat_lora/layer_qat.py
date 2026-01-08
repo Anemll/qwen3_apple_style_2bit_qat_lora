@@ -30,6 +30,28 @@ from .ane_qat_linear import AnemllQATLinear
 
 
 # ==============================================================================
+# TPU/XLA SUPPORT
+# ==============================================================================
+
+def is_xla_device(device) -> bool:
+    """Check if device is TPU/XLA."""
+    return 'xla' in str(device).lower()
+
+
+def xla_mark_step():
+    """Mark XLA step to trigger compilation/execution.
+
+    On TPU, XLA buffers all operations and only compiles/executes when forced.
+    Calling mark_step() breaks up the graph, preventing massive single-compilation.
+    """
+    try:
+        import torch_xla.core.xla_model as xm
+        xm.mark_step()
+    except ImportError:
+        pass  # Not on TPU
+
+
+# ==============================================================================
 # SAFE KD LOSS (TPU/XLA compatible - avoids aten::kl_div)
 # ==============================================================================
 
@@ -2722,8 +2744,9 @@ def train_recovery_lora(
     anchor_logits = None
     anchor_input_ids = None
     if anchor_kl_weight > 0 and anchor_samples > 0:
+        _anchor_start = time.time()
         if verbose:
-            print(f"  Computing anchor logits ({anchor_samples} samples)...")
+            print(f"  Computing anchor logits ({anchor_samples} samples)...", flush=True)
         model.eval()
 
         if use_kd_cache:
@@ -2762,10 +2785,16 @@ def train_recovery_lora(
 
         if anchor_batch is not None:
             anchor_input_ids = anchor_batch  # Save for later use in training loop
+            if verbose:
+                print(f"  Anchor batch shape: {anchor_batch.shape}, running forward...", flush=True)
             with torch.no_grad():
                 anchor_logits = model(anchor_batch).logits.detach()
+            # TPU: mark_step after anchor forward to compile/execute
+            if is_xla_device(device):
+                xla_mark_step()
+            _anchor_time = time.time() - _anchor_start
             if verbose:
-                print(f"  Anchor logits computed: {anchor_logits.shape}")
+                print(f"  Anchor logits computed: {anchor_logits.shape} ({_anchor_time:.1f}s)", flush=True)
         model.train()
 
     # Load teacher model for KD mode
@@ -2908,15 +2937,30 @@ def train_recovery_lora(
         if verbose:
             print(f"  Mixed precision: {autocast_dtype}")
 
+    # TPU detection for debug logging
+    use_tpu = is_xla_device(device)
     if verbose:
-        print(f"\n  Starting training...")
+        if use_tpu:
+            print(f"\n  Starting training on TPU/XLA...")
+            print(f"  Note: First step may take 5-15 min for XLA compilation", flush=True)
+        else:
+            print(f"\n  Starting training...")
 
     # KD cache iterator
     kd_cache_iter = None
     if use_kd_cache:
         kd_cache_iter = iter(kd_cache_dataset)
 
+    # Timing for first steps (XLA debug)
+    _step_times = {}
+
     for step in range(1, total_steps + 1):
+        # Detailed timing for first 3 steps on TPU to diagnose XLA compilation
+        _timing = step <= 3 and (use_tpu or debug)
+        if _timing:
+            _step_times[f's{step}_start'] = time.time()
+            print(f"\n  [Step {step}] Starting...", flush=True)
+
         # Get batch - KD cache, streaming tokenizer, or pre-tokenized data
         kd_batch = None
         if use_kd_cache:
@@ -2936,6 +2980,8 @@ def train_recovery_lora(
                 'topk_logits': torch.stack([ex['topk_logits'] for ex in batch_examples]).to(device),
             }
             input_batch = kd_batch['input_ids']
+            if _timing:
+                print(f"  [Step {step}] Batch collated: {input_batch.shape}", flush=True)
         elif streaming_tokenizer is not None:
             input_batch = streaming_tokenizer.get_batch().to(device)  # [B, seq_len]
         else:
@@ -2960,6 +3006,10 @@ def train_recovery_lora(
                 print(f"    Input text (first 100 tokens): {repr(decoded[:200])}")
 
         # Mode-specific loss computation (with optional mixed precision)
+        if _timing:
+            _step_times[f's{step}_fwd_start'] = time.time()
+            print(f"  [Step {step}] Forward pass starting...", flush=True)
+
         autocast_ctx = torch.amp.autocast(device.type, dtype=autocast_dtype) if autocast_dtype else nullcontext()
 
         with autocast_ctx:
@@ -3032,6 +3082,11 @@ def train_recovery_lora(
                         print(f"    Predicted: {repr(pred_text)}")
                         print(f"    Actual:    {repr(actual_text)}")
 
+        if _timing:
+            _step_times[f's{step}_fwd_end'] = time.time()
+            _fwd_time = _step_times[f's{step}_fwd_end'] - _step_times[f's{step}_fwd_start']
+            print(f"  [Step {step}] Forward pass done ({_fwd_time:.1f}s)", flush=True)
+
         # Optional anchor KL regularizer (soft CE, TPU/XLA safe)
         if anchor_kl_weight > 0 and anchor_logits is not None and anchor_input_ids is not None:
             # Use pre-computed anchor samples for KL
@@ -3048,14 +3103,33 @@ def train_recovery_lora(
         loss = loss / accumulation_steps
 
         # Backward pass with optional mixed precision
+        if _timing:
+            _step_times[f's{step}_bwd_start'] = time.time()
+            print(f"  [Step {step}] Backward pass starting...", flush=True)
+
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+
+        # TPU: mark_step after backward to break up XLA graph
+        # Without this, XLA buffers everything until .item() causing massive compilation
+        if is_xla_device(device):
+            xla_mark_step()
+
+        if _timing:
+            _step_times[f's{step}_bwd_end'] = time.time()
+            _bwd_time = _step_times[f's{step}_bwd_end'] - _step_times[f's{step}_bwd_start']
+            print(f"  [Step {step}] Backward pass done ({_bwd_time:.1f}s)", flush=True)
+
         total_loss += loss.item() * accumulation_steps
 
         # Optimizer step
         if step % accumulation_steps == 0:
+            if _timing:
+                _step_times[f's{step}_opt_start'] = time.time()
+                print(f"  [Step {step}] Optimizer step starting...", flush=True)
+
             if scaler is not None:
                 scaler.unscale_(optimizer)
                 if grad_clip > 0:
@@ -3069,6 +3143,16 @@ def train_recovery_lora(
             scheduler.step()
             optimizer.zero_grad()
             optimizer_step += 1
+
+            # TPU: mark_step after optimizer to ensure execution
+            if is_xla_device(device):
+                xla_mark_step()
+
+            if _timing:
+                _step_times[f's{step}_opt_end'] = time.time()
+                _opt_time = _step_times[f's{step}_opt_end'] - _step_times[f's{step}_opt_start']
+                _total_step = _step_times[f's{step}_opt_end'] - _step_times[f's{step}_start']
+                print(f"  [Step {step}] Optimizer done ({_opt_time:.1f}s), total step: {_total_step:.1f}s", flush=True)
 
             # Logging
             if optimizer_step % log_interval == 0:
