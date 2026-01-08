@@ -819,6 +819,11 @@ class AnemllQATLinearV2(nn.Module):
 
         Q = Q.to(x.dtype)
 
+        # STE-FP16: Apply to Q buffer (frozen LUT values snapped to FP16)
+        use_ste = getattr(self.config, 'use_ste_fp16', False)
+        if use_ste:
+            Q = ste_fp16(Q)
+
         # For LoRA training: V2 base doesn't need gradients, only LoRA does
         # This saves massive memory by not building computation graph for V2
         # Also use loop-based forward to avoid materializing [batch,seq,rank,out] tensors
@@ -831,7 +836,10 @@ class AnemllQATLinearV2(nn.Module):
                 # _forward_loop only keeps [batch,seq,out] accumulator
                 y = self._forward_loop(x, A_dir, B_dir, g, Q)
                 if self.bias is not None:
-                    y = y + self.bias.to(x.dtype)
+                    bias = self.bias.to(x.dtype)
+                    if use_ste:
+                        bias = ste_fp16(bias)
+                    y = y + bias
             # Detach to ensure no gradients flow back through V2
             y = y.detach()
         else:
@@ -842,16 +850,30 @@ class AnemllQATLinearV2(nn.Module):
                 y = self._forward_loop(x, A_dir, B_dir, g, Q)
             # Add bias
             if self.bias is not None:
-                y = y + self.bias.to(x.dtype)
+                bias = self.bias.to(x.dtype)
+                if use_ste:
+                    bias = ste_fp16(bias)
+                y = y + bias
 
         # Add LoRA if enabled (in-place for memory efficiency)
         if self.lora_r > 0:
             x_d = self.lora_drop(x) if self.lora_drop is not None else x
             lora_A = self.lora_A.to(x.dtype)
             lora_B = self.lora_B.to(x.dtype)
+
+            # STE-FP16: Apply to LoRA weights (snapped to FP16)
+            if use_ste:
+                lora_A = ste_fp16(lora_A)
+                lora_B = ste_fp16(lora_B)
+
             # In-place addition: y += ... is more memory efficient
             hidden = x_d @ lora_A.t()  # [*, lora_r] - small intermediate
-            y += (hidden @ lora_B.t()) * self.scaling
+            if use_ste:
+                hidden = ste_fp16(hidden)
+            lora_out = (hidden @ lora_B.t()) * self.scaling
+            if use_ste:
+                lora_out = ste_fp16(lora_out)
+            y += lora_out
 
         return y
 
@@ -892,6 +914,8 @@ class AnemllQATLinearV2(nn.Module):
 
             # Accumulate with a_k weighting
             y = y + a_k * Qx  # [..., out]
+            if use_ste:
+                y = ste_fp16(y)
 
         return y
 
@@ -936,6 +960,8 @@ class AnemllQATLinearV2(nn.Module):
         # Weight by A and sum over ranks
         # A: [rank, out] -> y: [..., out]
         y = (Y_rank * A).sum(dim=-2)  # [..., out]
+        if use_ste:
+            y = ste_fp16(y)
 
         return y
 
