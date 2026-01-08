@@ -566,7 +566,14 @@ class AnemllQATLinearV2(nn.Module):
         else:
             raise ValueError(f"Unknown magnitude_activation: {act}")
 
+        # STE-FP16: Round rank_magnitude to FP16-representable values
+        # This ensures rank_magnitude stays FP16-friendly during training,
+        # avoiding large rounding errors when snapping to FP16 for ANE.
+        if getattr(self.config, 'use_ste_fp16', False):
+            g = ste_fp16(g)
+
         return A_dir, B_dir, g
+
     def _compute_full_scales(self) -> torch.Tensor:
         """Reconstruct full scales matrix [out, in].
 
