@@ -396,12 +396,14 @@ def main():
         scale_rank=scale_rank,
         force_positive_scales=force_positive_scales,
         magnitude_activation=magnitude_activation,
+        use_ste_fp16=True,  # Enable FP16 emulation for ANE compatibility
     )
     attn_config = AnemllQuantConfigV2(
         lut_size=lut_size,
         scale_rank=scale_rank,
         force_positive_scales=force_positive_scales,
         magnitude_activation=magnitude_activation,
+        use_ste_fp16=True,  # Enable FP16 emulation for ANE compatibility
     )
 
     replace_linear_with_anemll_v2(

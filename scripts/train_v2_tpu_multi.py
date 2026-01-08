@@ -241,7 +241,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         group_size=args.group_size,
         force_positive_scales=False,
         magnitude_activation='identity',
-        use_ste_fp16=False,  # BF16 mode
+        use_ste_fp16=True,  # Enable FP16 emulation for ANE compatibility
     )
     v2_attn_config = AnemllQuantConfigV2(
         lut_size=preset['attn_lut'],
@@ -249,7 +249,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         group_size=args.group_size,
         force_positive_scales=False,
         magnitude_activation='identity',
-        use_ste_fp16=False,
+        use_ste_fp16=True,  # Enable FP16 emulation for ANE compatibility
     )
 
     # Rank 0 does layer replacement (SVD) once, saves state_dict for others to load

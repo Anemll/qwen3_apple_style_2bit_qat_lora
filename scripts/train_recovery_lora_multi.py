@@ -242,11 +242,11 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
 
     v2_mlp_config = AnemllQuantConfigV2(
         lut_size=mlp_lut, scale_rank=mlp_rank, group_size=group_size,
-        force_positive_scales=False, magnitude_activation='identity', use_ste_fp16=False,
+        force_positive_scales=False, magnitude_activation='identity', use_ste_fp16=True,
     )
     v2_attn_config = AnemllQuantConfigV2(
         lut_size=attn_lut, scale_rank=attn_rank, group_size=group_size,
-        force_positive_scales=False, magnitude_activation='identity', use_ste_fp16=False,
+        force_positive_scales=False, magnitude_activation='identity', use_ste_fp16=True,
     )
 
     # Rank 0 does setup, saves for others
