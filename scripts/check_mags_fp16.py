@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Check if rank_magnitude values are FP16-representable.
+Check if rank_magnitude and LUT values are FP16-representable.
 
-Loads a checkpoint and compares rank_magnitude to CPU-snapped FP16 values.
+Loads a checkpoint and compares rank_magnitude and lut tensors to CPU-snapped FP16 values.
 If differences are zero, the checkpoint was properly snapped.
 
 Usage:
@@ -21,7 +21,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print("CHECK RANK_MAGNITUDE FP16 PRECISION")
+    print("CHECK RANK_MAGNITUDE & LUT FP16 PRECISION")
     print("=" * 60)
     print(f"Checkpoint: {args.checkpoint}")
 
@@ -149,9 +149,69 @@ def main():
         snap_status = "✓" if max_diff == 0 else f"Δ{max_diff:.4f}"
         print(f"{i+1:2d}. max={vmax:6.1f} | {snap_status:8s} | {layer_type:4s} | {layer_name}")
 
-    # Sample values
+    # =========================================================================
+    # LUT FP16 CHECK
+    # =========================================================================
     print(f"\n" + "=" * 60)
-    print("SAMPLE VALUES")
+    print("LUT FP16 PRECISION CHECK")
+    print("=" * 60)
+
+    lut_keys = [k for k in state_dict.keys() if k.endswith('.lut')]
+    print(f"Found {len(lut_keys)} LUT tensors")
+
+    if lut_keys:
+        lut_snapped = 0
+        lut_unsnapped = 0
+        lut_diffs = []
+
+        for key in lut_keys:
+            val = state_dict[key].float()
+            snapped = val.cpu().half().float()
+            diff = (val - snapped).abs()
+            max_diff = diff.max().item()
+
+            if max_diff == 0.0:
+                lut_snapped += 1
+            else:
+                lut_unsnapped += 1
+                lut_diffs.append((max_diff, key, val.min().item(), val.max().item(), val.shape[0]))
+
+        print(f"Already FP16-snapped: {lut_snapped}/{len(lut_keys)}")
+        print(f"NOT snapped:          {lut_unsnapped}/{len(lut_keys)}")
+
+        if lut_unsnapped == 0:
+            print("\n✓ All LUT tensors are FP16-representable!")
+        else:
+            print(f"\n✗ {lut_unsnapped} LUT tensors have FP16 rounding differences")
+            lut_diffs.sort(reverse=True, key=lambda x: x[0])
+            print(f"\nTop {min(5, len(lut_diffs))} LUT differences:")
+            for i, (max_diff, key, vmin, vmax, lut_size) in enumerate(lut_diffs[:5]):
+                layer_name = key.replace('.lut', '')
+                is_mlp = any(p in key for p in ['gate_proj', 'up_proj', 'down_proj'])
+                layer_type = "MLP" if is_mlp else "Attn"
+                print(f"  {i+1}. diff={max_diff:.6f} | LUT{lut_size} | {layer_type:4s} | {layer_name}")
+
+        # Show sample LUT values
+        sample_lut_key = lut_keys[0]
+        sample_lut = state_dict[sample_lut_key]
+        print(f"\nSample LUT: {sample_lut_key}")
+        print(f"  dtype: {sample_lut.dtype}")
+        print(f"  shape: {sample_lut.shape} (LUT size = {sample_lut.shape[0]})")
+        print(f"  range: [{sample_lut.min():.6f}, {sample_lut.max():.6f}]")
+        print(f"  values: {sample_lut.flatten().tolist()}")
+
+        # Check if all LUTs are identical (they should be for uniform quantization)
+        first_lut = state_dict[lut_keys[0]].float()
+        all_identical = True
+        for key in lut_keys[1:]:
+            if not torch.allclose(first_lut, state_dict[key].float()):
+                all_identical = False
+                break
+        print(f"\n  All LUTs identical: {'✓ Yes' if all_identical else '✗ No (layer-specific LUTs)'}")
+
+    # Sample values (rank_magnitude)
+    print(f"\n" + "=" * 60)
+    print("SAMPLE RANK_MAGNITUDE VALUES")
     print("=" * 60)
     sample_key = mag_keys[0]
     sample = state_dict[sample_key]
