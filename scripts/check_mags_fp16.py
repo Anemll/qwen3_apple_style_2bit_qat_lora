@@ -117,6 +117,17 @@ def main():
         else:
             print(f"Attn layers: All snapped ✓")
 
+        # Show top magnitudes by max value (largest values lose most precision)
+        sorted_by_max = sorted(diffs, key=lambda x: x[4], reverse=True)  # Sort by vmax
+        print(f"\n" + "=" * 60)
+        print(f"TOP {min(args.top, len(sorted_by_max))} LARGEST MAGNITUDES (most affected by FP16)")
+        print("=" * 60)
+        for i, (max_diff, mean_diff, key, vmin, vmax) in enumerate(sorted_by_max[:args.top]):
+            layer_name = key.replace('.rank_magnitude', '')
+            is_mlp = any(p in key for p in ['gate_proj', 'up_proj', 'down_proj'])
+            layer_type = "MLP" if is_mlp else "Attn"
+            print(f"{i+1:2d}. max={vmax:6.1f} | diff={max_diff:.6f} | {layer_type:4s} | {layer_name}")
+
     # Sample values
     print(f"\n" + "=" * 60)
     print("SAMPLE VALUES")
