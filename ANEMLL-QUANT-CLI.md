@@ -595,7 +595,52 @@ python scripts/train_v2_simple.py \
 | `--save-steps` | 0 | Checkpoint interval (0=disabled) |
 | `--g-only` | False | Train only rank magnitudes |
 | `--mlp-only` | False | Train only MLP layers |
+| `--freeze-mags` | False | Snap and freeze rank_magnitude (FP16 compatible) |
+| `--freeze-mags-mlp` | False | Freeze rank_magnitude for MLP layers only |
 | `--wandb` | False | Enable W&B logging |
+
+### 10.4 Freeze Rank Magnitudes for ANE FP16
+
+When targeting Apple Neural Engine (ANE) with FP16-only inference, use `--freeze-mags` to ensure `rank_magnitude` values are FP16-compatible during training.
+
+**Problem:** ANE only supports FP16. Large `rank_magnitude` values (4.7-154.0) lose precision when snapped to FP16, causing inference divergence.
+
+**Solution:** `--freeze-mags` pre-snaps magnitudes to FP16-representable values and freezes them, so training learns to compensate.
+
+```bash
+# Train V2 with frozen FP16-compatible magnitudes
+python scripts/train_v2_simple.py \
+    --v2-checkpoint runs/q4_base.pt \
+    --cache-dir caches/alpaca_L128_K128_R1024 \
+    --output-dir runs/v2_frozen_mags \
+    --freeze-mags \
+    --max-steps 1000
+```
+
+**What `--freeze-mags` does:**
+1. Snaps `rank_magnitude` to FP16-representable values: `g = g.half().float()`
+2. Freezes them: `requires_grad = False`
+3. Trains only `scale_A` and `scale_B`
+
+**Options:**
+| Flag | Effect |
+|------|--------|
+| `--freeze-mags` | Freeze ALL 196 layers' magnitudes |
+| `--freeze-mags-mlp` | Freeze only MLP magnitudes (~84 layers), attention mags trainable |
+
+**Use cases:**
+- **AQ1 (2-bit MLP, 4-bit Attn):** Use `--freeze-mags-mlp` (MLP has higher compression, more sensitive)
+- **ANE FP16 export:** Use `--freeze-mags` for full FP16 compatibility
+- **Debugging snap divergence:** Compare with/without to isolate magnitude precision issues
+
+**Utility scripts:**
+```bash
+# Standalone snap (without training)
+python scripts/snap_mags_fp16.py checkpoint.pt --output checkpoint_magssnapped.pt
+
+# Snap MLP mags only
+python scripts/snap_mags_fp16.py checkpoint.pt --mlp-only
+```
 
 ---
 
