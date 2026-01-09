@@ -218,6 +218,62 @@ def find_largest_diffs(orig, snap, common_keys, top_n=20):
         print(f"{diff:.6f}: {key}")
 
 
+def analyze_lut_fp16(orig, snap):
+    """Check if LUT values are FP16-representable."""
+    print("\n" + "=" * 60)
+    print("LUT FP16 PRECISION CHECK")
+    print("=" * 60)
+
+    for name, state_dict in [("Original", orig), ("Snapped", snap)]:
+        lut_keys = [k for k in state_dict.keys() if k.endswith('.lut')]
+        if not lut_keys:
+            print(f"{name}: No LUT tensors found")
+            continue
+
+        lut_snapped = 0
+        lut_unsnapped = 0
+        lut_diffs = []
+
+        for key in lut_keys:
+            val = state_dict[key].float()
+            snapped = val.cpu().half().float()
+            diff = (val - snapped).abs()
+            max_diff = diff.max().item()
+
+            if max_diff == 0.0:
+                lut_snapped += 1
+            else:
+                lut_unsnapped += 1
+                lut_diffs.append((max_diff, key, val.shape[0]))
+
+        print(f"\n{name}:")
+        print(f"  Found {len(lut_keys)} LUT tensors")
+        print(f"  FP16-snapped: {lut_snapped}/{len(lut_keys)}")
+        print(f"  NOT snapped:  {lut_unsnapped}/{len(lut_keys)}")
+
+        if lut_unsnapped > 0:
+            lut_diffs.sort(reverse=True, key=lambda x: x[0])
+            print(f"  Top differences:")
+            for i, (diff, key, lut_size) in enumerate(lut_diffs[:3]):
+                print(f"    {i+1}. diff={diff:.6f} | LUT{lut_size} | {key}")
+
+        # Show sample LUT
+        if lut_keys:
+            sample_key = lut_keys[0]
+            sample_lut = state_dict[sample_key]
+            print(f"  Sample LUT ({sample_key.split('.')[-2]}):")
+            print(f"    dtype: {sample_lut.dtype}, shape: {sample_lut.shape}")
+            print(f"    values: {sample_lut.flatten().tolist()}")
+
+            # Check if all LUTs identical
+            first_lut = state_dict[lut_keys[0]].float()
+            all_identical = all(
+                torch.allclose(first_lut, state_dict[k].float())
+                for k in lut_keys[1:]
+            )
+            print(f"    All LUTs identical: {'✓ Yes' if all_identical else '✗ No'}")
+
+
 def analyze_attention_vs_mlp(orig, snap, common_keys):
     """Compare attention vs MLP layer differences."""
     print("\n" + "=" * 60)
@@ -292,6 +348,9 @@ def main():
 
     # Attention vs MLP
     analyze_attention_vs_mlp(orig, snap, common_keys)
+
+    # LUT FP16 precision check
+    analyze_lut_fp16(orig, snap)
 
     print("\n" + "=" * 60)
     print("SUMMARY")
