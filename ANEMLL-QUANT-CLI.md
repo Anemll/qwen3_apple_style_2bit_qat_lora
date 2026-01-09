@@ -693,6 +693,58 @@ python scripts/snap_mags_fp16.py checkpoint.pt --output checkpoint_magssnapped.p
 python scripts/snap_mags_fp16.py checkpoint.pt --mlp-only
 ```
 
+### 10.5 Auto Snap+Freeze (Dynamic During Training)
+
+Instead of freezing magnitudes at training start, auto-snap detects when `rank_magnitude` values have stabilized and applies snap+freeze automatically.
+
+**Usage:**
+```bash
+python scripts/train_v2_simple.py \
+    --v2-checkpoint runs/v2_q4/best.pt \
+    --cache-dir caches/openhermes_L128_K128 \
+    --save-steps 200 \
+    --auto-snap-mags \
+    --auto-snap-target mlp \
+    --auto-snap-threshold 0.05 \
+    --auto-snap-patience 2
+```
+
+**Auto-Snap CLI Options:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--auto-snap-mags` | False | Enable auto snap+freeze |
+| `--auto-snap-target` | mlp | Target: `mlp` (84 layers) or `all` (196 layers) |
+| `--auto-snap-threshold` | 0.05 | Max abs delta between saves for stability |
+| `--auto-snap-patience` | 2 | Consecutive stable saves before triggering |
+| `--auto-snap-start-step` | 100 | Don't audit before this step |
+| `--auto-snap-min-saves` | 2 | Minimum saves before eligible |
+| `--auto-snap-dry-run` | False | Audit + log but don't freeze |
+| `--auto-snap-log-json` | False | Write audit JSON files |
+
+**Conflicts:** `--auto-snap-mags` cannot be used with:
+- `--freeze-mags` (already frozen at start)
+- `--freeze-mags-mlp` (already frozen at start)
+- `--freeze-all` (nothing to snap)
+- `--g-only` (auto-snap targets mags)
+
+**Requirements:**
+- `--save-steps > 0` (audit happens at save checkpoints)
+
+**How it works:**
+1. At each `--save-steps`, CPU state dict is saved and audited
+2. Compares `rank_magnitude` values to previous save
+3. If `max_abs_delta < threshold` for `patience` consecutive saves → trigger
+4. Applies FP16 snap (`cpu().half().float()`) and freeze
+5. Rebuilds optimizer without frozen params (one TPU recompilation)
+
+**W&B metrics logged:**
+- `auto_snap/max_delta`, `auto_snap/mean_delta` - movement metrics
+- `auto_snap/stable_count` - consecutive stable audit count
+- `auto_snap/frozen_step`, `auto_snap/frozen_count` - when triggered
+
+**TPU/XLA safety:** Audit uses CPU tensors from checkpoint save, avoiding XLA lazy tensor reads.
+
 ---
 
 ## 11. Progressive Quantization (Q4→Q2)

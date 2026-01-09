@@ -336,35 +336,24 @@ def main():
         print("\nKeeping LoRA adapters separate (no merge)")
         print("  For best ANE perf, consider --merge-lora")
 
+    # IMPORTANT: Preserve embed_tokens and lm_head from ORIGINAL checkpoint BEFORE any snapping
+    # FP16 rounding corrupts vocab embeddings (~0.02 max error is semantically huge)
+    # Keep original dtype (BF16 or FP32) - do NOT convert to FP16
+    embed_weight_original = state_dict.get('model.embed_tokens.weight')
+    lm_head_weight_original = state_dict.get('lm_head.weight')
+    if embed_weight_original is not None:
+        embed_weight_original = embed_weight_original.clone()  # Preserve original dtype
+        print(f"  [Preserved] embed_tokens: {embed_weight_original.shape}, dtype={embed_weight_original.dtype}")
+    if lm_head_weight_original is not None:
+        lm_head_weight_original = lm_head_weight_original.clone()  # Preserve original dtype
+        print(f"  [Preserved] lm_head: {lm_head_weight_original.shape}, dtype={lm_head_weight_original.dtype}")
+
     # Snap for inference
     if args.fp16:
-        # FP16 snap for ANE export
-        # IMPORTANT: Preserve embed_tokens and lm_head in full precision
-        # (They may share weights via tie_word_embeddings - FP16 corrupts vocab embeddings)
-        embed_weight_backup = None
-        lm_head_weight_backup = None
-
-        # Check for tied embeddings (embed_tokens.weight == lm_head.weight)
-        has_tied = hasattr(model, 'model') and hasattr(model.model, 'embed_tokens')
-        if has_tied:
-            embed_weight_backup = model.model.embed_tokens.weight.data.clone()
-        if hasattr(model, 'lm_head') and model.lm_head is not None:
-            # Only backup if NOT tied (avoid duplicate clone)
-            if not has_tied or id(model.lm_head.weight) != id(model.model.embed_tokens.weight):
-                lm_head_weight_backup = model.lm_head.weight.data.clone()
-
         recompute = getattr(args, 'recompute_indices', False)
         print(f"\nSnapping for ANE (FP16 precision, recompute_indices={recompute})...")
         snapped = snap_model_for_ane_v2(model, recompute_indices=recompute, verbose=True)
         print(f"  Snapped {snapped} layers to FP16")
-
-        # Restore embed_tokens and lm_head to full precision
-        if embed_weight_backup is not None:
-            model.model.embed_tokens.weight.data = embed_weight_backup
-            print(f"  [Preserved] embed_tokens in FP32")
-        if lm_head_weight_backup is not None:
-            model.lm_head.weight.data = lm_head_weight_backup
-            print(f"  [Preserved] lm_head in FP32")
     else:
         # DON'T call snap_for_export() - it modifies scale params and might recompute Q
         # Instead, directly call freeze_for_inference() which caches W_eff using loaded _Q
@@ -403,6 +392,22 @@ def main():
         output_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), args.output)
         print(f"  Saved!")
+
+        # CRITICAL: Patch saved checkpoint with original embed_tokens/lm_head (FP32)
+        # FP16 snap corrupts vocab embeddings (~0.02 max error is semantically huge)
+        # embed_tokens and lm_head should NEVER be snapped to FP16
+        if args.fp16 and (embed_weight_original is not None or lm_head_weight_original is not None):
+            print(f"  Patching embed_tokens/lm_head from original checkpoint (FP32)...")
+            saved_ckpt = torch.load(args.output, map_location='cpu')
+            patched = []
+            if embed_weight_original is not None:
+                saved_ckpt['model.embed_tokens.weight'] = embed_weight_original
+                patched.append(f'model.embed_tokens.weight ({embed_weight_original.dtype})')
+            if lm_head_weight_original is not None:
+                saved_ckpt['lm_head.weight'] = lm_head_weight_original
+                patched.append(f'lm_head.weight ({lm_head_weight_original.dtype})')
+            torch.save(saved_ckpt, args.output)
+            print(f"  Patched: {', '.join(patched)}")
 
         # Save config.json for ANE tests
         config_path = output_path.parent / 'config.json'

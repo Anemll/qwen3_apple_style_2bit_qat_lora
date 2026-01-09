@@ -308,3 +308,147 @@ Or via environment variable:
 ```bash
 TPU_NUM_DEVICES=2 python scripts/train_recovery_lora_multi.py ...
 ```
+
+---
+
+## Auto Snap+Freeze rank_magnitude
+
+The `--auto-snap-mags` feature automatically detects when `rank_magnitude` values have stabilized during training and applies FP16 snap + freeze. This is TPU/XLA-safe because:
+
+1. **CPU-only audit**: Audit uses CPU tensors from checkpoint saves, no XLA lazy tensor reads
+2. **Save checkpoints only**: Audit runs only at `--save-steps` intervals, no per-step overhead
+3. **One-time snap+freeze**: Once triggered, optimizer is rebuilt with frozen params (one recompilation)
+
+### Usage
+
+```bash
+python scripts/train_v2_simple.py \
+    --v2-checkpoint runs/v2_q4/best.pt \
+    --cache-dir caches/openhermes_L128_K128 \
+    --save-steps 200 \
+    --auto-snap-mags \
+    --auto-snap-target mlp \
+    --auto-snap-threshold 0.05 \
+    --auto-snap-patience 2 \
+    --auto-snap-start-step 200
+```
+
+### CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--auto-snap-mags` | off | Enable auto snap+freeze |
+| `--auto-snap-target` | mlp | Target: `mlp` (84 layers) or `all` (196 layers) |
+| `--auto-snap-threshold` | 0.05 | Max abs delta between saves to consider stable |
+| `--auto-snap-patience` | 2 | Consecutive stable saves required to trigger |
+| `--auto-snap-start-step` | 100 | Don't audit before this step |
+| `--auto-snap-min-saves` | 2 | Minimum save checkpoints before eligible |
+| `--auto-snap-dry-run` | off | Audit + log but don't freeze (for testing) |
+| `--auto-snap-log-json` | off | Write audit JSON files |
+
+### How It Works
+
+1. **At each save checkpoint** (every `--save-steps`):
+   - State dict is copied to CPU for checkpoint save
+   - If `auto_snap_state.should_audit()` returns True:
+     - Extract `rank_magnitude` tensors (CPU-only)
+     - Compare to previous save's mags
+     - Compute max/mean abs delta
+
+2. **Stability detection**:
+   - If `max_abs_delta < threshold`: increment `stable_count`
+   - If `max_abs_delta >= threshold`: reset `stable_count` to 0
+
+3. **Trigger condition**:
+   - `stable_count >= patience` AND `num_audits >= min_saves`
+
+4. **Apply snap+freeze**:
+   - FP16 snap: `tensor.cpu().half().float()` (CPU-based for XLA safety)
+   - Freeze: `requires_grad = False`
+   - Rebuild optimizer without frozen params (one TPU recompilation)
+
+### W&B Logging
+
+When `--wandb` is enabled, auto-snap metrics are logged:
+
+| Metric | Description |
+|--------|-------------|
+| `auto_snap/max_delta` | Max abs change from previous save |
+| `auto_snap/mean_delta` | Mean abs change |
+| `auto_snap/fp16_snap_dist` | Max distance to FP16-representable values |
+| `auto_snap/stable_count` | Consecutive stable audit count |
+| `auto_snap/auto_frozen` | 1 if frozen, 0 otherwise |
+| `auto_snap/frozen_step` | Step when freeze was triggered |
+| `auto_snap/frozen_count` | Number of parameters frozen |
+
+### TPU/XLA Safety
+
+**Why CPU-based audit?**
+
+On TPU/XLA, reading tensors from device triggers graph breaks and can cause recompilation. The auto-snap audit avoids this by:
+
+1. Using the CPU state dict that's already created for checkpoint saving
+2. Never calling `.item()` or `.cpu()` on XLA tensors during audit
+3. Only modifying model when freeze is triggered (planned recompilation)
+
+```python
+# SAFE: Uses CPU state dict from checkpoint save
+cpu_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+torch.save(cpu_state_dict, ckpt_path)
+audit_result = audit_mags_movement(state, cpu_state_dict, step)  # CPU-only
+
+# UNSAFE: Would trigger XLA graph break
+# for name, p in model.named_parameters():
+#     if 'rank_magnitude' in name:
+#         val = p.cpu()  # BAD: XLA tensor read
+```
+
+### Recommended Starting Configuration
+
+For initial "from scratch" scale training:
+
+```bash
+python scripts/train_v2_simple.py \
+    --from-scratch \
+    --cache-dir caches/openhermes_L128_K128 \
+    --max-steps 3000 \
+    --save-steps 200 \
+    --auto-snap-mags \
+    --auto-snap-target mlp \
+    --auto-snap-start-step 200 \
+    --auto-snap-threshold 0.05 \
+    --auto-snap-patience 2 \
+    --auto-snap-min-saves 2 \
+    --wandb
+```
+
+**Key choices:**
+- `--auto-snap-start-step 200`: Skip early chaos phase (first ~200 optimizer steps)
+- `--auto-snap-threshold 0.05`: Max abs delta between saves (tune based on your data)
+- `--auto-snap-patience 2`: Require 2 consecutive stable saves before triggering
+- `--auto-snap-min-saves 2`: Need at least 2 comparisons before eligible
+
+**Expected behavior:**
+1. Steps 0-199: No auditing (warmup)
+2. Step 200: First audit (store baseline)
+3. Step 400: Second audit (compare to 200)
+4. Step 600+: If stable for 2 consecutive saves → trigger snap+freeze
+
+**Important notes:**
+- Triggers at most once per run
+- Rebuilds optimizer/scheduler after freeze (one XLA recompile expected)
+- Off by default (must explicitly enable with `--auto-snap-mags`)
+- Use `--auto-snap-dry-run` to test without actually freezing
+
+### Validation After Freeze
+
+After a run with auto-snap, verify the checkpoint:
+
+```bash
+python scripts/check_mags_fp16.py runs/output/checkpoint_step800.pt
+```
+
+Expected output after freeze:
+```
+MLP layers: All snapped ✓
+```

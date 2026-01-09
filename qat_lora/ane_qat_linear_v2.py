@@ -86,16 +86,25 @@ def make_lut(
     dtype: torch.dtype,
     include_zero: bool = False,
 ) -> torch.Tensor:
-    """Create monotonic LUT in [-1, 1]."""
+    """Create monotonic LUT in [-1, 1].
+
+    IMPORTANT: LUT values are created in FP16 first, then upcast to target dtype.
+    This ensures all values are FP16-representable, preventing precision loss
+    when snapping to FP16 for ANE export.
+    """
     if lut_size < 2:
         raise ValueError("lut_size must be >= 2")
     if not include_zero or (lut_size % 2 == 1):
-        return torch.linspace(-1.0, 1.0, steps=lut_size, device=device, dtype=dtype)
+        # Create in FP16 first, then cast to target dtype for FP16-representable values
+        lut_fp16 = torch.linspace(-1.0, 1.0, steps=lut_size, device='cpu', dtype=torch.float16)
+        return lut_fp16.to(device=device, dtype=dtype)
 
     # Even size with zero: non-uniform but includes 0
-    neg = torch.linspace(-1.0, 0.0, steps=lut_size // 2 + 1, device=device, dtype=dtype)
-    pos = torch.linspace(0.0, 1.0, steps=lut_size // 2, device=device, dtype=dtype)
-    return torch.cat([neg[:-1], pos], dim=0)
+    # Create in FP16 first for FP16-representable values
+    neg = torch.linspace(-1.0, 0.0, steps=lut_size // 2 + 1, device='cpu', dtype=torch.float16)
+    pos = torch.linspace(0.0, 1.0, steps=lut_size // 2, device='cpu', dtype=torch.float16)
+    lut_fp16 = torch.cat([neg[:-1], pos], dim=0)
+    return lut_fp16.to(device=device, dtype=dtype)
 
 
 def quantize_to_lut_indices(

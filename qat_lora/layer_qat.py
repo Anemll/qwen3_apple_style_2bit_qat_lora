@@ -1289,6 +1289,8 @@ def train_e2e(
     anchor_kl_weight: float = 0.0,
     anchor_samples: int = 16,
     anchor_interval: int = 1,
+    # Auto snap+freeze
+    auto_snap_state = None,
 ) -> dict:
     """End-to-end KD-QAT training (all layers unfrozen).
 
@@ -1338,6 +1340,9 @@ def train_e2e(
         anchor_kl_weight: Weight of anchor KL term (default 0.0 = disabled)
         anchor_samples: Number of fixed anchor samples to cache logits for (default 16)
         anchor_interval: Compute anchor KL every N steps (default 1 = every step)
+        auto_snap_state: AutoSnapState instance for automatic snap+freeze of rank_magnitude.
+                        When enabled, audits mags at save checkpoints (CPU-only) and triggers
+                        one-time snap+freeze when stability detected. See auto_snap_mags.py.
 
     Returns:
         Dict with 'initial_loss', 'final_loss', 'best_loss', 'steps', 'time_sec'
@@ -2123,9 +2128,95 @@ def train_e2e(
             if save_interval > 0 and save_dir and step % save_interval == 0 and step > 0:
                 os.makedirs(save_dir, exist_ok=True)
                 ckpt_path = os.path.join(save_dir, f"checkpoint_step{optimizer_step}.pt")
-                torch.save(model.state_dict(), ckpt_path)
+                # Save CPU state dict (also used for auto-snap audit)
+                cpu_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                torch.save(cpu_state_dict, ckpt_path)
                 if verbose:
                     print(f"  [Checkpoint saved: {ckpt_path}]")
+
+                # Auto-snap audit (CPU-only, no XLA tensor reads)
+                if auto_snap_state is not None and auto_snap_state.should_audit(optimizer_step):
+                    from qat_lora.auto_snap_mags import (
+                        audit_mags_movement,
+                        apply_auto_snap_and_freeze,
+                        save_audit_json,
+                    )
+                    audit_result = audit_mags_movement(
+                        auto_snap_state,
+                        cpu_state_dict,
+                        optimizer_step,
+                        verbose=verbose,
+                    )
+                    # Log to W&B if enabled
+                    if use_wandb and wandb_run is not None:
+                        import wandb
+                        snap_log = {'auto_snap/step': optimizer_step}
+                        if audit_result['movement_metrics']:
+                            snap_log['auto_snap/max_delta'] = audit_result['movement_metrics']['max_abs_delta']
+                            snap_log['auto_snap/mean_delta'] = audit_result['movement_metrics']['mean_abs_delta']
+                            snap_log['auto_snap/num_keys'] = audit_result['movement_metrics']['num_keys']
+                        if audit_result['snap_metrics']:
+                            snap_log['auto_snap/fp16_snap_dist'] = audit_result['snap_metrics']['max_snap_diff']
+                        snap_log['auto_snap/stable_count'] = auto_snap_state.stable_count
+                        snap_log['auto_snap/auto_frozen'] = int(auto_snap_state.auto_frozen)
+                        # Log disabled state if aborted
+                        snap_log['auto_snap/enabled'] = int(auto_snap_state.enabled)
+                        if audit_result.get('disabled'):
+                            snap_log['auto_snap/disabled'] = 1
+                            snap_log['auto_snap/disable_reason'] = audit_result.get('disable_reason', 'unknown')
+                        wandb.log(snap_log, step=step)
+
+                    # Save audit JSON if enabled
+                    if auto_snap_state.log_json:
+                        save_audit_json(auto_snap_state, save_dir, optimizer_step)
+
+                    # Apply snap+freeze if triggered
+                    if audit_result['should_freeze']:
+                        # Capture current LR and scheduler state before rebuild
+                        lr_before = optimizer.param_groups[0]['lr']
+                        sched_state = scheduler.state_dict() if scheduler else None
+
+                        frozen_count, optimizer = apply_auto_snap_and_freeze(
+                            model,
+                            optimizer,
+                            target=auto_snap_state.target,
+                            verbose=verbose,
+                        )
+                        auto_snap_state.auto_frozen = True
+
+                        # Rebuild scheduler with new optimizer (critical for LR continuity)
+                        # Use state_dict restore for robustness (handles base_lrs correctly)
+                        if scheduler is not None and sched_state is not None:
+                            from torch.optim.lr_scheduler import LambdaLR
+                            # Recreate with same lr_lambda closure (captured in outer scope)
+                            scheduler = LambdaLR(optimizer, lr_lambda)
+                            # Restore full state (includes last_epoch, base_lrs)
+                            scheduler.load_state_dict(sched_state)
+                            # Force LR update to current step
+                            scheduler._last_lr = [lr_lambda(sched_state['last_epoch']) * base_lr
+                                                  for base_lr in scheduler.base_lrs]
+                            for param_group, lr in zip(optimizer.param_groups, scheduler._last_lr):
+                                param_group['lr'] = lr
+
+                            # Verify LR continuity
+                            lr_after = optimizer.param_groups[0]['lr']
+                            if verbose:
+                                print(f"[AutoSnap] Scheduler rebuilt: step={sched_state['last_epoch']}, lr={lr_after:.2e}")
+                                lr_diff = abs(lr_before - lr_after)
+                                if lr_diff > 1e-8:
+                                    print(f"[AutoSnap] WARNING: LR changed from {lr_before:.2e} to {lr_after:.2e} (diff={lr_diff:.2e})")
+                                else:
+                                    print(f"[AutoSnap] LR continuity verified ✓")
+
+                        # Log to W&B
+                        if use_wandb and wandb_run is not None:
+                            import wandb
+                            wandb.log({
+                                'auto_snap/frozen_step': optimizer_step,
+                                'auto_snap/frozen_count': frozen_count,
+                                'auto_snap/lr_before': lr_before,
+                                'auto_snap/lr_after': optimizer.param_groups[0]['lr'],
+                            }, step=step)
 
                 # Clean up old checkpoints if keep_checkpoints is set
                 if keep_checkpoints > 0:
