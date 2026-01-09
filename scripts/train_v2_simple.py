@@ -75,6 +75,10 @@ def main():
     parser.add_argument('--eval-steps', type=int, default=100, help='Eval every N steps (default: 100)')
     parser.add_argument('--eval-samples', type=int, default=None, help='Eval samples (default: 40, 0=skip)')
     parser.add_argument('--g-only', action='store_true', help='Train only rank_magnitude (G), freeze A and B')
+    parser.add_argument('--freeze-mags', action='store_true',
+                        help='Freeze rank_magnitude (G), train only A and B. Opposite of --g-only.')
+    parser.add_argument('--freeze-mags-mlp', action='store_true',
+                        help='Freeze rank_magnitude for MLP layers only (attention mags still trainable)')
     parser.add_argument('--mlp-only', action='store_true', help='Train only MLP layers, freeze attention')
     parser.add_argument('--save-steps', type=int, default=0, help='Save checkpoint every N steps (0=disabled)')
     parser.add_argument('--keep-checkpoints', type=int, default=0,
@@ -542,6 +546,8 @@ def main():
         train_scales=True,
         train_g_only=args.g_only,
         train_mlp_only=args.mlp_only,
+        freeze_mags=args.freeze_mags,
+        freeze_mags_mlp=args.freeze_mags_mlp,
         hard_top1_weight=args.hard_top1,
         hard_top1_end=args.hard_top1_end,
         hard_full_weight=tpu_hard_full,

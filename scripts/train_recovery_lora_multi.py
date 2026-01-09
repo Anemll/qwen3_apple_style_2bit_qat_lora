@@ -60,6 +60,10 @@ def parse_args():
                         help='LoRA alpha (default: 2*r)')
     parser.add_argument('--mlp-only', action='store_true',
                         help='Apply LoRA to MLP layers only (skip attention)')
+    parser.add_argument('--freeze-mags', action='store_true',
+                        help='Freeze rank_magnitude (snap to FP16 values). Train only A, B, and LoRA.')
+    parser.add_argument('--freeze-mags-mlp', action='store_true',
+                        help='Freeze rank_magnitude for MLP layers only')
 
     # Training args
     parser.add_argument('--batch-size', type=int, default=4,
@@ -278,6 +282,20 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         )
         freeze_for_recovery_training(model)
 
+        # Freeze mags if requested (snap to FP16 + freeze)
+        if args.freeze_mags or args.freeze_mags_mlp:
+            mags_frozen = 0
+            mlp_patterns = ('gate_proj', 'up_proj', 'down_proj')
+            for name, m in model.named_modules():
+                if hasattr(m, 'rank_magnitude') and m.rank_magnitude is not None:
+                    is_mlp = any(p in name for p in mlp_patterns)
+                    if args.freeze_mags or (args.freeze_mags_mlp and is_mlp):
+                        with torch.no_grad():
+                            m.rank_magnitude.data = m.rank_magnitude.data.half().float()
+                        m.rank_magnitude.requires_grad = False
+                        mags_frozen += 1
+            log(f"  Snapped & frozen {mags_frozen} rank_magnitude tensors")
+
         # Save for other ranks
         torch.save(model.state_dict(), v2_cache_path)
         log_all("Rank 0: V2+LoRA state saved for other ranks")
@@ -298,6 +316,16 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
             mlp_only=args.mlp_only, skip_k=True,
         )
         freeze_for_recovery_training(model)
+
+        # Freeze mags if requested (snap to FP16 + freeze)
+        if args.freeze_mags or args.freeze_mags_mlp:
+            mlp_patterns = ('gate_proj', 'up_proj', 'down_proj')
+            for name, m in model.named_modules():
+                if hasattr(m, 'rank_magnitude') and m.rank_magnitude is not None:
+                    is_mlp = any(p in name for p in mlp_patterns)
+                    if args.freeze_mags or (args.freeze_mags_mlp and is_mlp):
+                        m.rank_magnitude.requires_grad = False
+            # Values already snapped by rank 0, will be loaded below
 
         # Load weights from rank 0
         state_dict = torch.load(v2_cache_path, map_location='cpu', weights_only=False)

@@ -167,6 +167,10 @@ def main():
                        help="Only enable LoRA on MLP layers (recommended first)")
     parser.add_argument("--include-k-proj", action="store_true",
                        help="Include K projection (default: skip like Apple)")
+    parser.add_argument("--freeze-mags", action="store_true",
+                       help="Freeze rank_magnitude (snap to FP16 values). Train only LoRA.")
+    parser.add_argument("--freeze-mags-mlp", action="store_true",
+                       help="Freeze rank_magnitude for MLP layers only")
 
     # Training mode
     parser.add_argument("--lora-mode", type=str, default="recover",
@@ -510,6 +514,8 @@ def main():
         wandb_run_name=args.wandb_run,
         verbose=True,
         debug=args.debug,
+        freeze_mags=args.freeze_mags,
+        freeze_mags_mlp=args.freeze_mags_mlp,
     )
 
     # Save final checkpoint

@@ -76,6 +76,10 @@ def parse_args():
     # Training mode
     parser.add_argument('--mlp-only', action='store_true',
                         help='Train only MLP layers (gate/up/down_proj), freeze attention (q/k/v/o_proj)')
+    parser.add_argument('--freeze-mags', action='store_true',
+                        help='Freeze rank_magnitude (snap to FP16 values). Train only A and B.')
+    parser.add_argument('--freeze-mags-mlp', action='store_true',
+                        help='Freeze rank_magnitude for MLP layers only')
 
     # Multi-chip options
     parser.add_argument('--num-chips', type=int, default=None,
@@ -325,6 +329,21 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                         attn_frozen += p.numel()
         if is_master:
             print(f"  MLP-only mode: frozen {attn_frozen:,} attention params")
+
+    # Freeze mags if requested (snap to FP16 + freeze)
+    if args.freeze_mags or args.freeze_mags_mlp:
+        mags_frozen = 0
+        mlp_patterns = ('gate_proj', 'up_proj', 'down_proj')
+        for name, m in model.named_modules():
+            if hasattr(m, 'rank_magnitude') and m.rank_magnitude is not None:
+                is_mlp = any(p in name for p in mlp_patterns)
+                if args.freeze_mags or (args.freeze_mags_mlp and is_mlp):
+                    with torch.no_grad():
+                        m.rank_magnitude.data = m.rank_magnitude.data.half().float()
+                    m.rank_magnitude.requires_grad = False
+                    mags_frozen += 1
+        if is_master:
+            print(f"  Snapped & frozen {mags_frozen} rank_magnitude tensors")
 
     # Move to device
     checkpoint("Moving model to device...")
