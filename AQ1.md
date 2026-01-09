@@ -278,6 +278,84 @@ def ste_fp16(x):
 
 ---
 
+## 9.1 Freeze Options for ANE FP16 Deployment
+
+When targeting Apple Neural Engine (ANE), scale parameters must be FP16-representable. Use freeze options to pre-snap and freeze parameters during training.
+
+**Problem:** Large `rank_magnitude` values (4.7-154.0) lose precision when snapped to FP16, causing inference divergence.
+
+**Solution:** Freeze options pre-snap parameters to FP16-representable values, so training learns to compensate with remaining trainable parameters.
+
+### Parameter Freeze Matrix
+
+| Parameter | `--freeze-mags` | `--freeze-mags-mlp` | `--freeze-all` |
+|-----------|-----------------|---------------------|----------------|
+| scale_A (MLP) | Trainable | Trainable | Frozen + FP16 snap |
+| scale_A (Attn) | Trainable | Trainable | Frozen + FP16 snap |
+| scale_B (MLP) | Trainable | Trainable | Frozen + FP16 snap |
+| scale_B (Attn) | Trainable | Trainable | Frozen + FP16 snap |
+| rank_magnitude (MLP) | Frozen + FP16 snap | Frozen + FP16 snap | Frozen + FP16 snap |
+| rank_magnitude (Attn) | Frozen + FP16 snap | Trainable | Frozen + FP16 snap |
+
+### Parameter Counts (Qwen3-0.6B, 28 layers)
+
+| Component | Layer Count | Parameters per Layer |
+|-----------|-------------|---------------------|
+| MLP layers | 84 | 3 per block (gate_proj, up_proj, down_proj) |
+| Attention layers | 112 | 4 per block (q_proj, k_proj, v_proj, o_proj) |
+| **Total V2 layers** | **196** | |
+
+### Use Cases
+
+| Flag | When to Use |
+|------|-------------|
+| `--freeze-mags` | ANE FP16 export - full FP16 compatibility |
+| `--freeze-mags-mlp` | AQ1 (2-bit MLP, 4-bit Attn) - MLP has higher compression, more sensitive |
+| `--freeze-all` | Debugging - isolate training vs precision issues |
+
+### Tensor-Level Snap/Freeze Details
+
+| Tensor Pattern | `--freeze-mags` | `--freeze-mags-mlp` | `--freeze-all` |
+|----------------|-----------------|---------------------|----------------|
+| `*.gate_proj.scale_A` | Trainable | Trainable | Snap + Freeze |
+| `*.gate_proj.scale_B` | Trainable | Trainable | Snap + Freeze |
+| `*.gate_proj.rank_magnitude` | Snap + Freeze | Snap + Freeze | Snap + Freeze |
+| `*.up_proj.scale_A` | Trainable | Trainable | Snap + Freeze |
+| `*.up_proj.scale_B` | Trainable | Trainable | Snap + Freeze |
+| `*.up_proj.rank_magnitude` | Snap + Freeze | Snap + Freeze | Snap + Freeze |
+| `*.down_proj.scale_A` | Trainable | Trainable | Snap + Freeze |
+| `*.down_proj.scale_B` | Trainable | Trainable | Snap + Freeze |
+| `*.down_proj.rank_magnitude` | Snap + Freeze | Snap + Freeze | Snap + Freeze |
+| `*.q_proj.scale_A` | Trainable | Trainable | Snap + Freeze |
+| `*.q_proj.scale_B` | Trainable | Trainable | Snap + Freeze |
+| `*.q_proj.rank_magnitude` | Snap + Freeze | Trainable | Snap + Freeze |
+| `*.k_proj.scale_A` | Trainable | Trainable | Snap + Freeze |
+| `*.k_proj.scale_B` | Trainable | Trainable | Snap + Freeze |
+| `*.k_proj.rank_magnitude` | Snap + Freeze | Trainable | Snap + Freeze |
+| `*.v_proj.scale_A` | Trainable | Trainable | Snap + Freeze |
+| `*.v_proj.scale_B` | Trainable | Trainable | Snap + Freeze |
+| `*.v_proj.rank_magnitude` | Snap + Freeze | Trainable | Snap + Freeze |
+| `*.o_proj.scale_A` | Trainable | Trainable | Snap + Freeze |
+| `*.o_proj.scale_B` | Trainable | Trainable | Snap + Freeze |
+| `*.o_proj.rank_magnitude` | Snap + Freeze | Trainable | Snap + Freeze |
+
+**Legend:**
+- **Snap**: `tensor.cpu().half().float()` (round to FP16-representable values)
+- **Freeze**: `requires_grad = False`
+- **Trainable**: `requires_grad = True`
+
+### FP16 Snap Operation
+
+```python
+# CPU-based snap for consistency across devices (MPS, CUDA, TPU)
+def snap_to_fp16(x):
+    return x.cpu().half().float().to(x.device)
+```
+
+**Important - TPU/XLA:** FP16 snap MUST be done on CPU (`.cpu().half().float()`) to avoid XLA lazy tensor optimizations. XLA may fuse or skip the FP16 round-trip if done on device, resulting in non-FP16-representable values in the checkpoint. Always move tensor to CPU before snapping.
+
+---
+
 ## 10. Quantization Configurations
 
 ### Q2_A4: 2-bit MLP, 4-bit Attention

@@ -597,6 +597,7 @@ python scripts/train_v2_simple.py \
 | `--mlp-only` | False | Train only MLP layers |
 | `--freeze-mags` | False | Snap and freeze rank_magnitude (FP16 compatible) |
 | `--freeze-mags-mlp` | False | Freeze rank_magnitude for MLP layers only |
+| `--freeze-all` | False | Freeze all scale params (A, B, G) after FP16 snap |
 | `--wandb` | False | Enable W&B logging |
 
 ### 10.4 Freeze Rank Magnitudes for ANE FP16
@@ -627,6 +628,56 @@ python scripts/train_v2_simple.py \
 |------|--------|
 | `--freeze-mags` | Freeze ALL 196 layers' magnitudes |
 | `--freeze-mags-mlp` | Freeze only MLP magnitudes (~84 layers), attention mags trainable |
+| `--freeze-all` | Freeze ALL scale parameters (A, B, and G) |
+
+**Detailed Parameter Freeze Matrix:**
+
+| Parameter | `--freeze-mags` | `--freeze-mags-mlp` | `--freeze-all` |
+|-----------|-----------------|---------------------|----------------|
+| scale_A (MLP) | Trainable | Trainable | Frozen + FP16 snap |
+| scale_A (Attn) | Trainable | Trainable | Frozen + FP16 snap |
+| scale_B (MLP) | Trainable | Trainable | Frozen + FP16 snap |
+| scale_B (Attn) | Trainable | Trainable | Frozen + FP16 snap |
+| rank_magnitude (MLP) | Frozen + FP16 snap | Frozen + FP16 snap | Frozen + FP16 snap |
+| rank_magnitude (Attn) | Frozen + FP16 snap | Trainable | Frozen + FP16 snap |
+
+**Parameter counts (Qwen3-0.6B, 28 layers):**
+- MLP layers: 84 total (3 per block: gate_proj, up_proj, down_proj)
+- Attention layers: 112 total (4 per block: q_proj, k_proj, v_proj, o_proj)
+- Total V2 quantized layers: 196
+
+**Tensor-Level Snap/Freeze Details:**
+
+| Tensor Pattern | `--freeze-mags` | `--freeze-mags-mlp` | `--freeze-all` |
+|----------------|-----------------|---------------------|----------------|
+| `*.gate_proj.scale_A` | Trainable | Trainable | Snap FP16 + Freeze |
+| `*.gate_proj.scale_B` | Trainable | Trainable | Snap FP16 + Freeze |
+| `*.gate_proj.rank_magnitude` | Snap FP16 + Freeze | Snap FP16 + Freeze | Snap FP16 + Freeze |
+| `*.up_proj.scale_A` | Trainable | Trainable | Snap FP16 + Freeze |
+| `*.up_proj.scale_B` | Trainable | Trainable | Snap FP16 + Freeze |
+| `*.up_proj.rank_magnitude` | Snap FP16 + Freeze | Snap FP16 + Freeze | Snap FP16 + Freeze |
+| `*.down_proj.scale_A` | Trainable | Trainable | Snap FP16 + Freeze |
+| `*.down_proj.scale_B` | Trainable | Trainable | Snap FP16 + Freeze |
+| `*.down_proj.rank_magnitude` | Snap FP16 + Freeze | Snap FP16 + Freeze | Snap FP16 + Freeze |
+| `*.q_proj.scale_A` | Trainable | Trainable | Snap FP16 + Freeze |
+| `*.q_proj.scale_B` | Trainable | Trainable | Snap FP16 + Freeze |
+| `*.q_proj.rank_magnitude` | Snap FP16 + Freeze | Trainable | Snap FP16 + Freeze |
+| `*.k_proj.scale_A` | Trainable | Trainable | Snap FP16 + Freeze |
+| `*.k_proj.scale_B` | Trainable | Trainable | Snap FP16 + Freeze |
+| `*.k_proj.rank_magnitude` | Snap FP16 + Freeze | Trainable | Snap FP16 + Freeze |
+| `*.v_proj.scale_A` | Trainable | Trainable | Snap FP16 + Freeze |
+| `*.v_proj.scale_B` | Trainable | Trainable | Snap FP16 + Freeze |
+| `*.v_proj.rank_magnitude` | Snap FP16 + Freeze | Trainable | Snap FP16 + Freeze |
+| `*.o_proj.scale_A` | Trainable | Trainable | Snap FP16 + Freeze |
+| `*.o_proj.scale_B` | Trainable | Trainable | Snap FP16 + Freeze |
+| `*.o_proj.rank_magnitude` | Snap FP16 + Freeze | Trainable | Snap FP16 + Freeze |
+
+**Legend:**
+- **Snap FP16**: `tensor = tensor.cpu().half().float()` (round to FP16-representable values)
+- **Freeze**: `tensor.requires_grad = False`
+- **Trainable**: `tensor.requires_grad = True` (included in optimizer)
+
+**Important - TPU/XLA:** FP16 snap MUST be done on CPU (`.cpu().half().float()`) to avoid XLA lazy tensor optimizations. XLA may fuse or skip the FP16 round-trip if done on device, resulting in non-FP16-representable values in the checkpoint.
 
 **Use cases:**
 - **AQ1 (2-bit MLP, 4-bit Attn):** Use `--freeze-mags-mlp` (MLP has higher compression, more sensitive)
