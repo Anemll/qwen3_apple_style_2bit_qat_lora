@@ -1576,8 +1576,8 @@ def train_e2e(
                 sched_info.append(f"cosine→{min_lr:.2e}")
             print(f"LR Schedule: {', '.join(sched_info)}")
 
-    # Initial evaluation (skip if eval_samples <= 0, e.g., on TPU)
-    if eval_samples > 0:
+    # Initial evaluation (skip if eval_samples <= 0 or None, e.g., on TPU)
+    if eval_samples and eval_samples > 0:
         model.eval()
         initial_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=eval_samples, temperature=temperature)
         if verbose:
@@ -2052,7 +2052,7 @@ def train_e2e(
                     if hard_top1_end is not None:
                         log_dict['train/hard_top1'] = current_hard_top1
                     # Add best_loss when tracking by training loss (eval disabled)
-                    if eval_samples <= 0:
+                    if not eval_samples or eval_samples <= 0:
                         log_dict['train/best_loss'] = best_loss
                     # Add TPU memory stats if available
                     if is_tpu and xm is not None:
@@ -2081,7 +2081,7 @@ def train_e2e(
                 total_loss = 0.0
 
                 # Track best by training loss when eval is disabled (e.g., TPU)
-                if eval_samples <= 0 and avg_loss < best_loss:
+                if (not eval_samples or eval_samples <= 0) and avg_loss < best_loss:
                     best_loss = avg_loss
                     # Save best state
                     if save_dir:
@@ -2091,10 +2091,10 @@ def train_e2e(
                         if verbose:
                             print(f"  [Saved best (train): {best_loss:.4f}]")
 
-            # Evaluation (skip if eval_samples <= 0, e.g., on TPU)
+            # Evaluation (skip if eval_samples <= 0 or None, e.g., on TPU)
             # Check every eval_steps optimizer steps
             eval_interval = eval_steps * accumulation_steps
-            if step % eval_interval == 0 and step > 0 and eval_samples > 0:
+            if step % eval_interval == 0 and step > 0 and eval_samples and eval_samples > 0:
                 model.eval()
                 eval_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=eval_samples, temperature=temperature)
                 elapsed = time.time() - t_start
@@ -2232,9 +2232,9 @@ def train_e2e(
                         except OSError:
                             pass
 
-    # Final evaluation (skip if eval_samples <= 0, e.g., on TPU)
+    # Final evaluation (skip if eval_samples <= 0 or None, e.g., on TPU)
     elapsed = time.time() - t_start
-    if eval_samples > 0:
+    if eval_samples and eval_samples > 0:
         model.eval()
         final_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=eval_samples, temperature=temperature)
 
@@ -2266,7 +2266,7 @@ def train_e2e(
         }, step=step)
 
     # Update best if final is better (skip if no eval)
-    if eval_samples > 0 and final_loss < best_loss:
+    if eval_samples and eval_samples > 0 and final_loss < best_loss:
         best_loss = final_loss
         best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         if save_dir:
@@ -2278,7 +2278,7 @@ def train_e2e(
     if verbose:
         print(f"\n=== Results ===")
         print(f"Initial: {initial_loss:.4f}")
-        if eval_samples > 0:
+        if eval_samples and eval_samples > 0:
             print(f"Final:   {final_loss:.4f}")
             print(f"Best:    {best_loss:.4f} (eval)")
             print(f"Improvement: {initial_loss - final_loss:.4f}")

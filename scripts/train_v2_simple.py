@@ -601,11 +601,14 @@ def main():
     else:
         tpu_hard_full = args.hard_full
 
-    # Eval samples: CLI > TPU default (0) > train_e2e default (40)
+    # Eval samples: CLI > TPU default (0) > GPU/CPU default (40)
     eval_samples = args.eval_samples
-    if eval_samples is None and is_tpu:
-        eval_samples = 0  # Skip eval on TPU for speed
-        print(f"  eval_samples: 0 (skip eval for speed)")
+    if eval_samples is None:
+        if is_tpu:
+            eval_samples = 0  # Skip eval on TPU for speed
+            print(f"  eval_samples: 0 (skip eval for speed)")
+        else:
+            eval_samples = 40  # Default for GPU/CPU
 
     result = train_e2e(
         model=v2_model,
