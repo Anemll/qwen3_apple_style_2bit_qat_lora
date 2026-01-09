@@ -1260,6 +1260,7 @@ def train_e2e(
     train_mlp_only: bool = False,
     freeze_mags: bool = False,
     freeze_mags_mlp: bool = False,
+    freeze_all: bool = False,
     hard_top1_weight: float = 0.0,
     hard_top1_end: float = None,
     hard_full_weight: float = 0.0005,
@@ -1300,6 +1301,8 @@ def train_e2e(
         freeze_mags: If True, snap rank_magnitude to FP16-representable values and freeze them.
                      This is the opposite of train_g_only. Useful when mags are pre-snapped.
         freeze_mags_mlp: If True, freeze rank_magnitude for MLP layers only (attention mags trainable)
+        freeze_all: If True, snap and freeze ALL V2 params (scale_A, scale_B, rank_magnitude).
+                    Nothing trains. Use for FP16 snap verification.
         train_mlp_only: If True, freeze attention layers (q/k/v/o_proj) and only train MLP
                         (gate/up/down_proj). Useful for mixed-bit configs (e.g., 4-bit attn, 2-bit MLP)
         hard_top1_weight: Weight for hard label top-1 loss (0 to disable), or start weight if annealing
@@ -1402,6 +1405,7 @@ def train_e2e(
     trainable = 0
     attn_frozen = 0
     mags_snapped = 0
+    scales_snapped = 0
     for p in model.parameters():
         p.requires_grad = False
 
@@ -1428,7 +1432,14 @@ def train_e2e(
                 trainable += module.weight.numel()
             if train_scales:
                 if hasattr(module, 'scale_A') and module.scale_A is not None:
-                    if not train_g_only:  # Only train A/B if not G-only mode
+                    if freeze_all:
+                        # Snap scales to FP16 and keep frozen
+                        with torch.no_grad():
+                            orig_device = module.scale_A.data.device
+                            module.scale_A.data = module.scale_A.data.cpu().half().float().to(orig_device)
+                            module.scale_B.data = module.scale_B.data.cpu().half().float().to(orig_device)
+                        scales_snapped += 1
+                    elif not train_g_only:  # Only train A/B if not G-only mode
                         module.scale_A.requires_grad = True
                         module.scale_B.requires_grad = True
                         trainable += module.scale_A.numel() + module.scale_B.numel()
@@ -1437,7 +1448,7 @@ def train_e2e(
                     is_mlp = any(p in name for p in ('gate_proj', 'up_proj', 'down_proj'))
 
                     # Determine if this mag should be frozen
-                    should_freeze_mag = freeze_mags or (freeze_mags_mlp and is_mlp)
+                    should_freeze_mag = freeze_all or freeze_mags or (freeze_mags_mlp and is_mlp)
 
                     if should_freeze_mag:
                         # Snap to FP16-representable values (keep as FP32 for training stability)
@@ -1454,20 +1465,23 @@ def train_e2e(
 
     # Describe mode
     mode_parts = []
-    if train_weights:
-        mode_parts.append("weights")
-    if train_scales:
-        if train_g_only:
-            mode_parts.append("G-only")
-        elif freeze_mags:
-            mode_parts.append("A+B (mags frozen/snapped)")
-        elif freeze_mags_mlp:
-            mode_parts.append("scales (MLP mags frozen/snapped)")
-        else:
-            mode_parts.append("scales")
-    mode = "+".join(mode_parts) if mode_parts else "none"
-    if train_mlp_only:
-        mode += " (MLP only)"
+    if freeze_all:
+        mode = "FREEZE ALL (A+B+G snapped/frozen)"
+    else:
+        if train_weights:
+            mode_parts.append("weights")
+        if train_scales:
+            if train_g_only:
+                mode_parts.append("G-only")
+            elif freeze_mags:
+                mode_parts.append("A+B (mags frozen/snapped)")
+            elif freeze_mags_mlp:
+                mode_parts.append("scales (MLP mags frozen/snapped)")
+            else:
+                mode_parts.append("scales")
+        mode = "+".join(mode_parts) if mode_parts else "none"
+        if train_mlp_only:
+            mode += " (MLP only)"
 
     if verbose:
         print(f"=== End-to-End KD-QAT ===")
@@ -1479,6 +1493,8 @@ def train_e2e(
         print(f"Trainable params: {trainable:,}")
         if train_mlp_only:
             print(f"Frozen attention params: {attn_frozen:,}")
+        if scales_snapped > 0:
+            print(f"Snapped & frozen scales: {scales_snapped} layers")
         if mags_snapped > 0:
             print(f"Snapped & frozen mags: {mags_snapped} layers")
         if accumulation_steps > 1:

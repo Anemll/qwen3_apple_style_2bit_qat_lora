@@ -79,8 +79,8 @@ def main():
                         help='Freeze rank_magnitude (G), train only A and B. Opposite of --g-only.')
     parser.add_argument('--freeze-mags-mlp', action='store_true',
                         help='Freeze rank_magnitude for MLP layers only (attention mags still trainable)')
-    parser.add_argument('--freeze-mags-mlp-att', action='store_true',
-                        help='Freeze rank_magnitude for ALL layers (MLP + attention). Alias for --freeze-mags.')
+    parser.add_argument('--freeze-all', action='store_true',
+                        help='Snap + freeze ALL V2 params (scale_A, scale_B, rank_magnitude) for FP16 export. Nothing trains.')
     parser.add_argument('--mlp-only', action='store_true', help='Train only MLP layers, freeze attention')
     parser.add_argument('--save-steps', type=int, default=0, help='Save checkpoint every N steps (0=disabled)')
     parser.add_argument('--keep-checkpoints', type=int, default=0,
@@ -548,8 +548,9 @@ def main():
         train_scales=True,
         train_g_only=args.g_only,
         train_mlp_only=args.mlp_only,
-        freeze_mags=args.freeze_mags or args.freeze_mags_mlp_att,  # --freeze-mags-mlp-att is alias
+        freeze_mags=args.freeze_mags,
         freeze_mags_mlp=args.freeze_mags_mlp,
+        freeze_all=args.freeze_all,
         hard_top1_weight=args.hard_top1,
         hard_top1_end=args.hard_top1_end,
         hard_full_weight=tpu_hard_full,
