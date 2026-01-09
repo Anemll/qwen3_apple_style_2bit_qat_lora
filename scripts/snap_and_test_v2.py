@@ -74,12 +74,18 @@ def main():
                         help='Apply LoRA to MLP layers only')
     parser.add_argument('--merge-lora', action='store_true',
                         help='Merge LoRA into quantized weights (best for ANE, removes adapter ops)')
+    parser.add_argument('--no-test', action='store_true',
+                        help='Skip inference test (snap only)')
     args = parser.parse_args()
 
     # Try to auto-detect config from checkpoint directory
     ckpt_path = Path(args.checkpoint)
     config_path = ckpt_path.parent / 'config.json'
     auto_config = {}
+    # Defaults for LoRA config (may be overwritten by config.json)
+    config_lora_r = 0
+    config_lora_alpha = None
+    config_lora_mlp_only = False
     if config_path.exists():
         with open(config_path) as f:
             auto_config = json.load(f)
@@ -99,17 +105,11 @@ def main():
         if args.attn_scale_rank == 8 and 'attn_scale_rank' in auto_config:
             args.attn_scale_rank = auto_config['attn_scale_rank']
             print(f"  Using attn_scale_rank={args.attn_scale_rank} from config")
-        # LoRA config from file
-        if args.lora_r == 0 and 'lora_r' in auto_config and auto_config['lora_r'] > 0:
-            args.lora_r = auto_config['lora_r']
-            print(f"  Using lora_r={args.lora_r} from config")
-        if args.lora_alpha is None and 'lora_alpha' in auto_config:
-            args.lora_alpha = auto_config['lora_alpha']
-            print(f"  Using lora_alpha={args.lora_alpha} from config")
-        if not args.mlp_only and 'lora_mlp_only' in auto_config:
-            args.mlp_only = auto_config['lora_mlp_only']
-            if args.mlp_only:
-                print(f"  Using mlp_only={args.mlp_only} from config")
+        # LoRA config from file - DEFER until we check if checkpoint has LoRA keys
+        # (stored for later use after loading checkpoint)
+        config_lora_r = auto_config.get('lora_r', 0)
+        config_lora_alpha = auto_config.get('lora_alpha', None)
+        config_lora_mlp_only = auto_config.get('lora_mlp_only', False)
 
     # Set attn defaults to MLP values if not specified
     if args.attn_lut_bits is None:
@@ -184,9 +184,11 @@ def main():
 
     # Auto-detect LoRA config from checkpoint BEFORE enabling LoRA
     ckpt_lora_keys = [k for k in state_dict.keys() if 'lora_' in k]
-    if ckpt_lora_keys:
+    ckpt_has_lora = len(ckpt_lora_keys) > 0
+
+    if ckpt_has_lora:
         print(f"  Checkpoint has {len(ckpt_lora_keys)} LoRA keys")
-        # Auto-detect rank
+        # Auto-detect rank from checkpoint
         if args.lora_r == 0:
             for k in ckpt_lora_keys:
                 if 'lora_A' in k:
@@ -198,6 +200,15 @@ def main():
         if not has_attn_lora and not args.mlp_only:
             args.mlp_only = True
             print(f"  [Auto-detect] mlp_only=True (no attention LoRA)")
+        # Use config.json LoRA settings if checkpoint has LoRA
+        if args.lora_alpha is None and 'config_lora_alpha' in dir():
+            args.lora_alpha = config_lora_alpha
+    else:
+        # Checkpoint has NO LoRA keys
+        if 'config_lora_r' in dir() and config_lora_r > 0:
+            print(f"  [WARNING] config.json has lora_r={config_lora_r} but checkpoint has NO LoRA keys")
+            print(f"  [WARNING] Ignoring config.json LoRA settings (use --lora-r to force)")
+        # Don't auto-enable LoRA from config.json if checkpoint doesn't have it
 
     # Enable LoRA with detected/specified config
     lora_alpha = None  # Will be set if LoRA is enabled
@@ -393,37 +404,40 @@ def main():
             json.dump(config_data, f, indent=2)
         print(f"  Config saved to {config_path}")
 
-    # Test inference
-    print("\n=== Testing Inference ===\n")
-    model.eval()
+    # Test inference (skip with --no-test)
+    if args.no_test:
+        print("\n[Skipping inference test (--no-test)]")
+    else:
+        print("\n=== Testing Inference ===\n")
+        model.eval()
 
-    prompts = [
-        "What is the capital of France?",
-        "Explain quantum mechanics in one sentence.",
-        "What is 2+2?",
-        "What is the speed of light?",
-    ]
-
-    for prompt in prompts:
-        print(f"Prompt: {prompt}")
-
-        messages = [
-            {'role': 'system', 'content': 'You are a helpful assistant.'},
-            {'role': 'user', 'content': prompt}
+        prompts = [
+            "What is the capital of France?",
+            "Explain quantum mechanics in one sentence.",
+            "What is 2+2?",
+            "What is the speed of light?",
         ]
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = tokenizer(text, return_tensors='pt').to(device)
 
-        with torch.no_grad():
-            output = model.generate(
-                **inputs,
-                max_new_tokens=128,
-                do_sample=False,
-            )
+        for prompt in prompts:
+            print(f"Prompt: {prompt}")
 
-        response = tokenizer.decode(output[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
-        print(f"Response: {response}")
-        print("-" * 50)
+            messages = [
+                {'role': 'system', 'content': 'You are a helpful assistant.'},
+                {'role': 'user', 'content': prompt}
+            ]
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = tokenizer(text, return_tensors='pt').to(device)
+
+            with torch.no_grad():
+                output = model.generate(
+                    **inputs,
+                    max_new_tokens=128,
+                    do_sample=False,
+                )
+
+            response = tokenizer.decode(output[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+            print(f"Response: {response}")
+            print("-" * 50)
 
     print("\n=== Done ===")
 
