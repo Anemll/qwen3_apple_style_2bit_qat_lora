@@ -171,6 +171,8 @@ def main():
                        help="Freeze rank_magnitude (snap to FP16 values). Train only LoRA.")
     parser.add_argument("--freeze-mags-mlp", action="store_true",
                        help="Freeze rank_magnitude for MLP layers only")
+    parser.add_argument("--freeze-all", action="store_true",
+                       help="Snap + freeze ALL V2 params (scale_A, scale_B, rank_magnitude) for FP16 export. Only LoRA trains.")
 
     # Training mode
     parser.add_argument("--lora-mode", type=str, default="recover",
@@ -516,6 +518,7 @@ def main():
         debug=args.debug,
         freeze_mags=args.freeze_mags,
         freeze_mags_mlp=args.freeze_mags_mlp,
+        freeze_all=args.freeze_all,
     )
 
     # Save final checkpoint

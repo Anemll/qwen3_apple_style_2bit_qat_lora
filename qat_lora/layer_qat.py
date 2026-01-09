@@ -2203,6 +2203,7 @@ def train_recovery_lora(
     debug: bool = False,
     freeze_mags: bool = False,
     freeze_mags_mlp: bool = False,
+    freeze_all: bool = False,
 ) -> dict:
     """Train recovery LoRA adapters with multiple training modes.
 
@@ -2262,6 +2263,9 @@ def train_recovery_lora(
         wandb_project: Wandb project name
         wandb_run_name: Wandb run name
         verbose: Print progress
+        freeze_mags: Snap rank_magnitude to FP16 and freeze (all 196 layers)
+        freeze_mags_mlp: Snap rank_magnitude to FP16 and freeze (MLP only, 84 layers)
+        freeze_all: Snap scale_A, scale_B, and rank_magnitude to FP16 and freeze all
 
     Returns:
         Dictionary with training results
@@ -2296,14 +2300,26 @@ def train_recovery_lora(
         )
         freeze_for_recovery_training(model, verbose=verbose)
 
-    # Freeze mags if requested (snap to FP16 + freeze)
-    if freeze_mags or freeze_mags_mlp:
+    # Freeze mags/scales if requested (snap to FP16 + freeze)
+    if freeze_all or freeze_mags or freeze_mags_mlp:
         mags_frozen = 0
+        scales_frozen = 0
         mlp_patterns = ('gate_proj', 'up_proj', 'down_proj')
         for name, m in model.named_modules():
+            # Snap scale_A and scale_B when freeze_all
+            if freeze_all and hasattr(m, 'scale_A') and m.scale_A is not None:
+                # Move to CPU for snapping (XLA/TPU .half() doesn't work correctly)
+                with torch.no_grad():
+                    orig_device = m.scale_A.data.device
+                    m.scale_A.data = m.scale_A.data.cpu().half().float().to(orig_device)
+                    m.scale_B.data = m.scale_B.data.cpu().half().float().to(orig_device)
+                m.scale_A.requires_grad = False
+                m.scale_B.requires_grad = False
+                scales_frozen += 1
+            # Snap rank_magnitude
             if hasattr(m, 'rank_magnitude') and m.rank_magnitude is not None:
                 is_mlp = any(p in name for p in mlp_patterns)
-                if freeze_mags or (freeze_mags_mlp and is_mlp):
+                if freeze_all or freeze_mags or (freeze_mags_mlp and is_mlp):
                     # Move to CPU for snapping (XLA/TPU .half() doesn't work correctly)
                     with torch.no_grad():
                         orig_device = m.rank_magnitude.data.device
@@ -2312,7 +2328,10 @@ def train_recovery_lora(
                     m.rank_magnitude.requires_grad = False
                     mags_frozen += 1
         if verbose:
-            print(f"  Snapped & frozen {mags_frozen} rank_magnitude tensors")
+            if scales_frozen > 0:
+                print(f"  Snapped & frozen {scales_frozen} scale_A/scale_B pairs")
+            if mags_frozen > 0:
+                print(f"  Snapped & frozen {mags_frozen} rank_magnitude tensors")
 
     # Resume from checkpoint if specified
     if resume_from:
