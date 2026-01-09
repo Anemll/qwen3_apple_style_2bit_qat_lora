@@ -97,10 +97,20 @@ def analyze_layer(orig, snap, layer_prefix):
         status = ""
         if in_orig and in_snap:
             o, s = orig[key], snap[key]
-            diff = (o.float() - s.float()).abs()
+            # Compare original vs snapped (both as FP32 on CPU)
+            o_f32 = o.cpu().float()
+            s_f32 = s.cpu().float()
+            diff = (o_f32 - s_f32).abs()
             max_diff = diff.max().item()
             mean_diff = diff.mean().item()
+
+            # Also show what CPU FP16 snap of original would give
+            o_cpu_snap = o_f32.half().float()
+            cpu_snap_diff = (o_cpu_snap - s_f32).abs().max().item()
+
             status = f"max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}, dtype={o.dtype}->{s.dtype}"
+            if cpu_snap_diff > 0:
+                status += f" [CPU_SNAP_DIFF={cpu_snap_diff:.6f}]"
         elif in_orig:
             status = "ONLY IN ORIGINAL"
         elif in_snap:
@@ -136,15 +146,17 @@ def compute_w_eff_diff(orig, snap, layer_prefix):
             return None
 
     def compute_w_eff(state_dict, prefix):
-        Q = state_dict[f"{prefix}._Q"].float()
-        A = state_dict[f"{prefix}.scale_A"].float()
-        B = state_dict[f"{prefix}.scale_B"].float()
-        g = state_dict[f"{prefix}.rank_magnitude"].float()
+        # All values as FP32 on CPU
+        Q = state_dict[f"{prefix}._Q"].cpu().float()
+        A = state_dict[f"{prefix}.scale_A"].cpu().float()
+        B = state_dict[f"{prefix}.scale_B"].cpu().float()
+        g = state_dict[f"{prefix}.rank_magnitude"].cpu().float()
 
         # Compute full scales: (A * g) @ B
         scales = (A * g) @ B
         return Q * scales
 
+    # Compare both as FP32
     orig_w = compute_w_eff(orig, layer_prefix)
     snap_w = compute_w_eff(snap, layer_prefix)
 
@@ -169,7 +181,10 @@ def find_largest_diffs(orig, snap, common_keys, top_n=20):
     for key in common_keys:
         if orig[key].shape != snap[key].shape:
             continue
-        diff = (orig[key].float() - snap[key].float()).abs().max().item()
+        # Compare original FP32 vs snapped (as FP32)
+        o_f32 = orig[key].cpu().float()
+        s_f32 = snap[key].cpu().float()
+        diff = (o_f32 - s_f32).abs().max().item()
         diffs.append((key, diff))
 
     diffs.sort(key=lambda x: -x[1])
@@ -190,7 +205,10 @@ def analyze_attention_vs_mlp(orig, snap, common_keys):
     for key in common_keys:
         if orig[key].shape != snap[key].shape:
             continue
-        diff = (orig[key].float() - snap[key].float()).abs().max().item()
+        # Compare original FP32 vs snapped (as FP32)
+        o_f32 = orig[key].cpu().float()
+        s_f32 = snap[key].cpu().float()
+        diff = (o_f32 - s_f32).abs().max().item()
 
         if 'q_proj' in key or 'k_proj' in key or 'v_proj' in key or 'o_proj' in key:
             attn_diffs.append(diff)
