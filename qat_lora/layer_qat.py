@@ -1434,6 +1434,7 @@ def train_e2e(
                 if hasattr(module, 'scale_A') and module.scale_A is not None:
                     if freeze_all:
                         # Snap scales to FP16 and keep frozen
+                        # Move to CPU for snapping (XLA/TPU .half() doesn't work correctly)
                         with torch.no_grad():
                             orig_device = module.scale_A.data.device
                             module.scale_A.data = module.scale_A.data.cpu().half().float().to(orig_device)
