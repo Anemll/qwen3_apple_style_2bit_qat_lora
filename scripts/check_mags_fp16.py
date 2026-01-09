@@ -128,6 +128,27 @@ def main():
             layer_type = "MLP" if is_mlp else "Attn"
             print(f"{i+1:2d}. max={vmax:6.1f} | diff={max_diff:.6f} | {layer_type:4s} | {layer_name}")
 
+    # Always show top magnitude values (regardless of snapping)
+    all_mags = []
+    for key in mag_keys:
+        val = state_dict[key].float()
+        vmin, vmax = val.min().item(), val.max().item()
+        snapped = val.cpu().half().float()
+        max_diff = (val - snapped).abs().max().item()
+        all_mags.append((vmax, max_diff, key, vmin))
+
+    all_mags.sort(reverse=True, key=lambda x: x[0])  # Sort by max value
+
+    print(f"\n" + "=" * 60)
+    print(f"TOP {min(args.top, len(all_mags))} RANK_MAGNITUDE VALUES")
+    print("=" * 60)
+    for i, (vmax, max_diff, key, vmin) in enumerate(all_mags[:args.top]):
+        layer_name = key.replace('.rank_magnitude', '')
+        is_mlp = any(p in key for p in ['gate_proj', 'up_proj', 'down_proj'])
+        layer_type = "MLP" if is_mlp else "Attn"
+        snap_status = "✓" if max_diff == 0 else f"Δ{max_diff:.4f}"
+        print(f"{i+1:2d}. max={vmax:6.1f} | {snap_status:8s} | {layer_type:4s} | {layer_name}")
+
     # Sample values
     print(f"\n" + "=" * 60)
     print("SAMPLE VALUES")
