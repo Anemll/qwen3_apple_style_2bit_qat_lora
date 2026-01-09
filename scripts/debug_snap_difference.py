@@ -46,11 +46,36 @@ def compare_keys(orig, snap):
     print(f"\n_Q buffers in original: {len(orig_Q)}")
     print(f"_Q buffers in snapped:  {len(snap_Q)}")
 
-    # Check for _scales_baked_flag
-    orig_baked = [k for k in orig_keys if '_scales_baked' in k]
-    snap_baked = [k for k in snap_keys if '_scales_baked' in k]
-    print(f"_scales_baked_flag in original: {len(orig_baked)}")
-    print(f"_scales_baked_flag in snapped:  {len(snap_baked)}")
+    # Check for _scales_baked_flag - show both COUNT and VALUES
+    orig_baked_keys = [k for k in orig_keys if '_scales_baked' in k]
+    snap_baked_keys = [k for k in snap_keys if '_scales_baked' in k]
+
+    # Count how many buffers have value=1 (actually baked) vs value=0 (not baked)
+    def count_baked_values(state_dict, keys):
+        baked_true = 0
+        baked_false = 0
+        for k in keys:
+            val = state_dict[k].item() if state_dict[k].numel() == 1 else state_dict[k][0].item()
+            if val == 1:
+                baked_true += 1
+            else:
+                baked_false += 1
+        return baked_true, baked_false
+
+    print(f"\n_scales_baked_flag buffers:")
+    print(f"  Original: {len(orig_baked_keys)} buffers exist", end="")
+    if orig_baked_keys:
+        orig_true, orig_false = count_baked_values(orig, orig_baked_keys)
+        print(f" → {orig_true} baked (value=1), {orig_false} not baked (value=0)")
+    else:
+        print(" (none)")
+
+    print(f"  Snapped:  {len(snap_baked_keys)} buffers exist", end="")
+    if snap_baked_keys:
+        snap_true, snap_false = count_baked_values(snap, snap_baked_keys)
+        print(f" → {snap_true} baked (value=1), {snap_false} not baked (value=0)")
+    else:
+        print(" (none)")
 
     return common
 

@@ -1284,6 +1284,11 @@ def train_e2e(
     accumulation_steps: int = 1,
     keep_checkpoints: int = 0,
     clip_grad_norm: float = 1.0,
+    # Anchor KL regularization
+    anchor_ckpt: str = None,
+    anchor_kl_weight: float = 0.0,
+    anchor_samples: int = 16,
+    anchor_interval: int = 1,
 ) -> dict:
     """End-to-end KD-QAT training (all layers unfrozen).
 
@@ -1329,6 +1334,10 @@ def train_e2e(
                            Effective batch = batch_size * accumulation_steps
         keep_checkpoints: Keep only the last N checkpoints (0=keep all). Useful for long runs.
         clip_grad_norm: Max gradient norm for clipping (default 1.0, 0=disable). Improves stability.
+        anchor_ckpt: Checkpoint to use as anchor teacher (prevents drift from reference behavior)
+        anchor_kl_weight: Weight of anchor KL term (default 0.0 = disabled)
+        anchor_samples: Number of fixed anchor samples to cache logits for (default 16)
+        anchor_interval: Compute anchor KL every N steps (default 1 = every step)
 
     Returns:
         Dict with 'initial_loss', 'final_loss', 'best_loss', 'steps', 'time_sec'
@@ -1589,6 +1598,92 @@ def train_e2e(
         if verbose:
             print(f"CSV log: {csv_path}")
 
+    # Load anchor model and compute anchor logits if enabled
+    anchor_model = None
+    anchor_logits = None
+    anchor_input_ids = None
+    if anchor_ckpt and anchor_kl_weight > 0 and anchor_samples > 0:
+        if verbose:
+            print(f"\n[Anchor KL] Loading anchor checkpoint: {anchor_ckpt}")
+            print(f"  weight={anchor_kl_weight}, samples={anchor_samples}, interval={anchor_interval}")
+
+        # Build anchor model with same architecture as training model
+        from transformers import AutoModelForCausalLM
+        from .ane_qat_linear_v2 import replace_linear_with_anemll_v2, AnemllQuantConfigV2
+
+        # Get model config from training model
+        model_config = model.config
+        model_id = getattr(model_config, '_name_or_path', 'Qwen/Qwen3-0.6B')
+
+        # Create a fresh model for anchor (in FP32 for precision)
+        anchor_model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.float32,
+            trust_remote_code=True,
+        )
+
+        # Detect V2 config from training model
+        v2_config = None
+        for name, m in model.named_modules():
+            if hasattr(m, 'lut_size') and hasattr(m, 'scale_rank'):
+                # Found a V2 layer, get config
+                from .ane_qat_linear_v2 import AnemllQuantConfigV2
+                is_mlp = any(p in name for p in ['gate_proj', 'up_proj', 'down_proj'])
+                if is_mlp:
+                    v2_config = AnemllQuantConfigV2(
+                        lut_size=m.lut_size,
+                        scale_rank=m.scale_rank,
+                        use_ste_fp16=getattr(m, 'use_ste_fp16', True),
+                    )
+                break
+
+        if v2_config is None:
+            # Fallback to default config
+            v2_config = AnemllQuantConfigV2(lut_size=16, scale_rank=32, use_ste_fp16=True)
+
+        # Replace with V2 layers
+        replace_linear_with_anemll_v2(anchor_model, v2_config)
+
+        # Load anchor checkpoint
+        anchor_state = torch.load(anchor_ckpt, map_location='cpu')
+        if isinstance(anchor_state, dict) and 'model_state_dict' in anchor_state:
+            anchor_state = anchor_state['model_state_dict']
+        anchor_model.load_state_dict(anchor_state, strict=False)
+
+        # Freeze and move to device
+        anchor_model.to(device)
+        anchor_model.eval()
+        for p in anchor_model.parameters():
+            p.requires_grad = False
+
+        # Get anchor samples from KD cache
+        anchor_batches = []
+        temp_dataset = KDCacheDataset(cache_dir, shuffle=False, preload=True)
+        temp_iter = iter(DataLoader(temp_dataset, batch_size=1, shuffle=False))
+        while len(anchor_batches) < anchor_samples:
+            try:
+                batch = next(temp_iter)
+                anchor_batches.append(batch['input_ids'].squeeze(0))
+            except StopIteration:
+                temp_iter = iter(DataLoader(temp_dataset, batch_size=1, shuffle=False))
+        anchor_input_ids = torch.stack(anchor_batches[:anchor_samples], dim=0).to(device)
+
+        # Compute anchor logits
+        if verbose:
+            print(f"  Computing anchor logits: {anchor_input_ids.shape}...", end=" ", flush=True)
+        with torch.no_grad():
+            anchor_logits = anchor_model(anchor_input_ids).logits.detach()
+        if verbose:
+            print(f"done: {anchor_logits.shape}")
+
+        # Free anchor model memory (we only need the cached logits)
+        del anchor_model
+        anchor_model = None
+        import gc
+        gc.collect()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+
     # Training loop
     model.train()
     step = 0
@@ -1788,6 +1883,28 @@ def train_e2e(
                     hard_top1_weight=current_hard_top1,
                     hard_full_weight=hard_full_weight,
                 )
+
+            # Optional anchor KL regularizer (prevents drift from reference checkpoint)
+            if anchor_kl_weight > 0 and anchor_logits is not None and anchor_input_ids is not None:
+                # Only compute anchor KL every anchor_interval steps
+                if (optimizer_step + 1) % anchor_interval == 0 or optimizer_step == 0:
+                    # Use pre-computed anchor samples for KL (cycle through them)
+                    anchor_idx = optimizer_step % anchor_samples
+                    anchor_input = anchor_input_ids[anchor_idx:anchor_idx+1]  # Already on device
+
+                    # Forward through current model
+                    if use_fp16:
+                        with torch.amp.autocast(device_type=autocast_device, dtype=torch.float16):
+                            current_logits = model(anchor_input).logits
+                    elif use_mixed_precision:
+                        with torch.amp.autocast(device_type=autocast_device, dtype=torch.bfloat16):
+                            current_logits = model(anchor_input).logits
+                    else:
+                        current_logits = model(anchor_input).logits
+
+                    # Soft cross-entropy (avoids aten::kl_div for TPU/XLA compatibility)
+                    anchor_loss = kd_soft_ce(current_logits, anchor_logits[anchor_idx:anchor_idx+1], temperature=1.0)
+                    loss = loss + anchor_kl_weight * anchor_loss
 
             # Scale loss for gradient accumulation
             if accumulation_steps > 1:

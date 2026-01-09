@@ -127,9 +127,20 @@ def main():
     parser.add_argument('--group-size', type=int, default=32, help='Group size for scale init (default: 32)')
     parser.add_argument('--fast-init', action='store_true',
                         help='Skip SVD-based scale initialization (faster, worse initial loss)')
+    # Anchor KL regularization (prevents drift from reference checkpoint)
+    parser.add_argument('--anchor-ckpt', type=str, default=None,
+                        help='Checkpoint to use as anchor teacher (prevents drift from this behavior)')
+    parser.add_argument('--anchor-kl-weight', type=float, default=0.01,
+                        help='Weight of anchor KL term (default: 0.01, 0=disabled)')
+    parser.add_argument('--anchor-samples', type=int, default=16,
+                        help='Number of fixed anchor samples to cache logits for (default: 16)')
+    parser.add_argument('--anchor-interval', type=int, default=1,
+                        help='Compute anchor KL every N steps (default: 1=every step, 10=less overhead)')
     args = parser.parse_args()
 
     # Validate inputs - need v1, v2 checkpoint, or from-scratch
+    if args.anchor_ckpt:
+        assert os.path.exists(args.anchor_ckpt), f"Anchor checkpoint not found: {args.anchor_ckpt}"
     if args.v2_checkpoint:
         assert os.path.exists(args.v2_checkpoint), f"V2 checkpoint not found: {args.v2_checkpoint}"
     elif args.v1_checkpoint:
@@ -516,6 +527,10 @@ def main():
         'weight_decay': args.weight_decay,
         'dropout': args.dropout,
         'accumulation_steps': args.accumulation_steps,
+        'anchor_ckpt': args.anchor_ckpt,
+        'anchor_kl_weight': args.anchor_kl_weight if args.anchor_ckpt else 0.0,
+        'anchor_samples': args.anchor_samples,
+        'anchor_interval': args.anchor_interval,
     }
 
     # TPU-specific parameters
@@ -572,6 +587,11 @@ def main():
         min_lr_ratio=args.min_lr_ratio,
         keep_checkpoints=args.keep_checkpoints,
         clip_grad_norm=args.clip_grad_norm,
+        # Anchor KL regularization
+        anchor_ckpt=args.anchor_ckpt,
+        anchor_kl_weight=args.anchor_kl_weight if args.anchor_ckpt else 0.0,
+        anchor_samples=args.anchor_samples,
+        anchor_interval=args.anchor_interval,
     )
 
     print(f"\n  Final loss: {result.get('final_loss', 'N/A')}")
