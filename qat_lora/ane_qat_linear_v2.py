@@ -1020,6 +1020,9 @@ class AnemllQATLinearV2(nn.Module):
         3. Compute scales in FP16
         4. Store Q = lut[indices] in FP16
 
+        IMPORTANT: All FP16 conversions use CPU for consistent rounding.
+        MPS/TPU/XLA may have different FP16 rounding behavior than CPU.
+
         Args:
             recompute_indices: If True, recompute indices in FP16 precision.
                               If False, keep existing indices but convert Q to FP16.
@@ -1027,9 +1030,14 @@ class AnemllQATLinearV2(nn.Module):
         device = self.weight.device
         fp16 = torch.float16
 
+        # Helper: CPU-based FP16 snap for consistent rounding across devices
+        def cpu_fp16(t: torch.Tensor) -> torch.Tensor:
+            """Snap tensor to FP16 via CPU (MPS/TPU have different rounding)."""
+            return t.cpu().half().to(device)
+
         # 1. Use existing LUT, just convert to FP16 (don't recreate!)
         if hasattr(self, 'lut') and self.lut is not None:
-            lut_fp16 = self.lut.to(fp16)
+            lut_fp16 = cpu_fp16(self.lut)
         else:
             # Fallback: create new LUT (shouldn't happen in trained model)
             lut_fp16 = make_lut(
@@ -1040,18 +1048,18 @@ class AnemllQATLinearV2(nn.Module):
             )
 
         if recompute_indices:
-            # 2. Compute scales in FP16
+            # 2. Compute scales in FP16 (on CPU for consistent rounding)
             A_dir, B_dir, g = self._get_normalized_scales()
-            A_dir = A_dir.to(fp16)
-            B_dir = B_dir.to(fp16)
-            g = g.to(fp16)
+            A_dir = cpu_fp16(A_dir)
+            B_dir = cpu_fp16(B_dir)
+            g = cpu_fp16(g)
 
             # Compute full scales in FP16 (no clamping for V2)
             A_scaled = A_dir * g
             scales_fp16 = (A_scaled @ B_dir)
 
             # 3. Recompute indices in FP16
-            weight_fp16 = self.weight.to(fp16)
+            weight_fp16 = cpu_fp16(self.weight)
             normalized = weight_fp16 / scales_fp16
 
             indices_fp16 = quantize_to_lut_indices(
@@ -1064,9 +1072,9 @@ class AnemllQATLinearV2(nn.Module):
             self._indices = indices_fp16
 
             # Bake scales into scale_A, scale_B
-            self.scale_A.data = A_scaled.to(fp16)
-            self.scale_B.data = B_dir.to(fp16)
-            self.rank_magnitude.data = torch.ones_like(g).to(fp16)
+            self.scale_A.data = A_scaled
+            self.scale_B.data = B_dir
+            self.rank_magnitude.data = torch.ones_like(g)
 
             # Mark scales as baked (skip normalization in forward)
             self._scales_baked = True
@@ -1076,19 +1084,19 @@ class AnemllQATLinearV2(nn.Module):
         else:
             # No recompute - just convert existing _Q to FP16
             if self._Q is not None:
-                self._Q = self._Q.to(fp16)
+                self._Q = cpu_fp16(self._Q)
             elif self._indices is not None:
                 # Have indices but no _Q - compute from indices
                 self._Q = lut_fp16[self._indices]
             else:
                 # Neither _Q nor _indices - need to compute (fallback)
                 self.freeze_Q()
-                self._Q = self._Q.to(fp16)
+                self._Q = cpu_fp16(self._Q)
 
-            # Convert scales to FP16 (don't bake)
-            self.scale_A.data = self.scale_A.data.to(fp16)
-            self.scale_B.data = self.scale_B.data.to(fp16)
-            self.rank_magnitude.data = self.rank_magnitude.data.to(fp16)
+            # Convert scales to FP16 via CPU (don't bake)
+            self.scale_A.data = cpu_fp16(self.scale_A.data)
+            self.scale_B.data = cpu_fp16(self.scale_B.data)
+            self.rank_magnitude.data = cpu_fp16(self.rank_magnitude.data)
 
         # Update LUT buffer
         if hasattr(self, 'lut') and isinstance(self.lut, torch.Tensor):
@@ -1097,17 +1105,17 @@ class AnemllQATLinearV2(nn.Module):
             else:
                 self.lut = lut_fp16
 
-        # Convert weight and bias to FP16
-        self.weight.data = self.weight.data.to(fp16)
+        # Convert weight and bias to FP16 via CPU
+        self.weight.data = cpu_fp16(self.weight.data)
         if self.bias is not None:
-            self.bias.data = self.bias.data.to(fp16)
+            self.bias.data = cpu_fp16(self.bias.data)
 
         # Convert LoRA adapters to FP16 (if present)
         # Note: For ANE deployment, consider using resnap_with_lora() first
         # to merge LoRA into weights and avoid extra matmuls at inference.
         if self.lora_r > 0 and self.lora_A is not None:
-            self.lora_A.data = self.lora_A.data.to(fp16)
-            self.lora_B.data = self.lora_B.data.to(fp16)
+            self.lora_A.data = cpu_fp16(self.lora_A.data)
+            self.lora_B.data = cpu_fp16(self.lora_B.data)
 
         # Clear cached weight (force factored forward)
         self._cached_weight_q = None
@@ -1118,19 +1126,27 @@ class AnemllQATLinearV2(nn.Module):
 
         Use this BEFORE freeze_Q() to ensure indices are computed in FP16.
         This ensures no precision mismatch between training and ANE inference.
+
+        IMPORTANT: All FP16 conversions use CPU for consistent rounding.
+        MPS/TPU/XLA may have different FP16 rounding behavior than CPU.
         """
         fp16 = torch.float16
         device = self.weight.device
 
-        # Convert weight and bias
-        self.weight.data = self.weight.data.to(fp16)
-        if self.bias is not None:
-            self.bias.data = self.bias.data.to(fp16)
+        # Helper: CPU-based FP16 snap for consistent rounding across devices
+        def cpu_fp16(t: torch.Tensor) -> torch.Tensor:
+            """Snap tensor to FP16 via CPU (MPS/TPU have different rounding)."""
+            return t.cpu().half().to(device)
 
-        # Convert scales
-        self.scale_A.data = self.scale_A.data.to(fp16)
-        self.scale_B.data = self.scale_B.data.to(fp16)
-        self.rank_magnitude.data = self.rank_magnitude.data.to(fp16)
+        # Convert weight and bias via CPU
+        self.weight.data = cpu_fp16(self.weight.data)
+        if self.bias is not None:
+            self.bias.data = cpu_fp16(self.bias.data)
+
+        # Convert scales via CPU
+        self.scale_A.data = cpu_fp16(self.scale_A.data)
+        self.scale_B.data = cpu_fp16(self.scale_B.data)
+        self.rank_magnitude.data = cpu_fp16(self.rank_magnitude.data)
 
         # Recompute LUT in FP16
         lut_fp16 = make_lut(
@@ -1150,10 +1166,10 @@ class AnemllQATLinearV2(nn.Module):
         if self._Q is not None:
             self._Q = self.lut[self._indices]
 
-        # Convert LoRA adapters to FP16 (if present)
+        # Convert LoRA adapters to FP16 via CPU (if present)
         if self.lora_r > 0 and self.lora_A is not None:
-            self.lora_A.data = self.lora_A.data.to(fp16)
-            self.lora_B.data = self.lora_B.data.to(fp16)
+            self.lora_A.data = cpu_fp16(self.lora_A.data)
+            self.lora_B.data = cpu_fp16(self.lora_B.data)
 
         # Clear cached weight
         self._cached_weight_q = None
