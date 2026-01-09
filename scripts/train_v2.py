@@ -456,8 +456,18 @@ def main():
     torch.save(v2_model.state_dict(), fp32_path)
     print(f"  FP32 model: {fp32_path}")
 
-    # Convert to FP16 and save
+    # Convert to FP16 and save (preserve embed_tokens and lm_head in full precision)
+    # FP16 rounding corrupts embeddings - 0.02 max error is huge for vocab
+    embed_weight = v2_model.model.embed_tokens.weight.data.clone()
+    lm_head_weight = v2_model.lm_head.weight.data.clone() if hasattr(v2_model, 'lm_head') else None
+
     v2_model.half()
+
+    # Restore non-quantized modules to full precision
+    v2_model.model.embed_tokens.weight.data = embed_weight
+    if lm_head_weight is not None:
+        v2_model.lm_head.weight.data = lm_head_weight
+
     fp16_path = f"{args.output_dir}/v2_model_fp16_{timestamp}.pt"
     torch.save(v2_model.state_dict(), fp16_path)
     print(f"  FP16 model: {fp16_path}")

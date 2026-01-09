@@ -1464,8 +1464,17 @@ def snap_model_for_ane_v2(
 ) -> int:
     """Snap all V2 layers for ANE export in FP16 precision.
 
-    This converts the model to FP16 and recomputes quantization indices
-    to match ANE's FP16 precision, avoiding BF16/FP16 mismatch issues.
+    This converts V2 quantized layers to FP16 and optionally recomputes
+    quantization indices to match ANE's FP16 precision.
+
+    IMPORTANT: This function ONLY touches AnemllQATLinearV2 layers.
+    It does NOT modify:
+    - embed_tokens (embedding lookup table - semantic precision matters)
+    - lm_head (output projection - not quantized)
+    - LayerNorm/RMSNorm (normalization layers)
+
+    Keeping embed_tokens in full precision is critical because FP16 rounding
+    causes ~0.02 max error which corrupts vocabulary embeddings.
 
     If LoRA adapters are present, they will be converted to FP16.
     For best ANE performance, consider calling resnap_with_lora() first
@@ -1477,7 +1486,7 @@ def snap_model_for_ane_v2(
         verbose: Print diagnostic information
 
     Returns:
-        Number of layers snapped
+        Number of V2 layers snapped
     """
     count = 0
     lora_count = 0
@@ -1495,7 +1504,8 @@ def snap_model_for_ane_v2(
         print(f"\n[ANE FP16 Snap]")
         print(f"  Snapped {count} V2 layers to FP16")
         print(f"  Recomputed indices: {recompute_indices}")
-        print(f"  All weights, scales, LUT, Q now in FP16")
+        print(f"  V2 weights, scales, LUT, Q now in FP16")
+        print(f"  embed_tokens, lm_head, norms: UNCHANGED (full precision)")
         if lora_count > 0:
             print(f"\n  [LoRA] {lora_count} layers have LoRA adapters (converted to FP16)")
             print(f"  [LoRA] For best ANE perf, consider: resnap_with_lora(model) first")

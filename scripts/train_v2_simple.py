@@ -136,6 +136,23 @@ def main():
                         help='Number of fixed anchor samples to cache logits for (default: 16)')
     parser.add_argument('--anchor-interval', type=int, default=1,
                         help='Compute anchor KL every N steps (default: 1=every step, 10=less overhead)')
+    # Auto snap+freeze rank_magnitude (CPU audit at save checkpoints)
+    parser.add_argument('--auto-snap-mags', action='store_true',
+                        help='Enable auto snap+freeze of rank_magnitude when stable (CPU audit at saves)')
+    parser.add_argument('--auto-snap-target', type=str, default='mlp', choices=['mlp', 'all'],
+                        help='Target layers for auto-snap: mlp (84 layers) or all (196 layers)')
+    parser.add_argument('--auto-snap-threshold', type=float, default=0.05,
+                        help='Max abs delta between saves to consider stable (default: 0.05)')
+    parser.add_argument('--auto-snap-patience', type=int, default=2,
+                        help='Consecutive stable saves required before triggering snap+freeze (default: 2)')
+    parser.add_argument('--auto-snap-start-step', type=int, default=100,
+                        help='Don\'t audit before this step (default: 100)')
+    parser.add_argument('--auto-snap-min-saves', type=int, default=2,
+                        help='Minimum save checkpoints before eligible (default: 2)')
+    parser.add_argument('--auto-snap-dry-run', action='store_true',
+                        help='Audit and log but don\'t actually freeze (for testing)')
+    parser.add_argument('--auto-snap-log-json', action='store_true',
+                        help='Write audit JSON files at each save checkpoint')
     args = parser.parse_args()
 
     # Validate inputs - need v1, v2 checkpoint, or from-scratch
@@ -150,6 +167,20 @@ def main():
     else:
         raise ValueError("Must specify --v1-checkpoint, --v2-checkpoint, or --from-scratch")
     assert os.path.exists(args.cache_dir), f"Cache dir not found: {args.cache_dir}"
+
+    # Validate auto-snap config (done early before imports to fail fast)
+    if args.auto_snap_mags:
+        # Check conflicts manually before AutoSnapState import
+        if args.freeze_mags:
+            raise ValueError("--auto-snap-mags conflicts with --freeze-mags")
+        if args.freeze_mags_mlp:
+            raise ValueError("--auto-snap-mags conflicts with --freeze-mags-mlp")
+        if args.freeze_all:
+            raise ValueError("--auto-snap-mags conflicts with --freeze-all")
+        if args.g_only:
+            raise ValueError("--auto-snap-mags conflicts with --g-only (auto-snap targets mags)")
+        if args.save_steps <= 0:
+            raise ValueError("--auto-snap-mags requires --save-steps > 0 (audit happens at saves)")
 
     # Device detection (TPU > CUDA > CPU)
     device, device_type = get_device()
@@ -237,6 +268,7 @@ def main():
     )
     from qat_lora.ane_qat_linear import AnemllQATLinear
     from qat_lora.ane_qat_linear_v2 import AnemllQATLinearV2
+    from qat_lora.auto_snap_mags import AutoSnapState, validate_auto_snap_config
 
     # =========================================================================
     # Load model (V2 checkpoint OR V1->V2 conversion)
@@ -531,7 +563,33 @@ def main():
         'anchor_kl_weight': args.anchor_kl_weight if args.anchor_ckpt else 0.0,
         'anchor_samples': args.anchor_samples,
         'anchor_interval': args.anchor_interval,
+        # Auto-snap config
+        'auto_snap_mags': args.auto_snap_mags,
+        'auto_snap_target': args.auto_snap_target if args.auto_snap_mags else None,
+        'auto_snap_threshold': args.auto_snap_threshold if args.auto_snap_mags else None,
+        'auto_snap_patience': args.auto_snap_patience if args.auto_snap_mags else None,
     }
+
+    # Create AutoSnapState if enabled
+    auto_snap_state = None
+    if args.auto_snap_mags:
+        auto_snap_state = AutoSnapState(
+            enabled=True,
+            target=args.auto_snap_target,
+            threshold=args.auto_snap_threshold,
+            patience=args.auto_snap_patience,
+            start_step=args.auto_snap_start_step,
+            min_saves=args.auto_snap_min_saves,
+            dry_run=args.auto_snap_dry_run,
+            log_json=args.auto_snap_log_json,
+        )
+        print(f"\n[AutoSnap] Enabled:")
+        print(f"  Target: {args.auto_snap_target} ({'84' if args.auto_snap_target == 'mlp' else '196'} layers)")
+        print(f"  Threshold: {args.auto_snap_threshold} (max abs delta)")
+        print(f"  Patience: {args.auto_snap_patience} consecutive stable saves")
+        print(f"  Start step: {args.auto_snap_start_step}")
+        if args.auto_snap_dry_run:
+            print(f"  DRY RUN MODE (audit only, no freeze)")
 
     # TPU-specific parameters
     if is_tpu:
@@ -592,6 +650,8 @@ def main():
         anchor_kl_weight=args.anchor_kl_weight if args.anchor_ckpt else 0.0,
         anchor_samples=args.anchor_samples,
         anchor_interval=args.anchor_interval,
+        # Auto snap+freeze
+        auto_snap_state=auto_snap_state,
     )
 
     print(f"\n  Final loss: {result.get('final_loss', 'N/A')}")
@@ -608,7 +668,18 @@ def main():
 
     # Always save FP16 for ANE export (convert if needed)
     if args.dtype != 'fp16':
+        # Preserve embed_tokens and lm_head in original precision
+        # (FP16 rounding corrupts embeddings - 0.02 max error is huge for vocab)
+        embed_weight = v2_model.model.embed_tokens.weight.data.clone()
+        lm_head_weight = v2_model.lm_head.weight.data.clone() if hasattr(v2_model, 'lm_head') else None
+
         v2_model.half()
+
+        # Restore non-quantized modules to full precision
+        v2_model.model.embed_tokens.weight.data = embed_weight
+        if lm_head_weight is not None:
+            v2_model.lm_head.weight.data = lm_head_weight
+
     fp16_path = f"{args.output_dir}/v2_{args.config}_fp16_{timestamp}.pt"
     torch.save(v2_model.state_dict(), fp16_path)
     print(f"  FP16: {fp16_path}")
