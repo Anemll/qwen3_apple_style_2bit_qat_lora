@@ -1441,8 +1441,11 @@ def train_e2e(
 
                     if should_freeze_mag:
                         # Snap to FP16-representable values (keep as FP32 for training stability)
+                        # Move to CPU for snapping (XLA/TPU .half() doesn't work correctly)
                         with torch.no_grad():
-                            module.rank_magnitude.data = module.rank_magnitude.data.half().float()
+                            orig_device = module.rank_magnitude.data.device
+                            snapped = module.rank_magnitude.data.cpu().half().float()
+                            module.rank_magnitude.data = snapped.to(orig_device)
                         mags_snapped += 1
                         # Keep frozen (requires_grad already False)
                     else:
@@ -2284,8 +2287,11 @@ def train_recovery_lora(
             if hasattr(m, 'rank_magnitude') and m.rank_magnitude is not None:
                 is_mlp = any(p in name for p in mlp_patterns)
                 if freeze_mags or (freeze_mags_mlp and is_mlp):
+                    # Move to CPU for snapping (XLA/TPU .half() doesn't work correctly)
                     with torch.no_grad():
-                        m.rank_magnitude.data = m.rank_magnitude.data.half().float()
+                        orig_device = m.rank_magnitude.data.device
+                        snapped = m.rank_magnitude.data.cpu().half().float()
+                        m.rank_magnitude.data = snapped.to(orig_device)
                     m.rank_magnitude.requires_grad = False
                     mags_frozen += 1
         if verbose:
