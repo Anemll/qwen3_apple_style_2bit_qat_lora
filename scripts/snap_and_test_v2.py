@@ -133,12 +133,13 @@ def main():
     print(f"Device: {device}")
     print()
 
-    # Load base model
+    # Load base model in FP32 to preserve checkpoint precision during load_state_dict
+    # (BF16 would round 153.75 → 154.0, corrupting the checkpoint values)
+    # The snap_for_ane() will convert to FP16 later with correct CPU-based rounding
     print("Loading base model...")
-    dtype = torch.bfloat16 if device.type != 'cpu' else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
-        torch_dtype=dtype,
+        torch_dtype=torch.float32,  # FP32 to preserve precision during checkpoint load
         trust_remote_code=True,
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
