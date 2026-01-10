@@ -49,6 +49,36 @@ def is_tpu_device(device) -> bool:
     return 'xla' in str(device).lower()
 
 
+def _maybe_disable_kv_cache(model, enabled: bool, verbose: bool = True):
+    """
+    Disable HuggingFace KV cache on the model.
+
+    This prevents TPU HBM OOM at long seq_len (L>=1024) by avoiding
+    the 192-256MB KV buffer allocations per batch.
+
+    Args:
+        model: HuggingFace model
+        enabled: If True, disable KV cache; if False, do nothing
+        verbose: Print status message
+    """
+    if not enabled:
+        return
+
+    disabled = False
+
+    # Main config
+    if hasattr(model, "config") and hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+        disabled = True
+
+    # Some HF models also consult generation_config
+    if hasattr(model, "generation_config") and hasattr(model.generation_config, "use_cache"):
+        model.generation_config.use_cache = False
+
+    if verbose and disabled:
+        print("[KV CACHE] Disabled: model.config.use_cache=False")
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -117,6 +147,9 @@ def main():
                         help='Force TPU mode (auto-detected if available)')
     parser.add_argument('--xla-cache-dir', type=str, default=None,
                         help='XLA compilation cache directory (speeds up TPU restarts)')
+    parser.add_argument('--disable-kv-cache', action='store_true',
+                        help='Force HF KV cache off during training: sets model.config.use_cache=False. '
+                             'Recommended for TPU and/or long seq_len (L>=1024) to avoid HBM OOM.')
     # Quantization config
     parser.add_argument('--config', type=str, default='q2a4',
                         choices=['q2a4', 'q4a4', 'q4a4_r32', 'q4_r32', 'q2a2'],
@@ -525,6 +558,11 @@ def main():
         initial_path = f"{args.output_dir}/v2_initial.pt"
         torch.save(v2_model.state_dict(), initial_path)
         print(f"  Saved initial V2 to {initial_path}")
+
+    # =========================================================================
+    # KV CACHE (disable for TPU / long seq_len to avoid HBM OOM)
+    # =========================================================================
+    _maybe_disable_kv_cache(v2_model, args.disable_kv_cache)
 
     # =========================================================================
     # GRADIENT CHECKPOINTING (optional memory optimization)

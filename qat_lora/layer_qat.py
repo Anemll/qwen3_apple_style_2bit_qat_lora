@@ -1739,7 +1739,7 @@ def train_e2e(
         if verbose:
             print(f"  Computing anchor logits: {anchor_input_ids.shape}...", end=" ", flush=True)
         with torch.no_grad():
-            anchor_logits = anchor_model(anchor_input_ids).logits.detach()
+            anchor_logits = anchor_model(anchor_input_ids, use_cache=False).logits.detach()
         if verbose:
             print(f"done: {anchor_logits.shape}")
 
@@ -1962,12 +1962,12 @@ def train_e2e(
                     # Forward through current model
                     if use_fp16:
                         with torch.amp.autocast(device_type=autocast_device, dtype=torch.float16):
-                            current_logits = model(anchor_input).logits
+                            current_logits = model(anchor_input, use_cache=False).logits
                     elif use_mixed_precision:
                         with torch.amp.autocast(device_type=autocast_device, dtype=torch.bfloat16):
-                            current_logits = model(anchor_input).logits
+                            current_logits = model(anchor_input, use_cache=False).logits
                     else:
-                        current_logits = model(anchor_input).logits
+                        current_logits = model(anchor_input, use_cache=False).logits
 
                     # Soft cross-entropy (avoids aten::kl_div for TPU/XLA compatibility)
                     anchor_loss = kd_soft_ce(current_logits, anchor_logits[anchor_idx:anchor_idx+1], temperature=1.0)
@@ -3153,7 +3153,7 @@ def train_recovery_lora(
             if verbose:
                 print(f"  Anchor batch shape: {anchor_batch.shape}, running forward...", flush=True)
             with torch.no_grad():
-                anchor_logits = model(anchor_batch).logits.detach()
+                anchor_logits = model(anchor_batch, use_cache=False).logits.detach()
             # TPU: mark_step after anchor forward to compile/execute
             if is_xla_device(device):
                 xla_mark_step()
@@ -3263,7 +3263,7 @@ def train_recovery_lora(
         # Eval mode
         model.eval()
         with torch.no_grad():
-            eval_out = model(test_batch)
+            eval_out = model(test_batch, use_cache=False)
             eval_logits = eval_out.logits
             eval_loss = F.cross_entropy(
                 eval_logits[:, :-1, :].reshape(-1, eval_logits.size(-1)),
@@ -3275,7 +3275,7 @@ def train_recovery_lora(
         # Train mode
         model.train()
         with torch.no_grad():
-            train_out = model(test_batch)
+            train_out = model(test_batch, use_cache=False)
             train_logits = train_out.logits
             train_loss = F.cross_entropy(
                 train_logits[:, :-1, :].reshape(-1, train_logits.size(-1)),
@@ -3406,7 +3406,7 @@ def train_recovery_lora(
                     print(f"    KD cache mode: loss={loss.item():.4f}, hard_top1={current_hard_top1:.4f}")
             else:
                 # Non-KD-cache modes: need forward pass
-                outputs = model(input_batch)
+                outputs = model(input_batch, use_cache=False)
                 logits = outputs.logits  # [B, seq_len, vocab]
 
                 # Debug: show batch info on first step
@@ -3426,7 +3426,7 @@ def train_recovery_lora(
                 if lora_mode == "kd" and teacher is not None:
                     # Knowledge distillation: combine CE + soft CE from teacher
                     with torch.no_grad():
-                        teacher_outputs = teacher(input_batch)
+                        teacher_outputs = teacher(input_batch, use_cache=False)
                         teacher_logits = teacher_outputs.logits[:, :-1, :].contiguous()
 
                     # Soft cross-entropy (TPU/XLA safe, avoids aten::kl_div)
@@ -3466,7 +3466,7 @@ def train_recovery_lora(
             # Use pre-computed anchor samples for KL
             anchor_idx = (step - 1) % anchor_samples
             anchor_input = anchor_input_ids[anchor_idx:anchor_idx+1].to(device)
-            current_logits = model(anchor_input)
+            current_logits = model(anchor_input, use_cache=False)
             if hasattr(current_logits, 'logits'):
                 current_logits = current_logits.logits
             # Soft cross-entropy (avoids aten::kl_div for TPU compatibility)
