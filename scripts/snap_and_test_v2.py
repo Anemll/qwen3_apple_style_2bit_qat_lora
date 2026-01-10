@@ -79,29 +79,37 @@ def main():
     args = parser.parse_args()
 
     # Try to auto-detect config from checkpoint directory
+    # Check config.json first, then v2_config.json
     ckpt_path = Path(args.checkpoint)
-    config_path = ckpt_path.parent / 'config.json'
     auto_config = {}
     # Defaults for LoRA config (may be overwritten by config.json)
     config_lora_r = 0
     config_lora_alpha = None
     config_lora_mlp_only = False
-    if config_path.exists():
-        with open(config_path) as f:
-            auto_config = json.load(f)
-        print(f"[Auto-config] Found {config_path}")
+    for config_name in ['config.json', 'v2_config.json']:
+        config_path = ckpt_path.parent / config_name
+        if config_path.exists():
+            with open(config_path) as f:
+                auto_config = json.load(f)
+            print(f"[Auto-config] Found {config_path}")
+            break
 
     # Use auto-detected values if not explicitly set (check if using defaults)
+    # Support both naming conventions: lut_bits/mlp_lut_bits, scale_rank/mlp_scale_rank
     if auto_config:
-        if args.lut_bits == 2 and 'lut_bits' in auto_config:
-            args.lut_bits = auto_config['lut_bits']
-            print(f"  Using lut_bits={args.lut_bits} from config")
+        if args.lut_bits == 2:
+            cfg_lut = auto_config.get('lut_bits') or auto_config.get('mlp_lut_bits')
+            if cfg_lut:
+                args.lut_bits = cfg_lut
+                print(f"  Using lut_bits={args.lut_bits} from config")
         if args.attn_lut_bits == 4 and 'attn_lut_bits' in auto_config:
             args.attn_lut_bits = auto_config['attn_lut_bits']
             print(f"  Using attn_lut_bits={args.attn_lut_bits} from config")
-        if args.scale_rank == 32 and 'scale_rank' in auto_config:
-            args.scale_rank = auto_config['scale_rank']
-            print(f"  Using scale_rank={args.scale_rank} from config")
+        if args.scale_rank == 32:
+            cfg_rank = auto_config.get('scale_rank') or auto_config.get('mlp_scale_rank')
+            if cfg_rank:
+                args.scale_rank = cfg_rank
+                print(f"  Using scale_rank={args.scale_rank} from config")
         if args.attn_scale_rank == 8 and 'attn_scale_rank' in auto_config:
             args.attn_scale_rank = auto_config['attn_scale_rank']
             print(f"  Using attn_scale_rank={args.attn_scale_rank} from config")

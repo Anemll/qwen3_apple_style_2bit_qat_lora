@@ -467,6 +467,8 @@ def main():
                     "dtype": str(param_dtype),
                 },
             )
+            # Define step metric to avoid "step less than current" warnings
+            wandb.define_metric("*", step_metric="step", step_sync=False)
             print(f"[wandb] initialized: {wandb.run.name}")
         except ImportError:
             print("[warn] wandb not installed, skipping logging")

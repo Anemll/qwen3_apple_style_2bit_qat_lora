@@ -482,6 +482,8 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                 },
                 resume="allow",  # Allow resuming if run was interrupted
             )
+            # Define step metric to avoid "step less than current" warnings when resuming
+            wandb.define_metric("*", step_metric="step", step_sync=False)
             log("  WandB initialized")
         except ImportError:
             use_wandb = False

@@ -76,20 +76,23 @@ def parse_args():
 
 
 def load_config(checkpoint_path):
-    """Load config.json from checkpoint directory."""
+    """Load config.json or v2_config.json from checkpoint directory."""
     path = Path(checkpoint_path)
 
     # Handle both file and directory paths
     if path.is_file():
-        config_path = path.parent / 'config.json'
+        config_dir = path.parent
     else:
-        config_path = path / 'config.json'
+        config_dir = path
 
-    if config_path.exists():
-        with open(config_path) as f:
-            config = json.load(f)
-        print(f"Loaded config from {config_path}")
-        return config
+    # Try config.json first, then v2_config.json
+    for config_name in ['config.json', 'v2_config.json']:
+        config_path = config_dir / config_name
+        if config_path.exists():
+            with open(config_path) as f:
+                config = json.load(f)
+            print(f"Loaded config from {config_path}")
+            return config
 
     return {}
 
@@ -117,9 +120,10 @@ def load_model(args):
     print(f"Model version: {version.upper()}")
 
     # Get quantization params from config or args
-    lut_bits = args.lut_bits or config.get('lut_bits', 4)
+    # Support both naming conventions: lut_bits/mlp_lut_bits, scale_rank/mlp_scale_rank
+    lut_bits = args.lut_bits or config.get('lut_bits') or config.get('mlp_lut_bits', 4)
     attn_lut_bits = args.attn_lut_bits or config.get('attn_lut_bits', lut_bits)
-    scale_rank = args.scale_rank or config.get('scale_rank', 4)
+    scale_rank = args.scale_rank or config.get('scale_rank') or config.get('mlp_scale_rank', 4)
     attn_scale_rank = args.attn_scale_rank or config.get('attn_scale_rank', scale_rank)
     model_id = config.get('model_id', args.model_id)
 
