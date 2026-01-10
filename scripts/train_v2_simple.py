@@ -188,6 +188,16 @@ def main():
     device, device_type = get_device()
     is_tpu = device_type == 'tpu' or args.tpu
 
+    # If --tpu flag but device not detected as TPU, force XLA device
+    if args.tpu and device_type != 'tpu':
+        try:
+            import torch_xla.core.xla_model as xm
+            device = xm.xla_device()
+            device_type = 'tpu'
+            print(f"[TPU] Forced XLA device via --tpu flag: {device}")
+        except ImportError:
+            raise RuntimeError("--tpu specified but torch_xla not installed")
+
     # XLA persistent compilation cache (speeds up TPU restarts)
     if args.xla_cache_dir:
         try:
