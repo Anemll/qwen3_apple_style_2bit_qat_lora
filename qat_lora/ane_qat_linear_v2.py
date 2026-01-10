@@ -1238,10 +1238,11 @@ class AnemllQATLinearV2(nn.Module):
             _skip_scale_init=True,  # Skip SVD in reset_parameters
         )
 
-        # Copy weights
-        layer.weight.data = linear.weight.data.clone()
-        if linear.bias is not None:
-            layer.bias.data = linear.bias.data.clone()
+        # Copy weights (handle dtype/device mismatch on TPU/XLA)
+        with torch.no_grad():
+            layer.weight.copy_(linear.weight)
+            if linear.bias is not None:
+                layer.bias.copy_(linear.bias)
 
         # Initialize scales from the actual weights (slow SVD - skip if loading state_dict)
         if not skip_init:
