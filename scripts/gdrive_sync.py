@@ -25,6 +25,7 @@ Environment variables:
 """
 
 import argparse
+import fnmatch
 import os
 import shutil
 import subprocess
@@ -142,7 +143,7 @@ def get_dir_size(path: str) -> str:
     return f"{total:.1f} TB"
 
 
-def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cache: bool = False):
+def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cache: bool = False, exclude: list = None):
     """
     Sync local run/cache to Google Drive.
 
@@ -151,12 +152,21 @@ def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cac
         run_name: Override name on Drive (default: same as local)
         dry_run: Show what would be copied without copying
         is_cache: If True, sync as cache (recursive); if False, sync as run (flat)
+        exclude: List of glob patterns to exclude (e.g., ['checkpoint_step*', '*.tmp'])
     """
     if not ensure_drive_mounted(is_cache):
         return False
 
     gdrive_base = get_gdrive_base(is_cache)
     item_type = "cache" if is_cache else "run"
+    exclude = exclude or []
+
+    def should_exclude(filename):
+        """Check if filename matches any exclude pattern."""
+        for pattern in exclude:
+            if fnmatch.fnmatch(filename, pattern):
+                return True
+        return False
 
     if not os.path.exists(local_path):
         print(f"ERROR: Local path not found: {local_path}")
@@ -170,13 +180,19 @@ def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cac
     print("=" * 60)
     print(f"Source:      {local_path}")
     print(f"Destination: {gdrive_path}")
+    if exclude:
+        print(f"Exclude:     {', '.join(exclude)}")
 
     # Get files to sync (recursive for caches)
     local_files = {}  # relative_path -> full_path
+    excluded_count = 0
     if is_cache:
         # Recursive walk for caches
         for root, dirs, files in os.walk(local_path):
             for f in files:
+                if should_exclude(f):
+                    excluded_count += 1
+                    continue
                 full_path = os.path.join(root, f)
                 rel_path = os.path.relpath(full_path, local_path)
                 local_files[rel_path] = full_path
@@ -184,7 +200,13 @@ def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cac
         # Flat listing for runs
         for f in os.listdir(local_path):
             if os.path.isfile(os.path.join(local_path, f)):
+                if should_exclude(f):
+                    excluded_count += 1
+                    continue
                 local_files[f] = os.path.join(local_path, f)
+
+    if excluded_count > 0:
+        print(f"Excluded:    {excluded_count} files")
 
     gdrive_files = {}
     if os.path.exists(gdrive_path):
@@ -555,6 +577,9 @@ Examples:
   # Dry run (show what would be synced)
   python scripts/gdrive_sync.py up runs/SR-011_mlp_autosnap --dry-run
 
+  # Exclude files by pattern (e.g., skip intermediate checkpoints)
+  python scripts/gdrive_sync.py up runs/SR-011 --exclude "checkpoint_step*"
+
   # Sync caches (use --cache flag)
   python scripts/gdrive_sync.py up caches/alpaca_L128 --cache
   python scripts/gdrive_sync.py down alpaca_L128 --cache
@@ -579,6 +604,8 @@ Environment:
     up_parser.add_argument('--name', help='Override name on Drive')
     up_parser.add_argument('--dry-run', action='store_true', help='Show what would be synced')
     up_parser.add_argument('--cache', action='store_true', help='Sync as cache (recursive) instead of run')
+    up_parser.add_argument('--exclude', action='append', default=[],
+                          help='Glob pattern to exclude (can be used multiple times, e.g., --exclude "checkpoint_step*")')
 
     # down (sync drive -> local)
     down_parser = subparsers.add_parser('down', help='Sync run/cache from Google Drive to local')
@@ -601,7 +628,7 @@ Environment:
     if args.command == 'list':
         list_runs(args.location, args.cache)
     elif args.command == 'up':
-        sync_up(args.local_path, args.name, args.dry_run, args.cache)
+        sync_up(args.local_path, args.name, args.dry_run, args.cache, args.exclude)
     elif args.command == 'down':
         sync_down(args.run_name, args.local, args.dry_run, args.cache)
     elif args.command == 'status':
