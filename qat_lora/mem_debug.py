@@ -123,12 +123,31 @@ def _get_xla_memory_info() -> Optional[Dict[str, Any]]:
     try:
         import torch_xla.core.xla_model as xm
         device = xm.xla_device()
-        raw_info = xm.get_memory_info(device)
+        # CRITICAL: pass str(device) - some torch_xla versions need string, not device object
+        raw_info = xm.get_memory_info(str(device))
 
-        # Normalize: XLA returns kb_total, kb_free
-        total_bytes = raw_info.get('kb_total', 0) * 1024
-        free_bytes = raw_info.get('kb_free', 0) * 1024
-        used_bytes = total_bytes - free_bytes
+        # Handle different key formats across torch_xla versions:
+        # - Newer: kb_total, kb_free
+        # - Older: bytes_limit, bytes_used
+        if 'kb_total' in raw_info:
+            total_bytes = raw_info.get('kb_total', 0) * 1024
+            free_bytes = raw_info.get('kb_free', 0) * 1024
+            used_bytes = total_bytes - free_bytes
+        elif 'bytes_limit' in raw_info:
+            total_bytes = raw_info.get('bytes_limit', 0)
+            used_bytes = raw_info.get('bytes_used', 0)
+            free_bytes = total_bytes - used_bytes
+        else:
+            # Unknown format - return raw with warning
+            return {
+                'used_bytes': 0,
+                'free_bytes': 0,
+                'total_bytes': 0,
+                'used_pct': 0,
+                'raw': raw_info,
+                'warning': f'Unknown memory info format, keys: {list(raw_info.keys())}',
+            }
+
         used_pct = (used_bytes / total_bytes * 100) if total_bytes > 0 else 0
 
         return {
@@ -142,7 +161,7 @@ def _get_xla_memory_info() -> Optional[Dict[str, Any]]:
     except ImportError:
         return None
     except Exception as e:
-        return {'error': str(e)}
+        return {'error': str(e), 'error_type': type(e).__name__}
 
 
 def _get_xla_metrics() -> Optional[Dict[str, Any]]:
