@@ -281,22 +281,33 @@ def compute_kd_loss_batch(
     hard_top1_weight: float = 0.0,
     hard_full_weight: float = 0.0,
     debug_step: int = -1,
+    # Sparse sampled CE (for L1024+ TPU memory safety)
+    sampled_ce_weight: float = 0.0,
+    sampled_negatives: int = 64,
+    vocab_size: int = 151936,  # Qwen3 vocab size default
 ) -> torch.Tensor:
     """Compute KD loss for a batch using memory-efficient approach.
 
     Args:
         model: The model (must have .model and .lm_head attributes)
         batch: Dict with input_ids, attention_mask, topk_idx, topk_logits
+               Optional: rand_idx [B,L,R], rand_logits [B,L,R] for negative samples
         device: Device to run on
         temperature: Distillation temperature
         no_grad: If True, wrap forward pass in no_grad (for evaluation).
                  During training, set to False to allow gradients.
         hard_top1_weight: Weight for hard label loss on top-1 (helps stabilize training)
+                          WARNING: Materializes [B*L, V] full logits tensor!
         hard_full_weight: Weight for hard label loss on full vocab (small value helps)
+                          WARNING: Materializes [B*L, V] full logits tensor!
         debug_step: If >= 0, print debug info for this step (for XLA debugging)
+        sampled_ce_weight: Weight for sampled CE loss on K+R candidates (sparse, no full logits).
+                           Memory-safe alternative to hard_top1_weight for L>=1024.
+        sampled_negatives: Number of random negatives to sample if cache lacks rand_idx.
+        vocab_size: Vocabulary size for random negative sampling.
 
     Returns:
-        Combined loss scalar (KL + hard label losses)
+        Combined loss scalar (KL + hard label losses + sampled CE)
     """
     import time as _time
     _dbg = debug_step >= 0
@@ -423,6 +434,42 @@ def compute_kd_loss_batch(
     elif hard_full_weight > 0:
         # Reuse the already computed loss
         total_loss = total_loss + hard_full_weight * hard_top1_loss
+
+    # Sampled CE loss on K+R candidates (sparse, no full logits)
+    # This is a memory-safe alternative to hard_top1_weight for L>=1024
+    if sampled_ce_weight > 0:
+        # Get random negatives: from cache or sample on-the-fly
+        rand_idx = batch.get('rand_idx')
+        if rand_idx is not None:
+            # Use cached random negatives
+            idx_neg = rand_idx[:, :seq_len, :].to(device).long()  # [B, S, R]
+            idx_neg = idx_neg.reshape(B * seq_len, -1)  # [N, R]
+            R = idx_neg.size(1)
+        elif sampled_negatives > 0:
+            # Sample random negatives on-the-fly (fallback)
+            # Exclude top-K tokens to ensure negatives are different
+            R = sampled_negatives
+            idx_neg = torch.randint(0, vocab_size, (B * seq_len, R), device=device, dtype=torch.long)
+        else:
+            idx_neg = None
+            R = 0
+
+        if idx_neg is not None and R > 0:
+            # Concatenate top-K + random negatives
+            idx_cand = torch.cat([idx, idx_neg], dim=1)  # [N, K+R]
+
+            # Gather lm_head weights for all candidates
+            w_cand = model.lm_head.weight[idx_cand]  # [N, K+R, H]
+
+            # Compute student logits for all candidates
+            student_cand = torch.einsum('nh,nkh->nk', h, w_cand)  # [N, K+R]
+
+            # Target: class 0 (the top-1 token from teacher)
+            # This assumes topk_idx is sorted by teacher logit descending
+            targets = torch.zeros((B * seq_len,), dtype=torch.long, device=device)
+
+            sampled_ce = F.cross_entropy(student_cand, targets)
+            total_loss = total_loss + sampled_ce_weight * sampled_ce
 
     return total_loss
 
@@ -1330,6 +1377,10 @@ def train_e2e(
     auto_snap_state = None,
     # Memory debug
     mem_debug_config = None,
+    # Sparse logits mode (L1024+ TPU memory safety)
+    sampled_ce_weight: float = 0.0,
+    sampled_negatives: int = 64,
+    no_full_logits: bool = False,
 ) -> dict:
     """End-to-end KD-QAT training (all layers unfrozen).
 
@@ -1674,8 +1725,11 @@ def train_e2e(
 
     # Load anchor model and compute anchor logits if enabled
     anchor_model = None
-    anchor_logits = None
+    anchor_logits = None  # Full logits [samples, L, V] - only used if no_full_logits=False
+    anchor_topk_idx = None  # Sparse top-K indices [samples, L, K] - used if no_full_logits=True
+    anchor_topk_logits = None  # Sparse top-K logits [samples, L, K] - used if no_full_logits=True
     anchor_input_ids = None
+    anchor_K = 128  # Number of top-K tokens to track for sparse anchor KL
     if anchor_ckpt and anchor_kl_weight > 0 and anchor_samples > 0:
         if verbose:
             print(f"\n[Anchor KL] Loading anchor checkpoint: {anchor_ckpt}")
@@ -1742,13 +1796,23 @@ def train_e2e(
                 temp_iter = iter(DataLoader(temp_dataset, batch_size=1, shuffle=False))
         anchor_input_ids = torch.stack(anchor_batches[:anchor_samples], dim=0).to(device)
 
-        # Compute anchor logits
+        # Compute anchor logits (sparse top-K if no_full_logits, otherwise full)
         if verbose:
             print(f"  Computing anchor logits: {anchor_input_ids.shape}...", end=" ", flush=True)
         with torch.no_grad():
-            anchor_logits = anchor_model(anchor_input_ids, use_cache=False).logits.detach()
-        if verbose:
-            print(f"done: {anchor_logits.shape}")
+            full_logits = anchor_model(anchor_input_ids, use_cache=False).logits.detach()
+            if no_full_logits:
+                # Extract top-K and discard full logits (memory-safe for L1024)
+                anchor_topk_logits, anchor_topk_idx = torch.topk(full_logits, k=anchor_K, dim=-1)
+                anchor_topk_logits = anchor_topk_logits.to(torch.bfloat16)  # Save memory
+                anchor_topk_idx = anchor_topk_idx.to(torch.int32)
+                del full_logits  # Free the [samples, L, V] tensor immediately
+                if verbose:
+                    print(f"done (sparse): topk_idx={anchor_topk_idx.shape}, topk_logits={anchor_topk_logits.shape}")
+            else:
+                anchor_logits = full_logits
+                if verbose:
+                    print(f"done: {anchor_logits.shape}")
 
         # Memory debug: after anchor model init (BEFORE freeing, shows peak with anchor model)
         if _mem_cfg:
@@ -1983,6 +2047,8 @@ def train_e2e(
                         no_grad=False,
                         hard_top1_weight=current_hard_top1,
                         hard_full_weight=hard_full_weight,
+                        sampled_ce_weight=sampled_ce_weight,
+                        sampled_negatives=sampled_negatives,
                     )
             elif use_mixed_precision:
                 # Mixed precision: FP32 master weights + BF16 compute
@@ -1992,6 +2058,8 @@ def train_e2e(
                         no_grad=False,
                         hard_top1_weight=current_hard_top1,
                         hard_full_weight=hard_full_weight,
+                        sampled_ce_weight=sampled_ce_weight,
+                        sampled_negatives=sampled_negatives,
                     )
             else:
                 loss = compute_kd_loss_batch(
@@ -1999,28 +2067,69 @@ def train_e2e(
                     no_grad=False,
                     hard_top1_weight=current_hard_top1,
                     hard_full_weight=hard_full_weight,
+                    sampled_ce_weight=sampled_ce_weight,
+                    sampled_negatives=sampled_negatives,
                 )
 
             # Optional anchor KL regularizer (prevents drift from reference checkpoint)
-            if anchor_kl_weight > 0 and anchor_logits is not None and anchor_input_ids is not None:
+            # Supports two modes: full logits (anchor_logits) or sparse top-K (anchor_topk_idx/anchor_topk_logits)
+            has_anchor = anchor_kl_weight > 0 and anchor_input_ids is not None and (
+                anchor_logits is not None or (anchor_topk_idx is not None and anchor_topk_logits is not None)
+            )
+            if has_anchor:
                 # Only compute anchor KL every anchor_interval steps
                 if (optimizer_step + 1) % anchor_interval == 0 or optimizer_step == 0:
                     # Use pre-computed anchor samples for KL (cycle through them)
-                    anchor_idx = optimizer_step % anchor_samples
-                    anchor_input = anchor_input_ids[anchor_idx:anchor_idx+1]  # Already on device
+                    anchor_sample_idx = optimizer_step % anchor_samples
+                    anchor_input = anchor_input_ids[anchor_sample_idx:anchor_sample_idx+1]  # Already on device
 
-                    # Forward through current model
-                    if use_fp16:
-                        with torch.amp.autocast(device_type=autocast_device, dtype=torch.float16):
-                            current_logits = model(anchor_input, use_cache=False).logits
-                    elif use_mixed_precision:
-                        with torch.amp.autocast(device_type=autocast_device, dtype=torch.bfloat16):
-                            current_logits = model(anchor_input, use_cache=False).logits
+                    if no_full_logits and anchor_topk_idx is not None:
+                        # Sparse anchor KL: compute hidden states, gather top-K logits
+                        # This avoids materializing [1, L, V] tensor
+                        if use_fp16:
+                            with torch.amp.autocast(device_type=autocast_device, dtype=torch.float16):
+                                hidden = model.model(anchor_input, use_cache=False).last_hidden_state
+                        elif use_mixed_precision:
+                            with torch.amp.autocast(device_type=autocast_device, dtype=torch.bfloat16):
+                                hidden = model.model(anchor_input, use_cache=False).last_hidden_state
+                        else:
+                            hidden = model.model(anchor_input, use_cache=False).last_hidden_state
+
+                        # Gather top-K logits using anchor indices
+                        B_anc, L_anc, H_anc = hidden.shape
+                        h = hidden.reshape(B_anc * L_anc, H_anc)  # [N, H]
+                        idx = anchor_topk_idx[anchor_sample_idx].to(device).long()  # [L, K]
+                        idx = idx.reshape(L_anc, -1)  # [L, K]
+                        K_anc = idx.size(1)
+
+                        # Gather lm_head weights and compute sparse logits
+                        w = model.lm_head.weight[idx.reshape(-1)]  # [L*K, H]
+                        w = w.reshape(L_anc, K_anc, H_anc)  # [L, K, H]
+                        current_topk = torch.einsum('lh,lkh->lk', h.reshape(L_anc, H_anc), w)  # [L, K]
+
+                        # Get anchor's top-K logits
+                        anchor_topk = anchor_topk_logits[anchor_sample_idx].to(device).float()  # [L, K]
+
+                        # Sparse KL divergence
+                        teacher_probs = F.softmax(anchor_topk, dim=-1)
+                        teacher_log_probs = F.log_softmax(anchor_topk, dim=-1)
+                        student_log_probs = F.log_softmax(current_topk, dim=-1)
+                        anchor_loss = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1).mean()
+
                     else:
-                        current_logits = model(anchor_input, use_cache=False).logits
+                        # Full logits mode (original behavior)
+                        if use_fp16:
+                            with torch.amp.autocast(device_type=autocast_device, dtype=torch.float16):
+                                current_logits = model(anchor_input, use_cache=False).logits
+                        elif use_mixed_precision:
+                            with torch.amp.autocast(device_type=autocast_device, dtype=torch.bfloat16):
+                                current_logits = model(anchor_input, use_cache=False).logits
+                        else:
+                            current_logits = model(anchor_input, use_cache=False).logits
 
-                    # Soft cross-entropy (avoids aten::kl_div for TPU/XLA compatibility)
-                    anchor_loss = kd_soft_ce(current_logits, anchor_logits[anchor_idx:anchor_idx+1], temperature=1.0)
+                        # Soft cross-entropy (avoids aten::kl_div for TPU/XLA compatibility)
+                        anchor_loss = kd_soft_ce(current_logits, anchor_logits[anchor_sample_idx:anchor_sample_idx+1], temperature=1.0)
+
                     loss = loss + anchor_kl_weight * anchor_loss
 
             # Scale loss for gradient accumulation

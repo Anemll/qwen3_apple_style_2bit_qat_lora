@@ -207,6 +207,16 @@ def main():
     parser.add_argument('--mem-debug-step-axis', type=str, default='opt',
                         choices=['micro', 'opt'],
                         help='Step axis for interval filtering: micro (gradient step) or opt (optimizer step, default)')
+    # Sparse logits (L1024+ TPU memory safety)
+    parser.add_argument('--no-full-logits', action='store_true',
+                        help='Prevent any full-vocab [B,L,V] logits materialization. Forces hard_top1=0, hard_full=0, '
+                             'and uses sparse anchor-KL. Required for L>=1024 on TPU v6e-1 (16GB HBM).')
+    parser.add_argument('--sampled-ce-weight', type=float, default=0.0,
+                        help='Weight for sampled CE loss on K+R candidates (sparse alternative to hard_top1). '
+                             'Uses topk + random negatives from cache. Default: 0.0 (disabled).')
+    parser.add_argument('--sampled-negatives', type=int, default=64,
+                        help='Number of random negative tokens to sample if cache lacks rand_idx (default: 64). '
+                             'Ignored if cache already has rand_idx/rand_logits.')
     args = parser.parse_args()
 
     # Validate inputs - need v1, v2 checkpoint, or from-scratch
@@ -682,6 +692,22 @@ def main():
     else:
         tpu_hard_full = args.hard_full
 
+    # Sparse logits mode (--no-full-logits): prevents [B,L,V] materialization
+    # Required for L>=1024 on TPU v6e-1 (16GB HBM)
+    effective_hard_top1 = args.hard_top1
+    effective_hard_full = tpu_hard_full
+    if args.no_full_logits:
+        effective_hard_top1 = 0.0
+        effective_hard_full = 0.0
+        print(f"\n[Sparse Logits] --no-full-logits enabled:")
+        print(f"  hard_top1_weight: 0.0 (forced off)")
+        print(f"  hard_full_weight: 0.0 (forced off)")
+        if args.sampled_ce_weight > 0:
+            print(f"  sampled_ce_weight: {args.sampled_ce_weight} (K+R sparse CE)")
+            print(f"  sampled_negatives: {args.sampled_negatives} (fallback if cache lacks rand_idx)")
+        if args.anchor_ckpt:
+            print(f"  anchor-KL: sparse top-K mode (no full logits)")
+
     # Eval samples: CLI > TPU default (0) > GPU/CPU default (40)
     eval_samples = args.eval_samples
     if eval_samples is None:
@@ -709,9 +735,13 @@ def main():
         freeze_mags=args.freeze_mags,
         freeze_mags_mlp=args.freeze_mags_mlp,
         freeze_all=args.freeze_all,
-        hard_top1_weight=args.hard_top1,
-        hard_top1_end=args.hard_top1_end,
-        hard_full_weight=tpu_hard_full,
+        hard_top1_weight=effective_hard_top1,
+        hard_top1_end=args.hard_top1_end if not args.no_full_logits else 0.0,
+        hard_full_weight=effective_hard_full,
+        # Sparse logits mode
+        sampled_ce_weight=args.sampled_ce_weight,
+        sampled_negatives=args.sampled_negatives,
+        no_full_logits=args.no_full_logits,
         logging_steps=20,
         eval_steps=args.eval_steps,
         eval_samples=eval_samples,

@@ -300,6 +300,8 @@ def estimate_logits_workspace(
     vocab_size: int,
     dtype: torch.dtype = torch.float32,
     materialize_full_vocab: bool = True,
+    topk: int = 128,
+    num_negatives: int = 64,
 ) -> Dict[str, Any]:
     """
     Estimate logits tensor size.
@@ -310,29 +312,63 @@ def estimate_logits_workspace(
 
     Args:
         materialize_full_vocab: If True, estimate full [B,L,V] tensor.
-                               If False, returns 0 with explanatory note.
+                               If False, shows sparse K+R estimate instead.
+        topk: Number of top-K tokens for sparse logits (default: 128)
+        num_negatives: Number of random negatives for sampled CE (default: 64)
     """
-    shape = (batch_size, seq_len, vocab_size)
-    bytes_est = _estimate_tensor_bytes(shape, dtype)
+    full_shape = (batch_size, seq_len, vocab_size)
+    full_bytes = _estimate_tensor_bytes(full_shape, dtype)
+
+    # Sparse logits: K+R candidates per token
+    sparse_shape = (batch_size, seq_len, topk + num_negatives)
+    sparse_bytes = _estimate_tensor_bytes(sparse_shape, dtype)
 
     if materialize_full_vocab:
         return {
-            'logits': {
-                'shape': list(shape),
+            'logits_full': {
+                'shape': list(full_shape),
                 'dtype': str(dtype),
-                'bytes': bytes_est,
-                'formatted': _format_bytes(bytes_est),
-                'note': 'if full vocab logits materialized (full CE loss)',
+                'bytes': full_bytes,
+                'formatted': _format_bytes(full_bytes),
+                'note': 'full vocab [B,L,V] if hard_top1/hard_full > 0 or anchor w/o --no-full-logits',
+            },
+            'logits_sparse': {
+                'shape': list(sparse_shape),
+                'dtype': str(dtype),
+                'bytes': sparse_bytes,
+                'formatted': _format_bytes(sparse_bytes),
+                'note': f'sparse [B,L,K+R] if using --no-full-logits (K={topk}, R={num_negatives})',
+            },
+            'logits': {
+                'shape': list(full_shape),
+                'dtype': str(dtype),
+                'bytes': full_bytes,
+                'formatted': _format_bytes(full_bytes),
+                'note': 'ACTIVE: full vocab logits materialized',
             }
         }
     else:
         return {
-            'logits': {
-                'shape': list(shape),
+            'logits_full': {
+                'shape': list(full_shape),
                 'dtype': str(dtype),
-                'bytes': 0,
-                'formatted': '0 B',
-                'note': 'not materialized (top-k teacher or sampled loss)',
+                'bytes': full_bytes,
+                'formatted': _format_bytes(full_bytes),
+                'note': 'full vocab [B,L,V] - NOT materialized (--no-full-logits)',
+            },
+            'logits_sparse': {
+                'shape': list(sparse_shape),
+                'dtype': str(dtype),
+                'bytes': sparse_bytes,
+                'formatted': _format_bytes(sparse_bytes),
+                'note': f'sparse [B,L,K+R] ACTIVE (K={topk}, R={num_negatives})',
+            },
+            'logits': {
+                'shape': list(sparse_shape),
+                'dtype': str(dtype),
+                'bytes': sparse_bytes,
+                'formatted': _format_bytes(sparse_bytes),
+                'note': f'ACTIVE: sparse top-K+R logits (K={topk}, R={num_negatives})',
             }
         }
 
@@ -351,6 +387,8 @@ def mem_log(
     vocab_size: int = 151936,
     dtype: torch.dtype = torch.bfloat16,
     materialize_full_vocab: bool = True,
+    topk: int = 128,
+    num_negatives: int = 64,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
@@ -370,6 +408,8 @@ def mem_log(
         vocab_size: Vocabulary size (for estimates)
         dtype: Compute dtype (for estimates)
         materialize_full_vocab: Whether full vocab logits are materialized
+        topk: Number of top-K tokens for sparse logits estimate (default: 128)
+        num_negatives: Number of random negatives for sampled CE estimate (default: 64)
         extra: Additional data to log
 
     Returns:
@@ -412,7 +452,8 @@ def mem_log(
         )
         logits_est = estimate_logits_workspace(
             batch_size, seq_len, vocab_size, torch.float32,
-            materialize_full_vocab=materialize_full_vocab
+            materialize_full_vocab=materialize_full_vocab,
+            topk=topk, num_negatives=num_negatives
         )
         record['estimates'] = {
             'attention': attn_est,
@@ -471,8 +512,16 @@ def _print_mem_summary(record: Dict[str, Any], level: str):
             cfg = attn.get('config', {})
             parts.append(f"[EST] attn_worst={worst.get('formatted', '?')} (B={cfg.get('B')},H={cfg.get('H')},L={cfg.get('L')})")
         if logits:
+            # Show active logits estimate (full or sparse based on materialize_full_vocab)
             log_info = logits.get('logits', {})
-            parts.append(f"[EST] logits={log_info.get('formatted', '?')}")
+            note = log_info.get('note', '')
+            if 'sparse' in note.lower():
+                parts.append(f"[EST] logits_sparse={log_info.get('formatted', '?')}")
+            else:
+                # Show both full and sparse for comparison
+                full_info = logits.get('logits_full', {})
+                sparse_info = logits.get('logits_sparse', {})
+                parts.append(f"[EST] logits_full={full_info.get('formatted', '?')} sparse={sparse_info.get('formatted', '?')}")
 
     # XLA metrics (if metrics level)
     if level in ('metrics', 'hlo'):
