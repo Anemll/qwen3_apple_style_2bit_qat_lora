@@ -258,7 +258,20 @@ def qranklut_fake_quant(
 # STE-FP16 UTILITIES
 # =============================================================================
 
-def ste_fp16(x: torch.Tensor) -> torch.Tensor:
+# FP16 max value - values beyond this become inf when cast to FP16
+FP16_MAX = 65504.0
+
+# Global flag for debugging STE-FP16 saturation events
+_STE_FP16_DEBUG = False
+
+
+def set_ste_fp16_debug(enabled: bool):
+    """Enable/disable debug logging for STE-FP16 saturation events."""
+    global _STE_FP16_DEBUG
+    _STE_FP16_DEBUG = enabled
+
+
+def ste_fp16(x: torch.Tensor, saturate: bool = True) -> torch.Tensor:
     """Straight-through estimator for FP16 rounding.
 
     Forward: Rounds x to FP16 precision (matches ANE behavior).
@@ -269,6 +282,9 @@ def ste_fp16(x: torch.Tensor) -> torch.Tensor:
 
     Args:
         x: Input tensor (any dtype)
+        saturate: If True, clamp values to FP16 range before casting to prevent
+                  inf values. This is critical for TPU/XLA where FP32 values
+                  can exceed FP16 max (~65504). Default True.
 
     Returns:
         Tensor with FP16-rounded values but same dtype as input.
@@ -276,7 +292,21 @@ def ste_fp16(x: torch.Tensor) -> torch.Tensor:
     """
     if x.dtype == torch.float16:
         return x  # Already FP16, no rounding needed
-    x16 = x.to(torch.float16)
+
+    if saturate:
+        # Clamp to FP16 range to prevent inf on overflow
+        # This is a valid emulation: ANE would also saturate/clip on overflow
+        if _STE_FP16_DEBUG:
+            overflow_mask = x.abs() > FP16_MAX
+            if overflow_mask.any():
+                overflow_count = overflow_mask.sum().item()
+                max_val = x.abs().max().item()
+                print(f"[STE_FP16 SATURATE] {overflow_count} values clamped, max|x|={max_val:.1f}")
+        x_safe = x.clamp(-FP16_MAX, FP16_MAX)
+        x16 = x_safe.to(torch.float16)
+    else:
+        x16 = x.to(torch.float16)
+
     # STE: forward uses x16 values, backward pretends this is identity
     return x + (x16.to(x.dtype) - x).detach()
 

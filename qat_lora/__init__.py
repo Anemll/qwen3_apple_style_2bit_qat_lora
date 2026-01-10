@@ -26,6 +26,8 @@ from .ane_qat_linear_v2 import (
     convert_model_to_fp16_v2,
     load_v2_checkpoint,  # Proper loading with _Q and _indices
     ste_fp16,  # STE-FP16 rounding for ANE-matching training
+    set_ste_fp16_debug,  # Enable debug logging for STE saturation events
+    FP16_MAX,  # FP16 max value constant (~65504)
 )
 from .layer_qat import (
     compute_kd_loss_batch,
@@ -68,6 +70,8 @@ __all__ = [
     'convert_model_to_fp16_v2',
     'load_v2_checkpoint',
     'ste_fp16',
+    'set_ste_fp16_debug',
+    'FP16_MAX',
     # Training utilities
     'compute_kd_loss_batch',
     'evaluate_kd_loss',
