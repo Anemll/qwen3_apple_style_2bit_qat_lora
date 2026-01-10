@@ -1612,6 +1612,11 @@ def train_e2e(
     if verbose and weight_decay > 0:
         print(f"Weight decay: {weight_decay}")
 
+    # Memory debug: after optimizer init
+    if _mem_cfg:
+        mem_log(_mem_cfg, 'after_optimizer_init', micro_step=0, opt_step=0, phase='init',
+                extra={'num_params': len(params), 'lr': lr, 'weight_decay': weight_decay})
+
     # LR Scheduler (cosine with warmup)
     scheduler = None
     if use_cosine_schedule or warmup_steps > 0:
@@ -1745,6 +1750,11 @@ def train_e2e(
         if verbose:
             print(f"done: {anchor_logits.shape}")
 
+        # Memory debug: after anchor model init (BEFORE freeing, shows peak with anchor model)
+        if _mem_cfg:
+            mem_log(_mem_cfg, 'after_anchor_init', micro_step=0, opt_step=0, phase='init',
+                    extra={'anchor_samples': anchor_samples, 'anchor_logits_shape': list(anchor_logits.shape)})
+
         # Free anchor model memory (we only need the cached logits)
         del anchor_model
         anchor_model = None
@@ -1795,7 +1805,7 @@ def train_e2e(
         # Memory debug: before warmup compile
         if _mem_cfg:
             print_attn_info(model)
-            mem_log(_mem_cfg, 'before_warmup_compile', step=0, phase='warmup',
+            mem_log(_mem_cfg, 'before_warmup_compile', micro_step=0, opt_step=0, phase='warmup',
                     batch_size=batch_size, seq_len=warmup_seq_len)
 
         # Run one forward+backward pass to trigger compilation
@@ -1820,12 +1830,12 @@ def train_e2e(
 
         # Memory debug: after first forward
         if _mem_cfg:
-            mem_log(_mem_cfg, 'after_first_forward', step=0, phase='warmup',
+            mem_log(_mem_cfg, 'after_first_forward', micro_step=0, opt_step=0, phase='warmup',
                     batch_size=batch_size, seq_len=warmup_seq_len)
 
         # Memory debug: before mark_step
         if _mem_cfg:
-            mem_log(_mem_cfg, 'before_mark_step', step=0, phase='warmup',
+            mem_log(_mem_cfg, 'before_mark_step', micro_step=0, opt_step=0, phase='warmup',
                     batch_size=batch_size, seq_len=warmup_seq_len)
 
         if xm is not None:
@@ -1833,7 +1843,7 @@ def train_e2e(
 
         # Memory debug: after mark_step
         if _mem_cfg:
-            mem_log(_mem_cfg, 'after_mark_step', step=0, phase='warmup',
+            mem_log(_mem_cfg, 'after_mark_step', micro_step=0, opt_step=0, phase='warmup',
                     batch_size=batch_size, seq_len=warmup_seq_len)
 
         print("backward...", end=" ", flush=True)
@@ -1841,7 +1851,7 @@ def train_e2e(
 
         # Memory debug: after backward
         if _mem_cfg:
-            mem_log(_mem_cfg, 'after_first_backward', step=0, phase='warmup',
+            mem_log(_mem_cfg, 'after_first_backward', micro_step=0, opt_step=0, phase='warmup',
                     batch_size=batch_size, seq_len=warmup_seq_len)
 
         if xm is not None:
@@ -1892,7 +1902,7 @@ def train_e2e(
 
         # Memory debug: after warmup compile
         if _mem_cfg:
-            mem_log(_mem_cfg, 'after_warmup_compile', step=0, phase='warmup',
+            mem_log(_mem_cfg, 'after_warmup_compile', micro_step=0, opt_step=0, phase='warmup',
                     batch_size=batch_size, seq_len=warmup_seq_len)
 
         # Reset timing for accurate t/s measurement
@@ -2238,7 +2248,7 @@ def train_e2e(
 
                 # Memory debug: on checkpoint save
                 if _mem_cfg:
-                    mem_log(_mem_cfg, 'on_checkpoint_save', step=optimizer_step, phase='save',
+                    mem_log(_mem_cfg, 'on_checkpoint_save', micro_step=step, opt_step=optimizer_step, phase='save',
                             batch_size=batch_size, seq_len=seq_len if seq_len else 128)
 
                 # Auto-snap audit (CPU-only, no XLA tensor reads)
@@ -2327,7 +2337,7 @@ def train_e2e(
 
                         # Memory debug: after autosnap freeze (optimizer rebuild may trigger recompile)
                         if _mem_cfg:
-                            mem_log(_mem_cfg, 'after_autosnap_freeze', step=optimizer_step, phase='save',
+                            mem_log(_mem_cfg, 'after_autosnap_freeze', micro_step=step, opt_step=optimizer_step, phase='save',
                                     batch_size=batch_size, seq_len=seq_len if seq_len else 128,
                                     extra={'frozen_count': frozen_count})
 

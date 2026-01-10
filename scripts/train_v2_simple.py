@@ -204,6 +204,9 @@ def main():
                         help='Optional run tag for log filtering')
     parser.add_argument('--mem-debug-no-xla-metrics', action='store_true',
                         help='Skip XLA metrics calls (if they perturb compilation)')
+    parser.add_argument('--mem-debug-step-axis', type=str, default='opt',
+                        choices=['micro', 'opt'],
+                        help='Step axis for interval filtering: micro (gradient step) or opt (optimizer step, default)')
     args = parser.parse_args()
 
     # Validate inputs - need v1, v2 checkpoint, or from-scratch
