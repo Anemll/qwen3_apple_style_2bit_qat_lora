@@ -1866,6 +1866,18 @@ def train_e2e(
         warmup_batch = next(iter(warmup_loader))
         warmup_seq_len = warmup_batch['input_ids'].shape[1]
 
+        # Truncate warmup batch if L>512 to reduce XLA compilation memory
+        # (XLA backward graph for L=1024 needs ~200MB compilation workspace)
+        # Training will trigger one more recompile for full L, but that's OK
+        warmup_max_len = 512
+        if warmup_seq_len > warmup_max_len:
+            print(f"(truncating L={warmup_seq_len}→{warmup_max_len} for compile) ", end="", flush=True)
+            warmup_batch = {
+                k: v[:, :warmup_max_len] if v.dim() >= 2 and v.size(1) == warmup_seq_len else v
+                for k, v in warmup_batch.items()
+            }
+            warmup_seq_len = warmup_max_len
+
         # Memory debug: before warmup compile
         if _mem_cfg:
             print_attn_info(model)
