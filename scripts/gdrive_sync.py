@@ -12,6 +12,8 @@ Usage (in Colab):
     # Sync runs (checkpoints)
     !python scripts/gdrive_sync.py up runs/SR-011_mlp_autosnap
     !python scripts/gdrive_sync.py down SR-011_mlp_autosnap
+    !python scripts/gdrive_sync.py down SR-011_mlp_autosnap --only "v2_*.pt"
+    !python scripts/gdrive_sync.py down runs/SR-011_mlp_autosnap/v2_checkpoint.pt
     !python scripts/gdrive_sync.py list
 
     # Sync caches (use --cache flag)
@@ -111,6 +113,41 @@ def ensure_drive_mounted(is_cache: bool = False):
 def get_run_name(path: str) -> str:
     """Extract run name from path like 'runs/SR-011_foo' -> 'SR-011_foo'."""
     return Path(path).name
+
+
+def parse_down_path(path: str) -> tuple:
+    """
+    Parse flexible path format for 'down' command.
+
+    Supports:
+      - "SR-011_name" -> (run_name="SR-011_name", only_pattern=None)
+      - "runs/SR-011_name" -> (run_name="SR-011_name", only_pattern=None)
+      - "runs/SR-011_name/file.pt" -> (run_name="SR-011_name", only_pattern="file.pt")
+      - "SR-011_name/file.pt" -> (run_name="SR-011_name", only_pattern="file.pt")
+
+    Returns:
+        (run_name, only_pattern) tuple
+    """
+    # Normalize path
+    path = path.strip('/')
+    parts = path.split('/')
+
+    # Remove 'runs' prefix if present
+    if parts[0] == 'runs':
+        parts = parts[1:]
+
+    if len(parts) == 0:
+        return None, None
+    elif len(parts) == 1:
+        # Just run name: "SR-011_name"
+        return parts[0], None
+    elif len(parts) == 2:
+        # Run name + file: "SR-011_name/file.pt"
+        return parts[0], parts[1]
+    else:
+        # Multiple levels: take first as run_name, last as file pattern
+        # e.g., "SR-011/subdir/file.pt" -> run_name="SR-011", pattern="file.pt"
+        return parts[0], parts[-1]
 
 
 def list_runs(location: str = "both", is_cache: bool = False):
@@ -319,7 +356,7 @@ def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cac
     return True
 
 
-def sync_down(run_name: str, local_path: str = None, dry_run: bool = False, is_cache: bool = False):
+def sync_down(run_name: str, local_path: str = None, dry_run: bool = False, is_cache: bool = False, only: list = None):
     """
     Sync run/cache from Google Drive to local.
 
@@ -328,6 +365,7 @@ def sync_down(run_name: str, local_path: str = None, dry_run: bool = False, is_c
         local_path: Local destination (default: runs/<name> or caches/<name>)
         dry_run: Show what would be copied without copying
         is_cache: If True, sync as cache (recursive); if False, sync as run (flat)
+        only: List of glob patterns to include (e.g., ['*1200*', 'best*']). If set, only matching files are synced.
     """
     if not ensure_drive_mounted(is_cache):
         return False
@@ -335,6 +373,16 @@ def sync_down(run_name: str, local_path: str = None, dry_run: bool = False, is_c
     gdrive_base, local_base = get_paths(is_cache)
     gdrive_path = os.path.join(gdrive_base, run_name)
     local_path = local_path or os.path.join(local_base, run_name)
+    only = only or []
+
+    def should_include(filename):
+        """Check if filename matches any 'only' pattern. Empty list = include all."""
+        if not only:
+            return True
+        for pattern in only:
+            if fnmatch.fnmatch(filename, pattern):
+                return True
+        return False
 
     item_type = "cache" if is_cache else "run"
     if not os.path.exists(gdrive_path):
@@ -348,19 +396,31 @@ def sync_down(run_name: str, local_path: str = None, dry_run: bool = False, is_c
     print("=" * 60)
     print(f"Source:      {gdrive_path}")
     print(f"Destination: {local_path}")
+    if only:
+        print(f"Only:        {', '.join(only)}")
 
     # Get files to sync (recursive for caches)
     gdrive_files = {}  # relative_path -> full_path
+    filtered_count = 0
     if is_cache:
         for root, dirs, files in os.walk(gdrive_path):
             for f in files:
+                if not should_include(f):
+                    filtered_count += 1
+                    continue
                 full_path = os.path.join(root, f)
                 rel_path = os.path.relpath(full_path, gdrive_path)
                 gdrive_files[rel_path] = full_path
     else:
         for f in os.listdir(gdrive_path):
             if os.path.isfile(os.path.join(gdrive_path, f)):
+                if not should_include(f):
+                    filtered_count += 1
+                    continue
                 gdrive_files[f] = os.path.join(gdrive_path, f)
+
+    if filtered_count > 0:
+        print(f"Filtered:    {filtered_count} files (not matching --only)")
 
     local_files = {}
     if os.path.exists(local_path):
@@ -621,8 +681,10 @@ Examples:
   # Upload local run to Drive
   python scripts/gdrive_sync.py up runs/SR-011_mlp_autosnap
 
-  # Download run from Drive
+  # Download run from Drive (multiple formats supported)
   python scripts/gdrive_sync.py down SR-011_mlp_autosnap
+  python scripts/gdrive_sync.py down SR-011_mlp_autosnap --only "v2_*.pt"
+  python scripts/gdrive_sync.py down runs/SR-011_mlp_autosnap/v2_checkpoint.pt
 
   # Check sync status
   python scripts/gdrive_sync.py status runs/SR-011_mlp_autosnap
@@ -667,10 +729,12 @@ Environment:
 
     # down (sync drive -> local)
     down_parser = subparsers.add_parser('down', help='Sync run/cache from Google Drive to local')
-    down_parser.add_argument('run_name', help='Name on Drive (e.g., SR-011_foo or alpaca_L128)')
+    down_parser.add_argument('path', help='Run name or path (e.g., SR-011_foo, runs/SR-011_foo/file.pt)')
     down_parser.add_argument('--local', help='Local destination path')
     down_parser.add_argument('--dry-run', action='store_true', help='Show what would be synced')
     down_parser.add_argument('--cache', action='store_true', help='Sync as cache (recursive) instead of run')
+    down_parser.add_argument('--only', action='append', default=[],
+                          help='Only sync files matching pattern (can be used multiple times, e.g., --only "*1200*")')
 
     # status
     status_parser = subparsers.add_parser('status', help='Show sync status')
@@ -688,7 +752,13 @@ Environment:
     elif args.command == 'up':
         sync_up(args.local_path, args.name, args.dry_run, args.cache, args.exclude, args.only)
     elif args.command == 'down':
-        sync_down(args.run_name, args.local, args.dry_run, args.cache)
+        # Parse flexible path format: "SR-011_name", "runs/SR-011_name", "runs/SR-011_name/file.pt"
+        run_name, path_pattern = parse_down_path(args.path)
+        # Combine patterns from path and --only flag
+        only_patterns = list(args.only)  # Copy to avoid modifying original
+        if path_pattern:
+            only_patterns.append(path_pattern)
+        sync_down(run_name, args.local, args.dry_run, args.cache, only_patterns if only_patterns else None)
     elif args.command == 'status':
         show_status(args.local_path, args.cache)
     elif args.command == 'resume':
