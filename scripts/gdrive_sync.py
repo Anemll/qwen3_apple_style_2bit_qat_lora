@@ -22,6 +22,40 @@ Usage (in Colab):
 Environment variables:
     GDRIVE_BASE: Base directory for runs (default: /content/drive/MyDrive/qwen3_runs)
     GDRIVE_CACHES: Base directory for caches (default: /content/drive/MyDrive/qwen3_caches)
+
+Training Commands:
+    # SR-011 Phase 1: MLP mags and scales (with auto-snap)
+    python scripts/train_v2_simple.py \
+        --config q4a4_r32 \
+        --v2-checkpoint runs/SR-011_q4_a4_r32_from_scratch/model_state_dict.pt \
+        --cache-dir caches/alpaca_chat_think_both_L128_K128_R1024 \
+        --output-dir runs/SR-011_q4_a4_r32_mlp_autosnap \
+        --mlp-only \
+        --mixed-precision \
+        --max-steps 4000 \
+        --batch-size 4 \
+        --accumulation-steps 2 \
+        --lr 2e-4 \
+        --warmup-steps 200 \
+        --min-lr-ratio 0.1 \
+        --temperature 2.0 \
+        --hard-top1 0.2 --hard-top1-end 0.0 \
+        --hard-full 5e-05 \
+        --clip-grad-norm 1.0 \
+        --save-steps 200 \
+        --eval-steps 100 \
+        --auto-snap-mags \
+        --auto-snap-target mlp \
+        --auto-snap-threshold 0.05 \
+        --auto-snap-patience 2 \
+        --auto-snap-start-step 100 \
+        --auto-snap-min-saves 2 \
+        --anchor-ckpt runs/SR-011_q4_a4_r32_from_scratch/model_state_dict.pt \
+        --anchor-kl-weight 0.002 \
+        --anchor-interval 10 \
+        --anchor-samples 1 \
+        --wandb --wandb-project qwen3-qat --wandb-run "SR-011_mlp_autosnap_L128_lr2e-4_anchor" \
+        --tpu
 """
 
 import argparse
@@ -143,7 +177,7 @@ def get_dir_size(path: str) -> str:
     return f"{total:.1f} TB"
 
 
-def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cache: bool = False, exclude: list = None):
+def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cache: bool = False, exclude: list = None, only: list = None):
     """
     Sync local run/cache to Google Drive.
 
@@ -153,6 +187,7 @@ def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cac
         dry_run: Show what would be copied without copying
         is_cache: If True, sync as cache (recursive); if False, sync as run (flat)
         exclude: List of glob patterns to exclude (e.g., ['checkpoint_step*', '*.tmp'])
+        only: List of glob patterns to include (e.g., ['*1200*', 'best*']). If set, only matching files are synced.
     """
     if not ensure_drive_mounted(is_cache):
         return False
@@ -160,10 +195,20 @@ def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cac
     gdrive_base = get_gdrive_base(is_cache)
     item_type = "cache" if is_cache else "run"
     exclude = exclude or []
+    only = only or []
 
     def should_exclude(filename):
         """Check if filename matches any exclude pattern."""
         for pattern in exclude:
+            if fnmatch.fnmatch(filename, pattern):
+                return True
+        return False
+
+    def should_include(filename):
+        """Check if filename matches any 'only' pattern. Empty list = include all."""
+        if not only:
+            return True
+        for pattern in only:
             if fnmatch.fnmatch(filename, pattern):
                 return True
         return False
@@ -180,16 +225,22 @@ def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cac
     print("=" * 60)
     print(f"Source:      {local_path}")
     print(f"Destination: {gdrive_path}")
+    if only:
+        print(f"Only:        {', '.join(only)}")
     if exclude:
         print(f"Exclude:     {', '.join(exclude)}")
 
     # Get files to sync (recursive for caches)
     local_files = {}  # relative_path -> full_path
     excluded_count = 0
+    filtered_count = 0
     if is_cache:
         # Recursive walk for caches
         for root, dirs, files in os.walk(local_path):
             for f in files:
+                if not should_include(f):
+                    filtered_count += 1
+                    continue
                 if should_exclude(f):
                     excluded_count += 1
                     continue
@@ -200,11 +251,16 @@ def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cac
         # Flat listing for runs
         for f in os.listdir(local_path):
             if os.path.isfile(os.path.join(local_path, f)):
+                if not should_include(f):
+                    filtered_count += 1
+                    continue
                 if should_exclude(f):
                     excluded_count += 1
                     continue
                 local_files[f] = os.path.join(local_path, f)
 
+    if filtered_count > 0:
+        print(f"Filtered:    {filtered_count} files (not matching --only)")
     if excluded_count > 0:
         print(f"Excluded:    {excluded_count} files")
 
@@ -606,6 +662,8 @@ Environment:
     up_parser.add_argument('--cache', action='store_true', help='Sync as cache (recursive) instead of run')
     up_parser.add_argument('--exclude', action='append', default=[],
                           help='Glob pattern to exclude (can be used multiple times, e.g., --exclude "checkpoint_step*")')
+    up_parser.add_argument('--only', action='append', default=[],
+                          help='Only sync files matching pattern (can be used multiple times, e.g., --only "*1200*")')
 
     # down (sync drive -> local)
     down_parser = subparsers.add_parser('down', help='Sync run/cache from Google Drive to local')
@@ -628,7 +686,7 @@ Environment:
     if args.command == 'list':
         list_runs(args.location, args.cache)
     elif args.command == 'up':
-        sync_up(args.local_path, args.name, args.dry_run, args.cache, args.exclude)
+        sync_up(args.local_path, args.name, args.dry_run, args.cache, args.exclude, args.only)
     elif args.command == 'down':
         sync_down(args.run_name, args.local, args.dry_run, args.cache)
     elif args.command == 'status':
