@@ -355,14 +355,33 @@ def load_checkpoint(
     scale_rank = 32
     attn_scale_rank = 8  # Default for attention
 
-    if config_path.exists():
-        with open(config_path) as f:
-            config = json.load(f)
-        lut_bits = config.get('lut_bits', config.get('mlp_lut_bits', 4))
-        attn_lut_bits = config.get('attn_lut_bits', lut_bits)
-        scale_rank = config.get('scale_rank', 32)
-        attn_scale_rank = config.get('attn_scale_rank', scale_rank)
-        print(f"Config: Q{lut_bits}/Q{attn_lut_bits}, scale_rank={scale_rank}/{attn_scale_rank}")
+    # Check for config.json or v2_config.json
+    config_dir = checkpoint_path.parent if checkpoint_path.is_file() else checkpoint_path
+    config = {}
+    config_found = None
+    for config_name in ['config.json', 'v2_config.json']:
+        config_path = config_dir / config_name
+        if config_path.exists():
+            with open(config_path) as f:
+                config = json.load(f)
+            config_found = config_path
+            break
+
+    if config_found:
+        print(f"Config:     {config_found}")
+        # Support both naming conventions: lut_bits/mlp_lut_bits, scale_rank/mlp_scale_rank
+        lut_bits = config.get('lut_bits') or config.get('mlp_lut_bits') or 4
+        attn_lut_bits = config.get('attn_lut_bits') or lut_bits
+        scale_rank = config.get('scale_rank') or config.get('mlp_scale_rank') or 32
+        attn_scale_rank = config.get('attn_scale_rank') or scale_rank
+        print(f"  MLP:      Q{lut_bits} (LUT{2**lut_bits}), rank={scale_rank}")
+        print(f"  Attn:     Q{attn_lut_bits} (LUT{2**attn_lut_bits}), rank={attn_scale_rank}")
+        if 'lora_r' in config and config['lora_r'] > 0:
+            print(f"  LoRA:     r={config['lora_r']}, alpha={config.get('lora_alpha', config['lora_r'])}")
+    else:
+        print(f"Config:     (not found, using defaults)")
+        print(f"  MLP:      Q{lut_bits} (LUT{2**lut_bits}), rank={scale_rank}")
+        print(f"  Attn:     Q{attn_lut_bits} (LUT{2**attn_lut_bits}), rank={attn_scale_rank}")
 
     # Load base model
     print(f"Loading base model: {model_name}")
