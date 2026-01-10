@@ -1444,6 +1444,7 @@ def train_e2e(
                 name=wandb_run_name,
                 config=run_config,
                 reinit=True,
+                resume="allow",  # Allow resuming if run was interrupted (Colab restarts)
             )
             if verbose:
                 print(f"[wandb] Logging to: {wandb_run.url}")
@@ -3227,6 +3228,7 @@ def train_recovery_lora(
                     'mlp_only': mlp_only,
                     'anchor_kl_weight': anchor_kl_weight,
                 },
+                resume="allow",  # Allow resuming if run was interrupted
             )
         except ImportError:
             print("wandb not installed, skipping logging")

@@ -449,6 +449,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                 project=args.wandb_project,
                 name=args.wandb_run or f"recovery_lora_multi_r{args.recovery_r}",
                 config=vars(args),
+                resume="allow",  # Allow resuming if run was interrupted
             )
         except ImportError:
             use_wandb = False

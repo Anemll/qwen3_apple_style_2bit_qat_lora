@@ -480,6 +480,7 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
                     'num_chips': world_size,
                     'accumulation_steps': args.accumulation_steps,
                 },
+                resume="allow",  # Allow resuming if run was interrupted
             )
             log("  WandB initialized")
         except ImportError:
