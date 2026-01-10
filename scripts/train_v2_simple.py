@@ -187,6 +187,23 @@ def main():
                         help='Audit and log but don\'t actually freeze (for testing)')
     parser.add_argument('--auto-snap-log-json', action='store_true',
                         help='Write audit JSON files at each save checkpoint')
+    # Memory debug (TPU/XLA-safe)
+    parser.add_argument('--mem-debug', action='store_true',
+                        help='Enable TPU HBM memory logging (OFF by default)')
+    parser.add_argument('--mem-debug-level', type=str, default='basic',
+                        choices=['basic', 'tensors', 'metrics', 'hlo'],
+                        help='Memory debug level: basic=HBM snapshots, tensors=+size estimates, '
+                             'metrics=+XLA compile stats, hlo=+HLO dumps (heavy)')
+    parser.add_argument('--mem-debug-phase', type=str, default='warmup,save',
+                        help='When to log: warmup,train,save,all (comma-separated, default: warmup,save)')
+    parser.add_argument('--mem-debug-interval', type=int, default=1,
+                        help='Log every N optimizer steps (default: 1)')
+    parser.add_argument('--mem-debug-json', type=str, default=None,
+                        help='Path to append JSONL memory records')
+    parser.add_argument('--mem-debug-tag', type=str, default=None,
+                        help='Optional run tag for log filtering')
+    parser.add_argument('--mem-debug-no-xla-metrics', action='store_true',
+                        help='Skip XLA metrics calls (if they perturb compilation)')
     args = parser.parse_args()
 
     # Validate inputs - need v1, v2 checkpoint, or from-scratch
@@ -314,6 +331,7 @@ def main():
     from qat_lora.ane_qat_linear import AnemllQATLinear
     from qat_lora.ane_qat_linear_v2 import AnemllQATLinearV2
     from qat_lora.auto_snap_mags import AutoSnapState, validate_auto_snap_config
+    from qat_lora.mem_debug import MemDebugConfig
 
     # =========================================================================
     # Load model (V2 checkpoint OR V1->V2 conversion)
@@ -642,6 +660,15 @@ def main():
         if args.auto_snap_dry_run:
             print(f"  DRY RUN MODE (audit only, no freeze)")
 
+    # Create MemDebugConfig if enabled
+    mem_debug_config = MemDebugConfig.from_args(args)
+    if mem_debug_config.enabled:
+        print(f"\n[MemDebug] Enabled:")
+        print(f"  Level: {mem_debug_config.level}")
+        print(f"  Phases: {', '.join(mem_debug_config.phases)}")
+        if mem_debug_config.json_path:
+            print(f"  JSON output: {mem_debug_config.json_path}")
+
     # TPU-specific parameters
     if is_tpu:
         # Disable full vocab CE on TPU - causes massive XLA graph, slow compilation
@@ -707,6 +734,8 @@ def main():
         anchor_interval=args.anchor_interval,
         # Auto snap+freeze
         auto_snap_state=auto_snap_state,
+        # Memory debug
+        mem_debug_config=mem_debug_config,
     )
 
     print(f"\n  Final loss: {result.get('final_loss', 'N/A')}")

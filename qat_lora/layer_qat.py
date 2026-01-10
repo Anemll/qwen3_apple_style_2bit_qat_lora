@@ -1328,6 +1328,8 @@ def train_e2e(
     anchor_interval: int = 1,
     # Auto snap+freeze
     auto_snap_state = None,
+    # Memory debug
+    mem_debug_config = None,
 ) -> dict:
     """End-to-end KD-QAT training (all layers unfrozen).
 
@@ -1776,6 +1778,10 @@ def train_e2e(
     # (avoids torch.load I/O every batch)
     dataset = KDCacheDataset(cache_dir, shuffle=True, preload=True)
 
+    # Memory debug helper (import here to avoid circular deps)
+    from .mem_debug import mem_log, print_attn_info
+    _mem_cfg = mem_debug_config  # Shorthand
+
     # TPU warmup: precompile XLA graph before timing starts
     if is_tpu and verbose:
         print("\n[TPU] Warmup: compiling XLA graph...", end=" ", flush=True)
@@ -1785,6 +1791,12 @@ def train_e2e(
         warmup_loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, drop_last=True)
         warmup_batch = next(iter(warmup_loader))
         warmup_seq_len = warmup_batch['input_ids'].shape[1]
+
+        # Memory debug: before warmup compile
+        if _mem_cfg:
+            print_attn_info(model)
+            mem_log(_mem_cfg, 'before_warmup_compile', step=0, phase='warmup',
+                    batch_size=batch_size, seq_len=warmup_seq_len)
 
         # Run one forward+backward pass to trigger compilation
         model.train()
@@ -1805,10 +1817,33 @@ def train_e2e(
                 hard_top1_weight=hard_top1_weight,
                 hard_full_weight=hard_full_weight,
             )
+
+        # Memory debug: after first forward
+        if _mem_cfg:
+            mem_log(_mem_cfg, 'after_first_forward', step=0, phase='warmup',
+                    batch_size=batch_size, seq_len=warmup_seq_len)
+
+        # Memory debug: before mark_step
+        if _mem_cfg:
+            mem_log(_mem_cfg, 'before_mark_step', step=0, phase='warmup',
+                    batch_size=batch_size, seq_len=warmup_seq_len)
+
         if xm is not None:
             xm.mark_step()
+
+        # Memory debug: after mark_step
+        if _mem_cfg:
+            mem_log(_mem_cfg, 'after_mark_step', step=0, phase='warmup',
+                    batch_size=batch_size, seq_len=warmup_seq_len)
+
         print("backward...", end=" ", flush=True)
         warmup_loss.backward()
+
+        # Memory debug: after backward
+        if _mem_cfg:
+            mem_log(_mem_cfg, 'after_first_backward', step=0, phase='warmup',
+                    batch_size=batch_size, seq_len=warmup_seq_len)
+
         if xm is not None:
             xm.mark_step()
 
@@ -1854,6 +1889,11 @@ def train_e2e(
             print(f"[TPU] Memory info not available: {e}")
 
         print(f"[TPU] XLA compilation complete. Training t/s will be accurate.")
+
+        # Memory debug: after warmup compile
+        if _mem_cfg:
+            mem_log(_mem_cfg, 'after_warmup_compile', step=0, phase='warmup',
+                    batch_size=batch_size, seq_len=warmup_seq_len)
 
         # Reset timing for accurate t/s measurement
         t_start = time.time()
@@ -2196,6 +2236,11 @@ def train_e2e(
                 if verbose:
                     print(f"  [Checkpoint saved: {ckpt_path}]")
 
+                # Memory debug: on checkpoint save
+                if _mem_cfg:
+                    mem_log(_mem_cfg, 'on_checkpoint_save', step=optimizer_step, phase='save',
+                            batch_size=batch_size, seq_len=seq_len if seq_len else 128)
+
                 # Auto-snap audit (CPU-only, no XLA tensor reads)
                 if auto_snap_state is not None and auto_snap_state.should_audit(optimizer_step):
                     from qat_lora.auto_snap_mags import (
@@ -2279,6 +2324,12 @@ def train_e2e(
                                 'auto_snap/lr_before': lr_before,
                                 'auto_snap/lr_after': optimizer.param_groups[0]['lr'],
                             }, step=step)
+
+                        # Memory debug: after autosnap freeze (optimizer rebuild may trigger recompile)
+                        if _mem_cfg:
+                            mem_log(_mem_cfg, 'after_autosnap_freeze', step=optimizer_step, phase='save',
+                                    batch_size=batch_size, seq_len=seq_len if seq_len else 128,
+                                    extra={'frozen_count': frozen_count})
 
                 # Clean up old checkpoints if keep_checkpoints is set
                 if keep_checkpoints > 0:
