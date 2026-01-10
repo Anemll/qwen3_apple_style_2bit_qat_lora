@@ -19,6 +19,10 @@ Usage:
     # With LoRA
     python scripts/measure_perplexity.py checkpoint.pt --lora-r 8
 
+    # Force specific dtype (fp16, bf16, or fp32)
+    python scripts/measure_perplexity.py checkpoint.pt --dtype fp16
+    python scripts/measure_perplexity.py --baseline --dtype bf16
+
 Perplexity = exp(cross-entropy loss) on next-token prediction.
 Lower is better. WikiText-2 baselines: GPT-2 ~22, good LLMs ~5-10.
 """
@@ -36,35 +40,69 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
-def get_device(device_arg: str = 'auto'):
-    """Get device and dtype based on availability."""
+def parse_dtype(dtype_arg: str) -> torch.dtype:
+    """Parse dtype string to torch.dtype."""
+    dtype_map = {
+        'fp16': torch.float16,
+        'bf16': torch.bfloat16,
+        'fp32': torch.float32,
+    }
+    return dtype_map.get(dtype_arg)
+
+
+def get_device(device_arg: str = 'auto', dtype_arg: str = 'auto'):
+    """Get device and dtype based on availability and user preference."""
+    # First determine device
+    device = None
+    default_dtype = None
+
     if device_arg == 'tpu':
         try:
             import torch_xla.core.xla_model as xm
-            return xm.xla_device(), torch.bfloat16
+            device = xm.xla_device()
+            default_dtype = torch.bfloat16
         except ImportError:
             print("Warning: torch_xla not installed, falling back to CPU")
-            return torch.device('cpu'), torch.float32
-
-    if device_arg == 'auto':
+            device = torch.device('cpu')
+            default_dtype = torch.float32
+    elif device_arg == 'auto':
         # TPU > MPS > CUDA > CPU
         try:
             import torch_xla.core.xla_model as xm
-            return xm.xla_device(), torch.bfloat16
+            device = xm.xla_device()
+            default_dtype = torch.bfloat16
         except ImportError:
             pass
-        if torch.backends.mps.is_available():
-            return torch.device('mps'), torch.float32
-        elif torch.cuda.is_available():
-            return torch.device('cuda'), torch.bfloat16
-        else:
-            return torch.device('cpu'), torch.float32
+        if device is None:
+            if torch.backends.mps.is_available():
+                device = torch.device('mps')
+                default_dtype = torch.float32
+            elif torch.cuda.is_available():
+                device = torch.device('cuda')
+                default_dtype = torch.bfloat16
+            else:
+                device = torch.device('cpu')
+                default_dtype = torch.float32
     elif device_arg == 'mps':
-        return torch.device('mps'), torch.float32
+        device = torch.device('mps')
+        default_dtype = torch.float32
     elif device_arg == 'cuda':
-        return torch.device('cuda'), torch.bfloat16
+        device = torch.device('cuda')
+        default_dtype = torch.bfloat16
     else:
-        return torch.device('cpu'), torch.float32
+        device = torch.device('cpu')
+        default_dtype = torch.float32
+
+    # Apply dtype override if specified
+    if dtype_arg != 'auto':
+        dtype = parse_dtype(dtype_arg)
+        if dtype is None:
+            print(f"Warning: Unknown dtype '{dtype_arg}', using default")
+            dtype = default_dtype
+    else:
+        dtype = default_dtype
+
+    return device, dtype
 
 
 def load_wikitext2(tokenizer, split='test'):
@@ -485,6 +523,8 @@ def main():
                         help='Base model name (default: Qwen/Qwen3-0.6B)')
     parser.add_argument('--device', choices=['auto', 'mps', 'cuda', 'cpu', 'tpu'], default='auto',
                         help='Device to use (default: auto). TPU requires torch_xla.')
+    parser.add_argument('--dtype', choices=['auto', 'fp16', 'bf16', 'fp32'], default='auto',
+                        help='Model dtype (default: auto, uses device default)')
     parser.add_argument('--verbose', action='store_true',
                         help='Show per-chunk perplexity')
     parser.add_argument('--baseline', action='store_true',
@@ -496,8 +536,9 @@ def main():
     if not args.baseline and args.checkpoint is None:
         parser.error("checkpoint is required unless --baseline is used")
 
-    # Get device
-    device, dtype = get_device(args.device)
+    # Get device and dtype
+    device, dtype = get_device(args.device, args.dtype)
+    dtype_name = {torch.float16: 'fp16', torch.bfloat16: 'bf16', torch.float32: 'fp32'}.get(dtype, str(dtype))
     print("=" * 60)
     print("PERPLEXITY MEASUREMENT")
     print("=" * 60)
@@ -505,7 +546,8 @@ def main():
         print(f"Model:      {args.model} (baseline)")
     else:
         print(f"Checkpoint: {args.checkpoint}")
-    print(f"Device:     {device} ({dtype})")
+    print(f"Device:     {device}")
+    print(f"Dtype:      {dtype_name}" + (" (override)" if args.dtype != 'auto' else " (auto)"))
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
