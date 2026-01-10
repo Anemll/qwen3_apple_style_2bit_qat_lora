@@ -12,6 +12,102 @@ export PJRT_DEVICE=TPU
 PT_XLA_DEBUG=1 python scripts/train_recovery_lora.py --tpu ...
 ```
 
+## Explicit TPU Control (Notebooks)
+
+For Colab notebooks, use `USE_TPU` to explicitly control TPU workflow:
+
+```python
+# Set this at the top of your notebook
+USE_TPU = True  # Set to False to force CPU/GPU
+
+# Auto-detect TPU and set PJRT_DEVICE prefix
+import os
+if USE_TPU:
+    os.environ['PJRT_DEVICE'] = 'TPU'
+    TPU_PREFIX = 'PJRT_DEVICE=TPU'
+else:
+    TPU_PREFIX = ''
+
+# Use in shell commands
+!{TPU_PREFIX} python scripts/train_v2_simple.py --tpu ...
+```
+
+**Auto-detection with fallback:**
+
+```python
+import os
+
+# Check if USE_TPU is defined, otherwise auto-detect
+try:
+    USE_TPU
+except NameError:
+    # Auto-detect: check if TPU device exists
+    USE_TPU = os.path.exists('/dev/accel0') or os.path.exists('/dev/vfio/0')
+
+if USE_TPU:
+    os.environ['PJRT_DEVICE'] = 'TPU'
+    TPU_PREFIX = 'PJRT_DEVICE=TPU'
+    TPU_FLAG = '--tpu'
+else:
+    TPU_PREFIX = ''
+    TPU_FLAG = ''
+
+print(f"USE_TPU={USE_TPU}, TPU_PREFIX='{TPU_PREFIX}'")
+
+# Use in training commands
+!{TPU_PREFIX} python scripts/train_v2_simple.py {TPU_FLAG} \
+    --config q4a4_r32 \
+    --v2-checkpoint runs/best.pt \
+    --cache-dir caches/openhermes_L128_K128 \
+    --max-steps 2000
+```
+
+**Recommended config cell (copy-paste ready):**
+
+```python
+#@title Config
+# USE_TPU options:
+#   True  = Force TPU mode
+#   False = Force CPU/GPU mode (disable TPU)
+#   Comment out (#USE_TPU) = Auto-detect TPU
+USE_TPU = True  #@param {type:"boolean"}
+
+# ============================================================================
+# TPU/Device Setup - DO NOT MODIFY BELOW
+# ============================================================================
+import os
+
+# Check if USE_TPU is defined
+try:
+    _use_tpu = USE_TPU
+except NameError:
+    # Not defined (commented out) -> auto-detect
+    _use_tpu = os.path.exists('/dev/accel0') or os.path.exists('/dev/vfio/0')
+    print(f"USE_TPU not defined, auto-detected: {_use_tpu}")
+
+if _use_tpu:
+    os.environ['PJRT_DEVICE'] = 'TPU'
+    TPU_PREFIX = 'PJRT_DEVICE=TPU'
+    TPU_FLAG = '--tpu'
+    print(f"TPU mode enabled (PJRT_DEVICE=TPU)")
+else:
+    TPU_PREFIX = ''
+    TPU_FLAG = ''
+    print("CPU/GPU mode (TPU disabled)")
+```
+
+Then use in training cells:
+
+```python
+!{TPU_PREFIX} python scripts/train_v2_simple.py {TPU_FLAG} \
+    --config q4a4_r32 \
+    --v2-checkpoint runs/best.pt \
+    --cache-dir caches/openhermes_L128_K128 \
+    --max-steps 2000 \
+    --save-steps 200 \
+    --wandb
+```
+
 ## Expected Timing
 
 | Phase | Time | Notes |
@@ -79,6 +175,32 @@ XLA compiles a new graph when tensor shapes change. To avoid recompilation:
 - Avoid dynamic shapes in loss computation
 
 ## Troubleshooting
+
+### TPU Device Busy (VFIO Lock)
+
+**Symptoms**: `RuntimeError: TPU initialization failed: open(/dev/vfio/0): Device or resource busy`
+
+**Cause**: A previous Python process still holds the TPU device handle. Common after Colab kernel crashes or interrupted training.
+
+**Solution**: Find and kill the process holding the device:
+
+```bash
+# Find process using TPU device
+sudo lsof /dev/vfio/0 2>/dev/null || sudo fuser -v /dev/vfio/0
+
+# Kill by PID
+sudo kill -9 <PID>
+```
+
+If the above commands don't show a process, the handle may be held by a zombie process. Restart the Colab runtime:
+
+```python
+# In a notebook cell
+import os
+os.kill(os.getpid(), 9)
+```
+
+Or use the Colab menu: **Runtime → Restart runtime**
 
 ### Training Stuck (No Output)
 

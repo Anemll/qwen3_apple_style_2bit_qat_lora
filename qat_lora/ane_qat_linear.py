@@ -766,12 +766,29 @@ def replace_linear_with_anemll(
         replacements.append((parent, attr, new_module, name))
 
     # --- Step 5: Apply replacements ---
+    replaced_names = []
     for parent, attr, new_module, name in replacements:
         setattr(parent, attr, new_module)
-        if verbose:
-            print(f'  [replaced] {name}')
+        replaced_names.append(name)
 
     if verbose:
+        # Group by pattern (replace layer numbers with *)
+        import re
+        patterns = {}
+        for name in replaced_names:
+            # Replace layer numbers with * for grouping
+            pattern = re.sub(r'\.layers\.(\d+)\.', '.layers.*.', name)
+            if pattern not in patterns:
+                patterns[pattern] = []
+            patterns[pattern].append(name)
+
+        # Print compact summary
+        for pattern, names in sorted(patterns.items()):
+            if len(names) > 1:
+                print(f'  [replaced] {pattern} ({len(names)} layers)')
+            else:
+                print(f'  [replaced] {names[0]}')
+
         print(f'\nReplaced {len(replacements)} layers')
 
     return len(replacements)

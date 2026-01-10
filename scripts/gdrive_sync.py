@@ -2,21 +2,26 @@
 """
 Google Drive sync utility for Colab training.
 
-Simplifies checkpoint management between Colab local storage and Google Drive.
+Simplifies checkpoint and cache management between Colab local storage and Google Drive.
 
 Usage (in Colab):
     # Mount drive first (if not already)
     from google.colab import drive
     drive.mount('/content/drive')
 
-    # Sync commands
+    # Sync runs (checkpoints)
     !python scripts/gdrive_sync.py up runs/SR-011_mlp_autosnap
     !python scripts/gdrive_sync.py down SR-011_mlp_autosnap
     !python scripts/gdrive_sync.py list
-    !python scripts/gdrive_sync.py status runs/SR-011_mlp_autosnap
+
+    # Sync caches (use --cache flag)
+    !python scripts/gdrive_sync.py up caches/alpaca_chat_L128 --cache
+    !python scripts/gdrive_sync.py down alpaca_chat_L128 --cache
+    !python scripts/gdrive_sync.py list --cache
 
 Environment variables:
-    GDRIVE_BASE: Base directory on Google Drive (default: /content/drive/MyDrive/qwen3_runs)
+    GDRIVE_BASE: Base directory for runs (default: /content/drive/MyDrive/qwen3_runs)
+    GDRIVE_CACHES: Base directory for caches (default: /content/drive/MyDrive/qwen3_caches)
 """
 
 import argparse
@@ -27,19 +32,35 @@ from pathlib import Path
 from datetime import datetime
 
 
-# Default paths
-DEFAULT_GDRIVE_BASE = "/content/drive/MyDrive/qwen3_runs"
-DEFAULT_LOCAL_BASE = "runs"
+# Default paths for runs
+DEFAULT_GDRIVE_RUNS = "/content/drive/MyDrive/qwen3_runs"
+DEFAULT_LOCAL_RUNS = "runs"
+
+# Default paths for caches
+DEFAULT_GDRIVE_CACHES = "/content/drive/MyDrive/qwen3_caches"
+DEFAULT_LOCAL_CACHES = "caches"
 
 
-def get_gdrive_base():
+def get_paths(is_cache: bool = False):
+    """Get Google Drive and local base paths based on mode."""
+    if is_cache:
+        gdrive = os.environ.get("GDRIVE_CACHES", DEFAULT_GDRIVE_CACHES)
+        local = DEFAULT_LOCAL_CACHES
+    else:
+        gdrive = os.environ.get("GDRIVE_BASE", DEFAULT_GDRIVE_RUNS)
+        local = DEFAULT_LOCAL_RUNS
+    return gdrive, local
+
+
+def get_gdrive_base(is_cache: bool = False):
     """Get Google Drive base path from env or default."""
-    return os.environ.get("GDRIVE_BASE", DEFAULT_GDRIVE_BASE)
+    gdrive, _ = get_paths(is_cache)
+    return gdrive
 
 
-def ensure_drive_mounted():
+def ensure_drive_mounted(is_cache: bool = False):
     """Check if Google Drive is mounted (Colab-specific)."""
-    gdrive_base = get_gdrive_base()
+    gdrive_base = get_gdrive_base(is_cache)
     if not os.path.exists("/content/drive"):
         print("ERROR: Google Drive not mounted!")
         print("Run this in Colab first:")
@@ -57,38 +78,49 @@ def get_run_name(path: str) -> str:
     return Path(path).name
 
 
-def list_runs(location: str = "both"):
-    """List available runs on local and/or Google Drive."""
-    gdrive_base = get_gdrive_base()
+def list_runs(location: str = "both", is_cache: bool = False):
+    """List available runs/caches on local and/or Google Drive."""
+    gdrive_base, local_base = get_paths(is_cache)
+    item_type = "CACHES" if is_cache else "RUNS"
+    file_ext = ".pt" if not is_cache else None  # Caches have subdirs, not just .pt files
 
     print("=" * 60)
-    print("AVAILABLE RUNS")
+    print(f"AVAILABLE {item_type}")
     print("=" * 60)
 
     if location in ("local", "both"):
-        print(f"\nLocal ({DEFAULT_LOCAL_BASE}/):")
-        if os.path.exists(DEFAULT_LOCAL_BASE):
-            runs = sorted(os.listdir(DEFAULT_LOCAL_BASE))
-            for run in runs:
-                run_path = os.path.join(DEFAULT_LOCAL_BASE, run)
-                if os.path.isdir(run_path):
-                    # Count checkpoints
-                    ckpts = [f for f in os.listdir(run_path) if f.endswith('.pt')]
-                    size = get_dir_size(run_path)
-                    print(f"  {run:<40} {len(ckpts):>3} ckpts  {size}")
+        print(f"\nLocal ({local_base}/):")
+        if os.path.exists(local_base):
+            items = sorted(os.listdir(local_base))
+            for item in items:
+                item_path = os.path.join(local_base, item)
+                if os.path.isdir(item_path):
+                    size = get_dir_size(item_path)
+                    if is_cache:
+                        # For caches, count files
+                        files = sum(1 for _ in Path(item_path).rglob('*') if _.is_file())
+                        print(f"  {item:<40} {files:>4} files  {size}")
+                    else:
+                        # For runs, count checkpoints
+                        ckpts = [f for f in os.listdir(item_path) if f.endswith('.pt')]
+                        print(f"  {item:<40} {len(ckpts):>3} ckpts  {size}")
         else:
-            print("  (no local runs directory)")
+            print(f"  (no local {local_base} directory)")
 
     if location in ("gdrive", "both"):
         print(f"\nGoogle Drive ({gdrive_base}/):")
         if os.path.exists(gdrive_base):
-            runs = sorted(os.listdir(gdrive_base))
-            for run in runs:
-                run_path = os.path.join(gdrive_base, run)
-                if os.path.isdir(run_path):
-                    ckpts = [f for f in os.listdir(run_path) if f.endswith('.pt')]
-                    size = get_dir_size(run_path)
-                    print(f"  {run:<40} {len(ckpts):>3} ckpts  {size}")
+            items = sorted(os.listdir(gdrive_base))
+            for item in items:
+                item_path = os.path.join(gdrive_base, item)
+                if os.path.isdir(item_path):
+                    size = get_dir_size(item_path)
+                    if is_cache:
+                        files = sum(1 for _ in Path(item_path).rglob('*') if _.is_file())
+                        print(f"  {item:<40} {files:>4} files  {size}")
+                    else:
+                        ckpts = [f for f in os.listdir(item_path) if f.endswith('.pt')]
+                        print(f"  {item:<40} {len(ckpts):>3} ckpts  {size}")
         else:
             print(f"  (directory not found: {gdrive_base})")
 
@@ -110,19 +142,21 @@ def get_dir_size(path: str) -> str:
     return f"{total:.1f} TB"
 
 
-def sync_up(local_path: str, run_name: str = None, dry_run: bool = False):
+def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cache: bool = False):
     """
-    Sync local run to Google Drive.
+    Sync local run/cache to Google Drive.
 
     Args:
-        local_path: Local run directory (e.g., 'runs/SR-011_foo')
-        run_name: Override run name on Drive (default: same as local)
+        local_path: Local directory (e.g., 'runs/SR-011_foo' or 'caches/alpaca_L128')
+        run_name: Override name on Drive (default: same as local)
         dry_run: Show what would be copied without copying
+        is_cache: If True, sync as cache (recursive); if False, sync as run (flat)
     """
-    if not ensure_drive_mounted():
+    if not ensure_drive_mounted(is_cache):
         return False
 
-    gdrive_base = get_gdrive_base()
+    gdrive_base = get_gdrive_base(is_cache)
+    item_type = "cache" if is_cache else "run"
 
     if not os.path.exists(local_path):
         print(f"ERROR: Local path not found: {local_path}")
@@ -132,33 +166,48 @@ def sync_up(local_path: str, run_name: str = None, dry_run: bool = False):
     gdrive_path = os.path.join(gdrive_base, run_name)
 
     print("=" * 60)
-    print("SYNC UP (Local -> Google Drive)")
+    print(f"SYNC UP {'CACHE' if is_cache else 'RUN'} (Local -> Google Drive)")
     print("=" * 60)
     print(f"Source:      {local_path}")
     print(f"Destination: {gdrive_path}")
 
-    # Get files to sync
-    local_files = set()
-    for f in os.listdir(local_path):
-        if os.path.isfile(os.path.join(local_path, f)):
-            local_files.add(f)
+    # Get files to sync (recursive for caches)
+    local_files = {}  # relative_path -> full_path
+    if is_cache:
+        # Recursive walk for caches
+        for root, dirs, files in os.walk(local_path):
+            for f in files:
+                full_path = os.path.join(root, f)
+                rel_path = os.path.relpath(full_path, local_path)
+                local_files[rel_path] = full_path
+    else:
+        # Flat listing for runs
+        for f in os.listdir(local_path):
+            if os.path.isfile(os.path.join(local_path, f)):
+                local_files[f] = os.path.join(local_path, f)
 
-    gdrive_files = set()
+    gdrive_files = {}
     if os.path.exists(gdrive_path):
-        for f in os.listdir(gdrive_path):
-            if os.path.isfile(os.path.join(gdrive_path, f)):
-                gdrive_files.add(f)
+        if is_cache:
+            for root, dirs, files in os.walk(gdrive_path):
+                for f in files:
+                    full_path = os.path.join(root, f)
+                    rel_path = os.path.relpath(full_path, gdrive_path)
+                    gdrive_files[rel_path] = full_path
+        else:
+            for f in os.listdir(gdrive_path):
+                if os.path.isfile(os.path.join(gdrive_path, f)):
+                    gdrive_files[f] = os.path.join(gdrive_path, f)
 
     # Find new/modified files
     to_copy = []
-    for f in local_files:
-        local_file = os.path.join(local_path, f)
-        gdrive_file = os.path.join(gdrive_path, f)
+    for rel_path, local_file in local_files.items():
+        gdrive_file = os.path.join(gdrive_path, rel_path)
 
-        if f not in gdrive_files:
-            to_copy.append((f, "new"))
+        if rel_path not in gdrive_files:
+            to_copy.append((rel_path, "new"))
         elif os.path.getmtime(local_file) > os.path.getmtime(gdrive_file):
-            to_copy.append((f, "modified"))
+            to_copy.append((rel_path, "modified"))
 
     if not to_copy:
         print("\nNo files to sync (Drive is up to date)")
@@ -166,7 +215,7 @@ def sync_up(local_path: str, run_name: str = None, dry_run: bool = False):
 
     print(f"\nFiles to sync: {len(to_copy)}")
     for f, status in to_copy:
-        size = os.path.getsize(os.path.join(local_path, f))
+        size = os.path.getsize(local_files[f])
         size_str = f"{size / 1024 / 1024:.1f} MB" if size > 1024*1024 else f"{size / 1024:.1f} KB"
         print(f"  [{status:8}] {f:<50} {size_str}")
 
@@ -179,10 +228,12 @@ def sync_up(local_path: str, run_name: str = None, dry_run: bool = False):
 
     # Copy files
     print("\nCopying...")
-    for f, status in to_copy:
-        src = os.path.join(local_path, f)
-        dst = os.path.join(gdrive_path, f)
-        print(f"  {f}...", end=" ", flush=True)
+    for rel_path, status in to_copy:
+        src = local_files[rel_path]
+        dst = os.path.join(gdrive_path, rel_path)
+        # Create subdirectories if needed (for caches)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        print(f"  {rel_path}...", end=" ", flush=True)
         shutil.copy2(src, dst)
         print("done")
 
@@ -190,66 +241,81 @@ def sync_up(local_path: str, run_name: str = None, dry_run: bool = False):
     return True
 
 
-def sync_down(run_name: str, local_path: str = None, dry_run: bool = False):
+def sync_down(run_name: str, local_path: str = None, dry_run: bool = False, is_cache: bool = False):
     """
-    Sync run from Google Drive to local.
+    Sync run/cache from Google Drive to local.
 
     Args:
-        run_name: Run name on Drive (e.g., 'SR-011_foo')
-        local_path: Local destination (default: runs/<run_name>)
+        run_name: Name on Drive (e.g., 'SR-011_foo' or 'alpaca_L128')
+        local_path: Local destination (default: runs/<name> or caches/<name>)
         dry_run: Show what would be copied without copying
+        is_cache: If True, sync as cache (recursive); if False, sync as run (flat)
     """
-    if not ensure_drive_mounted():
+    if not ensure_drive_mounted(is_cache):
         return False
 
-    gdrive_base = get_gdrive_base()
+    gdrive_base, local_base = get_paths(is_cache)
     gdrive_path = os.path.join(gdrive_base, run_name)
-    local_path = local_path or os.path.join(DEFAULT_LOCAL_BASE, run_name)
+    local_path = local_path or os.path.join(local_base, run_name)
 
+    item_type = "cache" if is_cache else "run"
     if not os.path.exists(gdrive_path):
-        print(f"ERROR: Run not found on Drive: {gdrive_path}")
-        print("\nAvailable runs:")
-        list_runs("gdrive")
+        print(f"ERROR: {item_type.title()} not found on Drive: {gdrive_path}")
+        print(f"\nAvailable {item_type}s:")
+        list_runs("gdrive", is_cache)
         return False
 
     print("=" * 60)
-    print("SYNC DOWN (Google Drive -> Local)")
+    print(f"SYNC DOWN {'CACHE' if is_cache else 'RUN'} (Google Drive -> Local)")
     print("=" * 60)
     print(f"Source:      {gdrive_path}")
     print(f"Destination: {local_path}")
 
-    # Get files to sync
-    gdrive_files = set()
-    for f in os.listdir(gdrive_path):
-        if os.path.isfile(os.path.join(gdrive_path, f)):
-            gdrive_files.add(f)
+    # Get files to sync (recursive for caches)
+    gdrive_files = {}  # relative_path -> full_path
+    if is_cache:
+        for root, dirs, files in os.walk(gdrive_path):
+            for f in files:
+                full_path = os.path.join(root, f)
+                rel_path = os.path.relpath(full_path, gdrive_path)
+                gdrive_files[rel_path] = full_path
+    else:
+        for f in os.listdir(gdrive_path):
+            if os.path.isfile(os.path.join(gdrive_path, f)):
+                gdrive_files[f] = os.path.join(gdrive_path, f)
 
-    local_files = set()
+    local_files = {}
     if os.path.exists(local_path):
-        for f in os.listdir(local_path):
-            if os.path.isfile(os.path.join(local_path, f)):
-                local_files.add(f)
+        if is_cache:
+            for root, dirs, files in os.walk(local_path):
+                for f in files:
+                    full_path = os.path.join(root, f)
+                    rel_path = os.path.relpath(full_path, local_path)
+                    local_files[rel_path] = full_path
+        else:
+            for f in os.listdir(local_path):
+                if os.path.isfile(os.path.join(local_path, f)):
+                    local_files[f] = os.path.join(local_path, f)
 
     # Find new/modified files
     to_copy = []
-    for f in gdrive_files:
-        gdrive_file = os.path.join(gdrive_path, f)
-        local_file = os.path.join(local_path, f)
+    for rel_path, gdrive_file in gdrive_files.items():
+        local_file = os.path.join(local_path, rel_path)
 
-        if f not in local_files:
-            to_copy.append((f, "new"))
+        if rel_path not in local_files:
+            to_copy.append((rel_path, "new"))
         elif os.path.getmtime(gdrive_file) > os.path.getmtime(local_file):
-            to_copy.append((f, "modified"))
+            to_copy.append((rel_path, "modified"))
 
     if not to_copy:
         print("\nNo files to sync (Local is up to date)")
         return True
 
     print(f"\nFiles to sync: {len(to_copy)}")
-    for f, status in to_copy:
-        size = os.path.getsize(os.path.join(gdrive_path, f))
+    for rel_path, status in to_copy:
+        size = os.path.getsize(gdrive_files[rel_path])
         size_str = f"{size / 1024 / 1024:.1f} MB" if size > 1024*1024 else f"{size / 1024:.1f} KB"
-        print(f"  [{status:8}] {f:<50} {size_str}")
+        print(f"  [{status:8}] {rel_path:<50} {size_str}")
 
     if dry_run:
         print("\n[DRY RUN] No files copied")
@@ -260,10 +326,12 @@ def sync_down(run_name: str, local_path: str = None, dry_run: bool = False):
 
     # Copy files
     print("\nCopying...")
-    for f, status in to_copy:
-        src = os.path.join(gdrive_path, f)
-        dst = os.path.join(local_path, f)
-        print(f"  {f}...", end=" ", flush=True)
+    for rel_path, status in to_copy:
+        src = gdrive_files[rel_path]
+        dst = os.path.join(local_path, rel_path)
+        # Create subdirectories if needed (for caches)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        print(f"  {rel_path}...", end=" ", flush=True)
         shutil.copy2(src, dst)
         print("done")
 
@@ -271,12 +339,12 @@ def sync_down(run_name: str, local_path: str = None, dry_run: bool = False):
     return True
 
 
-def show_status(local_path: str):
+def show_status(local_path: str, is_cache: bool = False):
     """Show sync status between local and Drive."""
-    if not ensure_drive_mounted():
+    if not ensure_drive_mounted(is_cache):
         return
 
-    gdrive_base = get_gdrive_base()
+    gdrive_base = get_gdrive_base(is_cache)
     run_name = get_run_name(local_path)
     gdrive_path = os.path.join(gdrive_base, run_name)
 
@@ -294,26 +362,46 @@ def show_status(local_path: str):
         print("\nBoth paths not found!")
         return
 
-    # Collect all files
+    # Collect all files (recursive for caches)
     local_files = {}
     if local_exists:
-        for f in os.listdir(local_path):
-            fp = os.path.join(local_path, f)
-            if os.path.isfile(fp):
-                local_files[f] = {
-                    'mtime': os.path.getmtime(fp),
-                    'size': os.path.getsize(fp)
-                }
+        if is_cache:
+            for root, dirs, files in os.walk(local_path):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    rel_path = os.path.relpath(fp, local_path)
+                    local_files[rel_path] = {
+                        'mtime': os.path.getmtime(fp),
+                        'size': os.path.getsize(fp)
+                    }
+        else:
+            for f in os.listdir(local_path):
+                fp = os.path.join(local_path, f)
+                if os.path.isfile(fp):
+                    local_files[f] = {
+                        'mtime': os.path.getmtime(fp),
+                        'size': os.path.getsize(fp)
+                    }
 
     gdrive_files = {}
     if gdrive_exists:
-        for f in os.listdir(gdrive_path):
-            fp = os.path.join(gdrive_path, f)
-            if os.path.isfile(fp):
-                gdrive_files[f] = {
-                    'mtime': os.path.getmtime(fp),
-                    'size': os.path.getsize(fp)
-                }
+        if is_cache:
+            for root, dirs, files in os.walk(gdrive_path):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    rel_path = os.path.relpath(fp, gdrive_path)
+                    gdrive_files[rel_path] = {
+                        'mtime': os.path.getmtime(fp),
+                        'size': os.path.getsize(fp)
+                    }
+        else:
+            for f in os.listdir(gdrive_path):
+                fp = os.path.join(gdrive_path, f)
+                if os.path.isfile(fp):
+                    gdrive_files[f] = {
+                        'mtime': os.path.getmtime(fp),
+                        'size': os.path.getsize(fp)
+                    }
 
     all_files = sorted(set(local_files.keys()) | set(gdrive_files.keys()))
 
@@ -396,7 +484,7 @@ def resume_path(run_name: str) -> str:
         return None
 
     gdrive_base = get_gdrive_base()
-    local_path = os.path.join(DEFAULT_LOCAL_BASE, run_name)
+    local_path = os.path.join(DEFAULT_LOCAL_RUNS, run_name)
     gdrive_path = os.path.join(gdrive_base, run_name)
 
     local_latest = find_latest_checkpoint(local_path)
@@ -467,32 +555,42 @@ Examples:
   # Dry run (show what would be synced)
   python scripts/gdrive_sync.py up runs/SR-011_mlp_autosnap --dry-run
 
+  # Sync caches (use --cache flag)
+  python scripts/gdrive_sync.py up caches/alpaca_L128 --cache
+  python scripts/gdrive_sync.py down alpaca_L128 --cache
+  python scripts/gdrive_sync.py list --cache
+
 Environment:
-  GDRIVE_BASE: Google Drive base path (default: /content/drive/MyDrive/qwen3_runs)
+  GDRIVE_BASE: Google Drive base path for runs (default: /content/drive/MyDrive/qwen3_runs)
+  GDRIVE_CACHES: Google Drive base path for caches (default: /content/drive/MyDrive/qwen3_caches)
 """
     )
 
     subparsers = parser.add_subparsers(dest='command', help='Command')
 
     # list
-    list_parser = subparsers.add_parser('list', help='List available runs')
+    list_parser = subparsers.add_parser('list', help='List available runs or caches')
     list_parser.add_argument('--location', choices=['local', 'gdrive', 'both'], default='both')
+    list_parser.add_argument('--cache', action='store_true', help='List caches instead of runs')
 
     # up (sync local -> drive)
-    up_parser = subparsers.add_parser('up', help='Sync local run to Google Drive')
-    up_parser.add_argument('local_path', help='Local run directory (e.g., runs/SR-011_foo)')
-    up_parser.add_argument('--name', help='Override run name on Drive')
+    up_parser = subparsers.add_parser('up', help='Sync local run/cache to Google Drive')
+    up_parser.add_argument('local_path', help='Local directory (e.g., runs/SR-011_foo or caches/alpaca_L128)')
+    up_parser.add_argument('--name', help='Override name on Drive')
     up_parser.add_argument('--dry-run', action='store_true', help='Show what would be synced')
+    up_parser.add_argument('--cache', action='store_true', help='Sync as cache (recursive) instead of run')
 
     # down (sync drive -> local)
-    down_parser = subparsers.add_parser('down', help='Sync run from Google Drive to local')
-    down_parser.add_argument('run_name', help='Run name on Drive (e.g., SR-011_foo)')
+    down_parser = subparsers.add_parser('down', help='Sync run/cache from Google Drive to local')
+    down_parser.add_argument('run_name', help='Name on Drive (e.g., SR-011_foo or alpaca_L128)')
     down_parser.add_argument('--local', help='Local destination path')
     down_parser.add_argument('--dry-run', action='store_true', help='Show what would be synced')
+    down_parser.add_argument('--cache', action='store_true', help='Sync as cache (recursive) instead of run')
 
     # status
     status_parser = subparsers.add_parser('status', help='Show sync status')
-    status_parser.add_argument('local_path', help='Local run directory')
+    status_parser.add_argument('local_path', help='Local directory')
+    status_parser.add_argument('--cache', action='store_true', help='Check cache status instead of run')
 
     # resume
     resume_parser = subparsers.add_parser('resume', help='Get resume checkpoint path')
@@ -501,13 +599,13 @@ Environment:
     args = parser.parse_args()
 
     if args.command == 'list':
-        list_runs(args.location)
+        list_runs(args.location, args.cache)
     elif args.command == 'up':
-        sync_up(args.local_path, args.name, args.dry_run)
+        sync_up(args.local_path, args.name, args.dry_run, args.cache)
     elif args.command == 'down':
-        sync_down(args.run_name, args.local, args.dry_run)
+        sync_down(args.run_name, args.local, args.dry_run, args.cache)
     elif args.command == 'status':
-        show_status(args.local_path)
+        show_status(args.local_path, args.cache)
     elif args.command == 'resume':
         path = resume_path(args.run_name)
         if path:

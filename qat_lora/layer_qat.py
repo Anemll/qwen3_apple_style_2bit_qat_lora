@@ -1443,7 +1443,6 @@ def train_e2e(
                 project=wandb_project,
                 name=wandb_run_name,
                 config=run_config,
-                reinit=True,
                 resume="allow",  # Allow resuming if run was interrupted (Colab restarts)
             )
             if verbose:
@@ -2225,7 +2224,7 @@ def train_e2e(
                         if audit_result.get('disabled'):
                             snap_log['auto_snap/disabled'] = 1
                             snap_log['auto_snap/disable_reason'] = audit_result.get('disable_reason', 'unknown')
-                        wandb.log(snap_log, step=step)
+                        wandb.log(snap_log, step=optimizer_step)
 
                     # Save audit JSON if enabled
                     if auto_snap_state.log_json:
