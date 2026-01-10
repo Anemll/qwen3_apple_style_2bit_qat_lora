@@ -1443,6 +1443,10 @@ def train_e2e(
     import os
     from torch.optim import AdamW
     from torch.utils.data import DataLoader
+    from .mem_debug import mem_log, print_attn_info
+
+    # Memory debug config shorthand (used throughout function)
+    _mem_cfg = mem_debug_config
 
     t_start = time.time()
 
@@ -1851,10 +1855,6 @@ def train_e2e(
     # Create dataset ONCE with preload for fast training
     # (avoids torch.load I/O every batch)
     dataset = KDCacheDataset(cache_dir, shuffle=True, preload=True)
-
-    # Memory debug helper (import here to avoid circular deps)
-    from .mem_debug import mem_log, print_attn_info
-    _mem_cfg = mem_debug_config  # Shorthand
 
     # TPU warmup: precompile XLA graph before timing starts
     if is_tpu and verbose:
