@@ -341,6 +341,14 @@ def compute_kd_loss_batch(
     if _dbg:
         print(f"    [kd_loss] step={debug_step} model.model() done ({_time.time()-_t0:.1f}s), hidden.shape={hidden.shape}", flush=True)
 
+    # NaN detection for debugging
+    if hidden.isnan().any() or hidden.isinf().any():
+        nan_count = hidden.isnan().sum().item()
+        inf_count = hidden.isinf().sum().item()
+        print(f"[NaN DEBUG] hidden has {nan_count} NaN, {inf_count} inf values!")
+        print(f"[NaN DEBUG] hidden shape={hidden.shape}, dtype={hidden.dtype}")
+        print(f"[NaN DEBUG] hidden range: [{hidden[~hidden.isnan() & ~hidden.isinf()].min():.4f}, {hidden[~hidden.isnan() & ~hidden.isinf()].max():.4f}]" if (~hidden.isnan() & ~hidden.isinf()).any() else "[NaN DEBUG] All values are NaN/inf!")
+
     B, S, H = hidden.shape
 
     # Only compute logits for top-k
@@ -354,6 +362,18 @@ def compute_kd_loss_batch(
     w = model.lm_head.weight[idx]  # [N, K, H]
     student_topk = torch.einsum('nh,nkh->nk', h, w).view(B, seq_len, K)
 
+    # NaN detection for student logits
+    if student_topk.isnan().any() or student_topk.isinf().any():
+        nan_count = student_topk.isnan().sum().item()
+        inf_count = student_topk.isinf().sum().item()
+        print(f"[NaN DEBUG] student_topk has {nan_count} NaN, {inf_count} inf values!")
+        print(f"[NaN DEBUG] student_topk shape={student_topk.shape}, dtype={student_topk.dtype}")
+        # Check if h or w is the culprit
+        if h.isnan().any() or h.isinf().any():
+            print(f"[NaN DEBUG] h (hidden) has NaN/inf")
+        if w.isnan().any() or w.isinf().any():
+            print(f"[NaN DEBUG] w (lm_head weights) has NaN/inf")
+
     # KL divergence with temperature (per-token, matching progressive training)
     t_logits = topk_logits[:, :seq_len, :]
     teacher_probs = F.softmax(t_logits / temperature, dim=-1)
@@ -363,6 +383,22 @@ def compute_kd_loss_batch(
     # KL = sum over K dimension, then mean over B*S tokens
     kl_per_token = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)  # [B, S]
     kl_loss = kl_per_token.mean() * (temperature ** 2)
+
+    # NaN detection for KL loss
+    if kl_loss.isnan() or kl_loss.isinf():
+        print(f"[NaN DEBUG] kl_loss is {kl_loss.item()}")
+        if teacher_probs.isnan().any() or teacher_probs.isinf().any():
+            print(f"[NaN DEBUG] teacher_probs has NaN/inf")
+        if teacher_log_probs.isnan().any() or teacher_log_probs.isinf().any():
+            print(f"[NaN DEBUG] teacher_log_probs has NaN/inf")
+        if student_log_probs.isnan().any() or student_log_probs.isinf().any():
+            nan_slp = student_log_probs.isnan().sum().item()
+            inf_slp = student_log_probs.isinf().sum().item()
+            print(f"[NaN DEBUG] student_log_probs has {nan_slp} NaN, {inf_slp} inf")
+        if kl_per_token.isnan().any() or kl_per_token.isinf().any():
+            nan_kl = kl_per_token.isnan().sum().item()
+            inf_kl = kl_per_token.isinf().sum().item()
+            print(f"[NaN DEBUG] kl_per_token has {nan_kl} NaN, {inf_kl} inf")
 
     total_loss = kl_loss
 
@@ -1258,6 +1294,7 @@ def train_e2e(
     train_scales: bool = False,
     train_g_only: bool = False,
     train_mlp_only: bool = False,
+    train_attn_only: bool = False,
     freeze_mags: bool = False,
     freeze_mags_mlp: bool = False,
     freeze_all: bool = False,
@@ -1312,6 +1349,8 @@ def train_e2e(
                     Nothing trains. Use for FP16 snap verification.
         train_mlp_only: If True, freeze attention layers (q/k/v/o_proj) and only train MLP
                         (gate/up/down_proj). Useful for mixed-bit configs (e.g., 4-bit attn, 2-bit MLP)
+        train_attn_only: If True, freeze MLP layers (gate/up/down_proj) and only train attention
+                        (q/k/v/o_proj). Useful for 2-phase training: Phase 1 trains MLP, Phase 2 trains attn.
         hard_top1_weight: Weight for hard label top-1 loss (0 to disable), or start weight if annealing
         hard_top1_end: End weight for hard_top1 annealing (None = no annealing, use fixed weight)
         hard_full_weight: Weight for hard label full vocab loss (default 0.0005, helps stability)
@@ -1416,15 +1455,21 @@ def train_e2e(
             use_wandb = False
 
     # Set trainable parameters
+    # Validate mutually exclusive flags
+    if train_mlp_only and train_attn_only:
+        raise ValueError("Cannot use both --mlp-only and --attn-only. Choose one.")
+
     trainable = 0
     attn_frozen = 0
+    mlp_frozen = 0
     mags_snapped = 0
     scales_snapped = 0
     for p in model.parameters():
         p.requires_grad = False
 
-    # Attention projection names to freeze when train_mlp_only=True
+    # Projection names for selective training
     attn_proj_names = ('q_proj', 'k_proj', 'v_proj', 'o_proj')
+    mlp_proj_names = ('gate_proj', 'up_proj', 'down_proj')
 
     for name, module in model.named_modules():
         if type(module).__name__ in ('AnemllQATLinear', 'AnemllQATLinearV2'):
@@ -1439,6 +1484,17 @@ def train_e2e(
                 # V2 has rank_magnitude
                 if hasattr(module, 'rank_magnitude') and module.rank_magnitude is not None:
                     attn_frozen += module.rank_magnitude.numel()
+                continue  # Keep frozen
+
+            # Skip MLP layers if train_attn_only
+            is_mlp_proj = any(proj in name for proj in mlp_proj_names)
+            if train_attn_only and is_mlp_proj:
+                mlp_frozen += module.weight.numel()
+                if hasattr(module, 'scale_A') and module.scale_A is not None:
+                    mlp_frozen += module.scale_A.numel() + module.scale_B.numel()
+                # V2 has rank_magnitude
+                if hasattr(module, 'rank_magnitude') and module.rank_magnitude is not None:
+                    mlp_frozen += module.rank_magnitude.numel()
                 continue  # Keep frozen
 
             if train_weights:
@@ -1497,6 +1553,8 @@ def train_e2e(
         mode = "+".join(mode_parts) if mode_parts else "none"
         if train_mlp_only:
             mode += " (MLP only)"
+        elif train_attn_only:
+            mode += " (Attn only)"
 
     if verbose:
         print(f"=== End-to-End KD-QAT ===")
@@ -1508,6 +1566,8 @@ def train_e2e(
         print(f"Trainable params: {trainable:,}")
         if train_mlp_only:
             print(f"Frozen attention params: {attn_frozen:,}")
+        elif train_attn_only:
+            print(f"Frozen MLP params: {mlp_frozen:,}")
         if scales_snapped > 0:
             print(f"Snapped & frozen scales: {scales_snapped} layers")
         if mags_snapped > 0:

@@ -42,7 +42,7 @@ class AutoSnapState:
 
     # Configuration (from CLI)
     enabled: bool = False
-    target: str = 'mlp'  # 'mlp' or 'all'
+    target: str = 'mlp'  # 'mlp', 'attn', or 'all'
     threshold: float = 0.05  # Max abs delta between saves
     patience: int = 2  # Consecutive stable saves required
     start_step: int = 0  # Don't audit before this step
@@ -88,13 +88,14 @@ def extract_rank_magnitudes(
 
     Args:
         state_dict: Model state dict (must be on CPU)
-        target: 'mlp' for MLP layers only, 'all' for all V2 layers
+        target: 'mlp' for MLP layers only, 'attn' for attention only, 'all' for all V2 layers
 
     Returns:
         Dict mapping key -> FP32 CPU tensor
     """
     mags = {}
     mlp_proj_names = ('gate_proj', 'up_proj', 'down_proj')
+    attn_proj_names = ('q_proj', 'k_proj', 'v_proj', 'o_proj')
 
     for key, tensor in state_dict.items():
         if not key.endswith('.rank_magnitude'):
@@ -104,6 +105,10 @@ def extract_rank_magnitudes(
         if target == 'mlp':
             if not any(proj in key for proj in mlp_proj_names):
                 continue
+        elif target == 'attn':
+            if not any(proj in key for proj in attn_proj_names):
+                continue
+        # target == 'all' -> no filtering
 
         # Convert to FP32 CPU for comparison
         mags[key] = tensor.detach().float().cpu()
@@ -267,8 +272,8 @@ def audit_mags_movement(
     if prev_count != curr_count:
         reason = f"key_count_mismatch:{prev_count}→{curr_count}"
         if verbose:
-            print(f"[AutoSnap] ABORT: Key count changed ({prev_count} → {curr_count})")
-            print(f"[AutoSnap] Auto-snap disabled for this run")
+            print(f"\033[1;31m[AutoSnap] ABORT: Key count changed ({prev_count} → {curr_count})\033[0m")
+            print(f"\033[31m[AutoSnap] Auto-snap disabled for this run\033[0m")
         state.enabled = False  # Disable for rest of run
         state.disable_reason = reason
         return {'should_freeze': False, 'movement_metrics': None, 'snap_metrics': snap_metrics, 'disabled': True, 'disable_reason': reason}
@@ -283,8 +288,8 @@ def audit_mags_movement(
     if math.isnan(movement['max_abs_delta']) or math.isinf(movement['max_abs_delta']):
         reason = f"nan_inf_delta:{movement['max_abs_delta']}"
         if verbose:
-            print(f"[AutoSnap] ABORT: NaN/Inf detected in movement metrics")
-            print(f"[AutoSnap] Auto-snap disabled for this run")
+            print(f"\033[1;31m[AutoSnap] ABORT: NaN/Inf detected in movement metrics\033[0m")
+            print(f"\033[31m[AutoSnap] Auto-snap disabled for this run\033[0m")
         state.enabled = False  # Disable for rest of run
         state.disable_reason = reason
         return {'should_freeze': False, 'movement_metrics': movement, 'snap_metrics': snap_metrics, 'disabled': True, 'disable_reason': reason}
@@ -332,9 +337,10 @@ def audit_mags_movement(
     )
 
     if should_freeze and verbose:
-        print(f"[AutoSnap] *** TRIGGER: {state.stable_count} consecutive stable audits ***")
+        # ANSI colors: green=32, yellow=33, bold=1, reset=0
+        print(f"\033[1;32m[AutoSnap] *** TRIGGER: {state.stable_count} consecutive stable audits ***\033[0m")
         if state.dry_run:
-            print(f"[AutoSnap] Dry run mode - would freeze but skipping")
+            print(f"\033[33m[AutoSnap] Dry run mode - would freeze but skipping\033[0m")
 
     # Update prev for next audit
     state.prev_mags_cpu = curr_mags
@@ -362,13 +368,14 @@ def apply_auto_snap_and_freeze(
     Args:
         model: Model with AnemllQATLinearV2 layers
         optimizer: Current optimizer (will be rebuilt)
-        target: 'mlp' for MLP layers only, 'all' for all V2 layers
+        target: 'mlp' for MLP layers only, 'attn' for attention only, 'all' for all V2 layers
         verbose: Print progress
 
     Returns:
         Tuple of (num_frozen, new_optimizer)
     """
     mlp_proj_names = ('gate_proj', 'up_proj', 'down_proj')
+    attn_proj_names = ('q_proj', 'k_proj', 'v_proj', 'o_proj')
 
     frozen_count = 0
     frozen_params = set()
@@ -384,6 +391,10 @@ def apply_auto_snap_and_freeze(
         if target == 'mlp':
             if not any(proj in name for proj in mlp_proj_names):
                 continue
+        elif target == 'attn':
+            if not any(proj in name for proj in attn_proj_names):
+                continue
+        # target == 'all' -> no filtering
 
         # CPU-based FP16 snap (critical for TPU/XLA)
         with torch.no_grad():
@@ -402,7 +413,7 @@ def apply_auto_snap_and_freeze(
         frozen_count += 1
 
     if verbose:
-        print(f"[AutoSnap] Snapped and froze {frozen_count} rank_magnitude tensors (target={target})")
+        print(f"\033[1;32m[AutoSnap] ✓ Snapped and froze {frozen_count} rank_magnitude tensors (target={target})\033[0m")
 
     # Rebuild optimizer to exclude frozen params
     # Get current optimizer settings
@@ -415,7 +426,7 @@ def apply_auto_snap_and_freeze(
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     if verbose:
-        print(f"[AutoSnap] Rebuilding optimizer with {len(trainable_params)} trainable params")
+        print(f"\033[32m[AutoSnap] Rebuilding optimizer with {len(trainable_params)} trainable params\033[0m")
         print(f"[AutoSnap] Note: This may trigger one TPU recompilation")
 
     # Create new optimizer
@@ -470,6 +481,7 @@ def validate_auto_snap_config(
     freeze_all: bool,
     g_only: bool,
     save_steps: int,
+    auto_snap_target: str = 'mlp',
 ) -> Tuple[bool, str]:
     """
     Validate auto-snap configuration for conflicts.
@@ -483,8 +495,9 @@ def validate_auto_snap_config(
     # Check conflicts
     if freeze_mags:
         return False, "--auto-snap-mags conflicts with --freeze-mags"
-    if freeze_mags_mlp:
-        return False, "--auto-snap-mags conflicts with --freeze-mags-mlp"
+    # Allow --freeze-mags-mlp with --auto-snap-target attn (2-phase training)
+    if freeze_mags_mlp and auto_snap_target != 'attn':
+        return False, "--auto-snap-mags conflicts with --freeze-mags-mlp (unless --auto-snap-target attn)"
     if freeze_all:
         return False, "--auto-snap-mags conflicts with --freeze-all"
     if g_only:

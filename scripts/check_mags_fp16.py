@@ -221,6 +221,127 @@ def main():
     print(f"  range: [{sample.min():.4f}, {sample.max():.4f}]")
     print(f"  first 5: {sample.flatten()[:5].tolist()}")
 
+    # =========================================================================
+    # WEIGHT FP16 CHECK
+    # =========================================================================
+    print(f"\n" + "=" * 60)
+    print("WEIGHT FP16 PRECISION CHECK")
+    print("=" * 60)
+
+    # Find QAT weight keys (not LoRA, not embeddings)
+    weight_keys = [k for k in state_dict.keys()
+                   if k.endswith('.weight')
+                   and 'lora_' not in k
+                   and ('mlp.' in k or 'self_attn.' in k)]
+    print(f"Found {len(weight_keys)} QAT weight tensors")
+
+    weight_mlp_snapped = 0
+    weight_mlp_total = 0
+    weight_attn_snapped = 0
+    weight_attn_total = 0
+
+    for key in weight_keys:
+        val = state_dict[key].float()
+        snapped = val.cpu().half().float()
+        max_diff = (val - snapped).abs().max().item()
+        is_snapped = max_diff == 0.0
+
+        is_mlp = any(p in key for p in ['gate_proj', 'up_proj', 'down_proj'])
+        if is_mlp:
+            weight_mlp_total += 1
+            if is_snapped:
+                weight_mlp_snapped += 1
+        else:
+            weight_attn_total += 1
+            if is_snapped:
+                weight_attn_snapped += 1
+
+    print(f"MLP weights:  {weight_mlp_snapped}/{weight_mlp_total} snapped")
+    print(f"ATTN weights: {weight_attn_snapped}/{weight_attn_total} snapped")
+
+    # =========================================================================
+    # FINAL SUMMARY (with colors)
+    # =========================================================================
+    print(f"\n" + "=" * 60)
+    print("\033[1;36mFINAL SUMMARY\033[0m")  # Bold cyan
+    print("=" * 60)
+
+    # Categorize mags by MLP vs ATTN
+    mag_mlp_snapped = 0
+    mag_mlp_total = 0
+    mag_attn_snapped = 0
+    mag_attn_total = 0
+
+    for key in mag_keys:
+        val = state_dict[key].float()
+        snapped = val.cpu().half().float()
+        max_diff = (val - snapped).abs().max().item()
+        is_snapped = max_diff == 0.0
+
+        is_mlp = any(p in key for p in ['gate_proj', 'up_proj', 'down_proj'])
+        if is_mlp:
+            mag_mlp_total += 1
+            if is_snapped:
+                mag_mlp_snapped += 1
+        else:
+            mag_attn_total += 1
+            if is_snapped:
+                mag_attn_snapped += 1
+
+    # Categorize LUTs by MLP vs ATTN
+    lut_mlp_snapped = 0
+    lut_mlp_total = 0
+    lut_attn_snapped = 0
+    lut_attn_total = 0
+
+    for key in lut_keys:
+        val = state_dict[key].float()
+        snapped = val.cpu().half().float()
+        max_diff = (val - snapped).abs().max().item()
+        is_snapped = max_diff == 0.0
+
+        is_mlp = any(p in key for p in ['gate_proj', 'up_proj', 'down_proj'])
+        if is_mlp:
+            lut_mlp_total += 1
+            if is_snapped:
+                lut_mlp_snapped += 1
+        else:
+            lut_attn_total += 1
+            if is_snapped:
+                lut_attn_snapped += 1
+
+    def status_str(snapped, total):
+        """Return colored status string."""
+        if total == 0:
+            return "\033[33mN/A\033[0m"  # Yellow
+        elif snapped == total:
+            return f"\033[1;32mall snapped ✓\033[0m ({snapped}/{total})"  # Bold green
+        else:
+            return f"\033[1;31mNOT snapped ✗\033[0m ({snapped}/{total})"  # Bold red
+
+    print(f"  mags MLP:     {status_str(mag_mlp_snapped, mag_mlp_total)}")
+    print(f"  mags ATTN:    {status_str(mag_attn_snapped, mag_attn_total)}")
+    print(f"  LUTs MLP:     {status_str(lut_mlp_snapped, lut_mlp_total)}")
+    print(f"  LUTs ATTN:    {status_str(lut_attn_snapped, lut_attn_total)}")
+    print(f"  weights MLP:  {status_str(weight_mlp_snapped, weight_mlp_total)}")
+    print(f"  weights ATTN: {status_str(weight_attn_snapped, weight_attn_total)}")
+
+    # Overall status
+    all_snapped = (
+        mag_mlp_snapped == mag_mlp_total and
+        mag_attn_snapped == mag_attn_total and
+        lut_mlp_snapped == lut_mlp_total and
+        lut_attn_snapped == lut_attn_total and
+        weight_mlp_snapped == weight_mlp_total and
+        weight_attn_snapped == weight_attn_total
+    )
+
+    print()
+    if all_snapped:
+        print("\033[1;32m✓ CHECKPOINT FULLY FP16-SNAPPED\033[0m")
+    else:
+        print("\033[1;31m✗ CHECKPOINT NOT FULLY SNAPPED\033[0m")
+
 
 if __name__ == '__main__':
     main()

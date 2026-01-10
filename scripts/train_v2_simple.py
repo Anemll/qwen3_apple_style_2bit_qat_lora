@@ -82,6 +82,7 @@ def main():
     parser.add_argument('--freeze-all', action='store_true',
                         help='Snap + freeze ALL V2 params (scale_A, scale_B, rank_magnitude) for FP16 export. Nothing trains.')
     parser.add_argument('--mlp-only', action='store_true', help='Train only MLP layers, freeze attention')
+    parser.add_argument('--attn-only', action='store_true', help='Train only attention layers, freeze MLP (for 2-phase training)')
     parser.add_argument('--save-steps', type=int, default=0, help='Save checkpoint every N steps (0=disabled)')
     parser.add_argument('--keep-checkpoints', type=int, default=0,
                         help='Keep only the last N checkpoints (0=keep all). Useful for long runs.')
@@ -139,8 +140,8 @@ def main():
     # Auto snap+freeze rank_magnitude (CPU audit at save checkpoints)
     parser.add_argument('--auto-snap-mags', action='store_true',
                         help='Enable auto snap+freeze of rank_magnitude when stable (CPU audit at saves)')
-    parser.add_argument('--auto-snap-target', type=str, default='mlp', choices=['mlp', 'all'],
-                        help='Target layers for auto-snap: mlp (84 layers) or all (196 layers)')
+    parser.add_argument('--auto-snap-target', type=str, default='mlp', choices=['mlp', 'attn', 'all'],
+                        help='Target layers for auto-snap: mlp (84 layers), attn (112 layers), or all (196 layers)')
     parser.add_argument('--auto-snap-threshold', type=float, default=0.05,
                         help='Max abs delta between saves to consider stable (default: 0.05)')
     parser.add_argument('--auto-snap-patience', type=int, default=2,
@@ -173,8 +174,9 @@ def main():
         # Check conflicts manually before AutoSnapState import
         if args.freeze_mags:
             raise ValueError("--auto-snap-mags conflicts with --freeze-mags")
-        if args.freeze_mags_mlp:
-            raise ValueError("--auto-snap-mags conflicts with --freeze-mags-mlp")
+        # Allow --freeze-mags-mlp with --auto-snap-target attn (2-phase training)
+        if args.freeze_mags_mlp and args.auto_snap_target != 'attn':
+            raise ValueError("--auto-snap-mags conflicts with --freeze-mags-mlp (unless --auto-snap-target attn)")
         if args.freeze_all:
             raise ValueError("--auto-snap-mags conflicts with --freeze-all")
         if args.g_only:
@@ -584,7 +586,8 @@ def main():
             log_json=args.auto_snap_log_json,
         )
         print(f"\n[AutoSnap] Enabled:")
-        print(f"  Target: {args.auto_snap_target} ({'84' if args.auto_snap_target == 'mlp' else '196'} layers)")
+        target_layers = {'mlp': 84, 'attn': 112, 'all': 196}.get(args.auto_snap_target, 196)
+        print(f"  Target: {args.auto_snap_target} ({target_layers} layers)")
         print(f"  Threshold: {args.auto_snap_threshold} (max abs delta)")
         print(f"  Patience: {args.auto_snap_patience} consecutive stable saves")
         print(f"  Start step: {args.auto_snap_start_step}")
@@ -624,6 +627,7 @@ def main():
         train_scales=True,
         train_g_only=args.g_only,
         train_mlp_only=args.mlp_only,
+        train_attn_only=args.attn_only,
         freeze_mags=args.freeze_mags,
         freeze_mags_mlp=args.freeze_mags_mlp,
         freeze_all=args.freeze_all,

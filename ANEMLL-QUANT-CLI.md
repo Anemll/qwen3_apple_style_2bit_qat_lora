@@ -714,7 +714,7 @@ python scripts/train_v2_simple.py \
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--auto-snap-mags` | False | Enable auto snap+freeze |
-| `--auto-snap-target` | mlp | Target: `mlp` (84 layers) or `all` (196 layers) |
+| `--auto-snap-target` | mlp | Target: `mlp` (84), `attn` (112), or `all` (196) |
 | `--auto-snap-threshold` | 0.05 | Max abs delta between saves for stability |
 | `--auto-snap-patience` | 2 | Consecutive stable saves before triggering |
 | `--auto-snap-start-step` | 100 | Don't audit before this step |
@@ -724,7 +724,7 @@ python scripts/train_v2_simple.py \
 
 **Conflicts:** `--auto-snap-mags` cannot be used with:
 - `--freeze-mags` (already frozen at start)
-- `--freeze-mags-mlp` (already frozen at start)
+- `--freeze-mags-mlp` (unless `--auto-snap-target attn` for 2-phase training)
 - `--freeze-all` (nothing to snap)
 - `--g-only` (auto-snap targets mags)
 
@@ -744,6 +744,23 @@ python scripts/train_v2_simple.py \
 - `auto_snap/frozen_step`, `auto_snap/frozen_count` - when triggered
 
 **TPU/XLA safety:** Audit uses CPU tensors from checkpoint save, avoiding XLA lazy tensor reads.
+
+**2-Phase Training Example:**
+```bash
+# Phase 1: MLP training with auto-snap MLP mags
+python scripts/train_v2_simple.py \
+    --v2-checkpoint best.pt \
+    --mlp-only \
+    --auto-snap-mags --auto-snap-target mlp \
+    --save-steps 200
+
+# Phase 2: Attention training with frozen MLP mags + auto-snap attn mags
+python scripts/train_v2_simple.py \
+    --v2-checkpoint phase1_best.pt \
+    --freeze-mags-mlp \
+    --auto-snap-mags --auto-snap-target attn \
+    --save-steps 200
+```
 
 ---
 

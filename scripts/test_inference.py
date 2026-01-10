@@ -43,6 +43,8 @@ def parse_args():
                         help='Sampling temperature (default: 0.6)')
     parser.add_argument('--repetition-penalty', type=float, default=1.1,
                         help='Repetition penalty (default: 1.1)')
+    parser.add_argument('--sample', action='store_true',
+                        help='Use sampling instead of greedy (non-deterministic, uses temperature/top_p)')
     parser.add_argument('--no-thinking', action='store_true',
                         help='Disable thinking mode (use chat template without <think>)')
     parser.add_argument('--no-template', action='store_true',
@@ -412,15 +414,25 @@ def generate(model, tokenizer, device, prompt, args, template_mode=None):
         print(f"[DEBUG] Input tokens: {inputs['input_ids'].shape[1]}")
 
     with torch.no_grad():
-        output = model.generate(
-            **inputs,
-            max_new_tokens=args.max_tokens,
-            do_sample=True,
-            temperature=args.temperature,
-            top_p=0.9,
-            repetition_penalty=args.repetition_penalty,
-            pad_token_id=tokenizer.eos_token_id,
-        )
+        # Greedy decoding by default (deterministic), sampling with --sample
+        if args.sample:
+            output = model.generate(
+                **inputs,
+                max_new_tokens=args.max_tokens,
+                do_sample=True,
+                temperature=args.temperature,
+                top_p=0.9,
+                repetition_penalty=args.repetition_penalty,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        else:
+            output = model.generate(
+                **inputs,
+                max_new_tokens=args.max_tokens,
+                do_sample=False,
+                repetition_penalty=args.repetition_penalty,
+                pad_token_id=tokenizer.eos_token_id,
+            )
 
     response = tokenizer.decode(
         output[0][inputs['input_ids'].shape[1]:],
