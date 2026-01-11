@@ -1820,8 +1820,11 @@ def train_e2e(
 
         # Memory debug: after anchor model init (BEFORE freeing, shows peak with anchor model)
         if _mem_cfg:
+            # Use sparse shape if no_full_logits, otherwise full logits shape
+            logits_shape = list(anchor_topk_logits.shape) if no_full_logits else list(anchor_logits.shape)
             mem_log(_mem_cfg, 'after_anchor_init', micro_step=0, opt_step=0, phase='init',
-                    extra={'anchor_samples': anchor_samples, 'anchor_logits_shape': list(anchor_logits.shape)})
+                    extra={'anchor_samples': anchor_samples, 'anchor_logits_shape': logits_shape,
+                           'anchor_mode': 'sparse' if no_full_logits else 'full'})
 
         # Free anchor model memory (we only need the cached logits)
         del anchor_model
