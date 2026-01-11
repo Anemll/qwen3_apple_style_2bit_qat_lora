@@ -2327,7 +2327,7 @@ def train_e2e(
             # Evaluation (skip if eval_samples <= 0 or None, e.g., on TPU)
             # Check every eval_steps optimizer steps
             eval_interval = eval_steps * accumulation_steps
-            if step % eval_interval == 0 and step > 0 and eval_samples and eval_samples > 0:
+            if eval_interval > 0 and step % eval_interval == 0 and step > 0 and eval_samples and eval_samples > 0:
                 model.eval()
                 eval_loss = evaluate_kd_loss(model, cache_dir, device, num_samples=eval_samples, temperature=temperature)
                 elapsed = time.time() - t_start
