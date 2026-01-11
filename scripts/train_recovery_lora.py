@@ -228,6 +228,19 @@ def main():
     parser.add_argument("--anchor-samples", type=int, default=32,
                        help="Number of anchor samples for KL")
 
+    # Sparse logits mode (TPU memory safety for L>=1024)
+    parser.add_argument("--no-full-logits", action="store_true",
+                       help="Prevent any full-vocab [B,L,V] logits materialization. "
+                            "Forces hard_top1=0, hard_full=0, and uses sparse anchor-KL. "
+                            "Required for L>=1024 on TPU v6e-1 (16GB HBM).")
+    parser.add_argument("--anchor-sparse", action="store_true",
+                       help="Use sparse anchor KL (compute only on K candidates from cache). "
+                            "Auto-enabled on TPU when seq_len>=512 and no_full_logits is set.")
+    parser.add_argument("--anchor-topk", type=int, default=None,
+                       help="Number of top-K candidates for sparse anchor KL (default: use cache K)")
+    parser.add_argument("--anchor-interval", type=int, default=1,
+                       help="Apply anchor KL every N optimizer steps (default: 1, try 10-50 for L>=1024)")
+
     # Logging/saving
     parser.add_argument("--log-interval", type=int, default=50,
                        help="Steps between logging")
@@ -466,6 +479,38 @@ def main():
         recovery_config['kd_alpha'] = args.kd_alpha
         recovery_config['kd_cache_dir'] = args.kd_cache_dir
 
+    # ==========================================================================
+    # Sparse logits mode (--no-full-logits): prevents [B,L,V] materialization
+    # Required for L>=1024 on TPU v6e-1 (16GB HBM)
+    # ==========================================================================
+    effective_hard_top1 = args.hard_top1
+    effective_hard_full = args.hard_full
+    if args.no_full_logits:
+        # Force disable hard losses (they require full logits)
+        if args.hard_top1 > 0 or args.hard_full > 0:
+            print(f"\n[Sparse Logits] WARNING: --no-full-logits forces hard_top1=0, hard_full=0")
+            print(f"  (was: hard_top1={args.hard_top1}, hard_full={args.hard_full})")
+        effective_hard_top1 = 0.0
+        effective_hard_full = 0.0
+        print(f"\n[Sparse Logits] --no-full-logits enabled:")
+        print(f"  hard_top1_weight: 0.0 (forced off)")
+        print(f"  hard_full_weight: 0.0 (forced off)")
+        if args.anchor_kl_weight > 0:
+            print(f"  anchor-KL: sparse top-K mode (no full logits)")
+        if args.anchor_sparse:
+            print(f"  anchor_sparse: True (explicit)")
+        if args.anchor_topk:
+            print(f"  anchor_topk: {args.anchor_topk}")
+        if args.anchor_interval > 1:
+            print(f"  anchor_interval: {args.anchor_interval}")
+
+    # Auto-enable sparse anchor on TPU when seq_len>=512 and no_full_logits
+    is_tpu = args.tpu or (device is not None and 'xla' in str(device).lower())
+    use_anchor_sparse = args.anchor_sparse
+    if args.no_full_logits and is_tpu and args.seq_len >= 512 and not args.anchor_sparse:
+        use_anchor_sparse = True
+        print(f"  anchor_sparse: True (auto-enabled for TPU + L>={args.seq_len})")
+
     print(f"\nStarting recovery LoRA training (mode={args.lora_mode})...")
     results = train_recovery_lora(
         model=model,
@@ -507,6 +552,10 @@ def main():
         keep_checkpoints=args.keep_checkpoints,
         anchor_kl_weight=args.anchor_kl_weight,
         anchor_samples=args.anchor_samples,
+        no_full_logits=args.no_full_logits,
+        anchor_sparse=use_anchor_sparse,
+        anchor_topk=args.anchor_topk,
+        anchor_interval=args.anchor_interval,
         resume_from=args.resume_from,
         save_lora_only=args.save_lora_only,
         config=recovery_config,
@@ -514,9 +563,9 @@ def main():
         teacher_model=args.teacher,
         kd_temperature=args.kd_temperature,
         kd_alpha=args.kd_alpha,
-        hard_top1_weight=args.hard_top1,
-        hard_top1_end=args.hard_top1_end,
-        hard_full_weight=args.hard_full,
+        hard_top1_weight=effective_hard_top1,
+        hard_top1_end=args.hard_top1_end if not args.no_full_logits else 0.0,
+        hard_full_weight=effective_hard_full,
         use_wandb=args.wandb,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run,

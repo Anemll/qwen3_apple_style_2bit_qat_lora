@@ -2671,6 +2671,10 @@ def train_recovery_lora(
     keep_checkpoints: int = 3,
     anchor_kl_weight: float = 0.0,
     anchor_samples: int = 32,
+    no_full_logits: bool = False,
+    anchor_sparse: bool = False,
+    anchor_topk: Optional[int] = None,
+    anchor_interval: int = 1,
     resume_from: Optional[str] = None,
     save_lora_only: bool = False,
     config: Optional[dict] = None,
@@ -3321,25 +3325,52 @@ def train_recovery_lora(
         print(f"  Tokens/step: {tokens_per_step:,}, Tokens/update: {tokens_per_update:,} (batch={batch_size}x{accumulation_steps})")
 
     # Compute anchor logits if KL regularizer enabled
-    anchor_logits = None
+    # Supports two modes:
+    #   - Dense (default): anchor_logits = [samples, L, V] (full vocab)
+    #   - Sparse (no_full_logits/anchor_sparse): anchor_topk_logits/anchor_topk_idx = [samples, L, K]
+    anchor_logits = None  # Full logits [samples, L, V] - only if not sparse mode
+    anchor_topk_logits = None  # Sparse top-K logits [samples, L, K] - for sparse mode
+    anchor_topk_idx = None  # Sparse top-K indices [samples, L, K] - for sparse mode
     anchor_input_ids = None
+    anchor_K = anchor_topk if anchor_topk else 128  # Default K=128 if not specified
+
+    # Determine if we should use sparse anchor mode
+    use_sparse_anchor = anchor_sparse or no_full_logits
+
     if anchor_kl_weight > 0 and anchor_samples > 0:
         _anchor_start = time.time()
+        mode_str = "sparse" if use_sparse_anchor else "dense"
         if verbose:
-            print(f"  Computing anchor logits ({anchor_samples} samples)...", flush=True)
+            print(f"  Computing anchor logits ({anchor_samples} samples, {mode_str} mode)...", flush=True)
         model.eval()
 
         if use_kd_cache:
             # Use samples from KD cache for anchors
             anchor_batches = []
+            anchor_topk_idx_list = []
+            anchor_topk_logits_list = []
             temp_iter = iter(kd_cache_dataset)
             while len(anchor_batches) < anchor_samples:
                 try:
                     batch = next(temp_iter)
                     anchor_batches.append(batch['input_ids'])
+                    # For sparse mode, also collect topk_idx and topk_logits from cache
+                    if use_sparse_anchor and 'topk_idx' in batch:
+                        anchor_topk_idx_list.append(batch['topk_idx'])
+                        anchor_topk_logits_list.append(batch['topk_logits'])
                 except StopIteration:
                     temp_iter = iter(kd_cache_dataset)
             anchor_batch = torch.stack(anchor_batches[:anchor_samples], dim=0).to(device)
+
+            # For sparse mode with KD cache, use cache's topk as anchor
+            if use_sparse_anchor and anchor_topk_idx_list:
+                # Stack and use cache's topk directly as anchor (teacher logits)
+                anchor_topk_idx = torch.stack(anchor_topk_idx_list[:anchor_samples], dim=0)  # [A, L, K]
+                anchor_topk_logits = torch.stack(anchor_topk_logits_list[:anchor_samples], dim=0)  # [A, L, K]
+                # Update K from cache
+                anchor_K = anchor_topk_idx.size(-1)
+                if verbose:
+                    print(f"  Using KD cache topk as anchor: idx={anchor_topk_idx.shape}, logits={anchor_topk_logits.shape}")
         elif streaming_tokenizer is not None:
             # Use streaming tokenizer to get anchor samples
             anchor_batch = streaming_tokenizer.get_batch().to(device)
@@ -3367,14 +3398,31 @@ def train_recovery_lora(
             anchor_input_ids = anchor_batch  # Save for later use in training loop
             if verbose:
                 print(f"  Anchor batch shape: {anchor_batch.shape}, running forward...", flush=True)
-            with torch.no_grad():
-                anchor_logits = model(anchor_batch, use_cache=False).logits.detach()
+
+            # Compute anchor logits (only if not using cache's topk as anchor)
+            if anchor_topk_logits is None:
+                with torch.no_grad():
+                    full_logits = model(anchor_batch, use_cache=False).logits.detach()
+
+                if use_sparse_anchor:
+                    # Extract top-K and discard full logits (memory-safe for L>=1024)
+                    anchor_topk_logits, anchor_topk_idx = torch.topk(full_logits, k=anchor_K, dim=-1)
+                    anchor_topk_logits = anchor_topk_logits.to(torch.bfloat16).cpu()  # Save memory
+                    anchor_topk_idx = anchor_topk_idx.cpu()
+                    del full_logits
+                    if verbose:
+                        print(f"  Anchor logits computed (sparse): topk_idx={anchor_topk_idx.shape}, topk_logits={anchor_topk_logits.shape}")
+                else:
+                    anchor_logits = full_logits
+                    if verbose:
+                        print(f"  Anchor logits computed (dense): {anchor_logits.shape}")
+
             # TPU: mark_step after anchor forward to compile/execute
             if is_xla_device(device):
                 xla_mark_step()
             _anchor_time = time.time() - _anchor_start
             if verbose:
-                print(f"  Anchor logits computed: {anchor_logits.shape} ({_anchor_time:.1f}s)", flush=True)
+                print(f"  Anchor precompute done ({_anchor_time:.1f}s)", flush=True)
         model.train()
 
     # Load teacher model for KD mode
@@ -3443,6 +3491,13 @@ def train_recovery_lora(
                     'seq_len': seq_len,
                     'mlp_only': mlp_only,
                     'anchor_kl_weight': anchor_kl_weight,
+                    # Sparse logits mode
+                    'no_full_logits': no_full_logits,
+                    'anchor_sparse': anchor_sparse,
+                    'anchor_topk': anchor_topk,
+                    'anchor_interval': anchor_interval,
+                    'sparse_logits_enabled': use_sparse_anchor,
+                    'hard_logits_enabled': hard_top1_weight > 0 or hard_full_weight > 0,
                 },
                 resume="allow",  # Allow resuming if run was interrupted
             )
@@ -3682,16 +3737,77 @@ def train_recovery_lora(
             print(f"  [Step {step}] Forward pass done ({_fwd_time:.1f}s)", flush=True)
 
         # Optional anchor KL regularizer (soft CE, TPU/XLA safe)
-        if anchor_kl_weight > 0 and anchor_logits is not None and anchor_input_ids is not None:
-            # Use pre-computed anchor samples for KL
-            anchor_idx = (step - 1) % anchor_samples
-            anchor_input = anchor_input_ids[anchor_idx:anchor_idx+1].to(device)
-            current_logits = model(anchor_input, use_cache=False)
-            if hasattr(current_logits, 'logits'):
-                current_logits = current_logits.logits
-            # Soft cross-entropy (avoids aten::kl_div for TPU compatibility)
-            anchor_loss = kd_soft_ce(current_logits, anchor_logits[anchor_idx:anchor_idx+1], temperature=1.0)
-            loss = loss + anchor_kl_weight * anchor_loss
+        # Supports two modes: dense (anchor_logits) or sparse (anchor_topk_idx/anchor_topk_logits)
+        anchor_enabled = anchor_kl_weight > 0 and anchor_input_ids is not None and (
+            anchor_logits is not None or (anchor_topk_idx is not None and anchor_topk_logits is not None)
+        )
+        if anchor_enabled:
+            # Apply anchor KL every anchor_interval optimizer steps
+            if (optimizer_step + 1) % anchor_interval == 0 or optimizer_step == 0:
+                anchor_idx = (step - 1) % anchor_samples
+                anchor_input = anchor_input_ids[anchor_idx:anchor_idx+1].to(device)
+
+                if use_sparse_anchor and anchor_topk_idx is not None:
+                    # =========================================================
+                    # Sparse anchor KL: compute hidden states, gather top-K logits
+                    # This avoids materializing [1, L, V] tensor
+                    # =========================================================
+                    if mixed_precision:
+                        with torch.amp.autocast(autocast_device_type, dtype=autocast_dtype):
+                            hidden = model.model(anchor_input, use_cache=False).last_hidden_state
+                    else:
+                        hidden = model.model(anchor_input, use_cache=False).last_hidden_state
+
+                    # Get dimensions
+                    B_anc, L_anc, H_anc = hidden.shape
+                    idx = anchor_topk_idx[anchor_idx].to(device).long()  # [L, K]
+                    K_anc = idx.size(1)
+                    anchor_topk = anchor_topk_logits[anchor_idx].to(device).float()  # [L, K]
+
+                    # Process in chunks to avoid XLA OOM (gather L*K rows is too large)
+                    # For L=1024, K=128: full gather = 131K rows = 512MB
+                    # With chunk=64: gather = 8K rows = 32MB per chunk
+                    anchor_chunk_size = 64  # Positions per chunk
+                    chunk_losses = []
+
+                    for chunk_start in range(0, L_anc, anchor_chunk_size):
+                        chunk_end = min(chunk_start + anchor_chunk_size, L_anc)
+                        chunk_len = chunk_end - chunk_start
+
+                        # Get hidden states and indices for this chunk
+                        h_chunk = hidden[0, chunk_start:chunk_end]  # [chunk, H]
+                        idx_chunk = idx[chunk_start:chunk_end]  # [chunk, K]
+
+                        # Gather lm_head weights for this chunk's top-K indices
+                        w_chunk = model.lm_head.weight[idx_chunk.reshape(-1)]  # [chunk*K, H]
+                        w_chunk = w_chunk.reshape(chunk_len, K_anc, H_anc)  # [chunk, K, H]
+
+                        # Compute sparse logits: einsum('ch,ckh->ck')
+                        student_chunk = torch.einsum('ch,ckh->ck', h_chunk, w_chunk)  # [chunk, K]
+
+                        # Get anchor logits for this chunk
+                        teacher_chunk = anchor_topk[chunk_start:chunk_end]  # [chunk, K]
+
+                        # Compute KL loss for this chunk
+                        teacher_probs = F.softmax(teacher_chunk, dim=-1)
+                        teacher_log_probs = F.log_softmax(teacher_chunk, dim=-1)
+                        student_log_probs = F.log_softmax(student_chunk, dim=-1)
+                        chunk_kl = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1).mean()
+                        chunk_losses.append(chunk_kl)
+
+                    # Average loss across all chunks
+                    anchor_loss = sum(chunk_losses) / len(chunk_losses)
+                else:
+                    # =========================================================
+                    # Dense anchor KL: full logits comparison
+                    # =========================================================
+                    current_logits = model(anchor_input, use_cache=False)
+                    if hasattr(current_logits, 'logits'):
+                        current_logits = current_logits.logits
+                    # Soft cross-entropy (avoids aten::kl_div for TPU compatibility)
+                    anchor_loss = kd_soft_ce(current_logits, anchor_logits[anchor_idx:anchor_idx+1], temperature=1.0)
+
+                loss = loss + anchor_kl_weight * anchor_loss
 
         # Scale loss for accumulation
         loss = loss / accumulation_steps
