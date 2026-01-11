@@ -650,20 +650,29 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         torch.save(model_cpu.state_dict(), final_path)
         log(f"  Saved: {final_path}")
 
-        # Save config with LoRA settings for inference
+        # Save config.json if it doesn't exist
         config_path = f"{args.output_dir}/config.json"
-        config_data = {
-            'lut_bits': args.lut_bits,
-            'attn_lut_bits': args.attn_lut_bits,
-            'scale_rank': args.scale_rank,
-            'attn_scale_rank': args.attn_scale_rank,
-            'lora_r': args.recovery_r,
-            'lora_alpha': lora_alpha,
-            'lora_mlp_only': args.mlp_only,
-        }
-        with open(config_path, 'w') as f:
-            json.dump(config_data, f, indent=2)
-        log(f"  Config saved: {config_path}")
+        if not os.path.exists(config_path):
+            config_data = {
+                'version': 'v2',
+                'model_id': args.model,
+                # Quantization config
+                'lut_bits': args.lut_bits,
+                'mlp_lut_bits': args.lut_bits,
+                'attn_lut_bits': args.attn_lut_bits,
+                'scale_rank': args.scale_rank,
+                'mlp_scale_rank': args.scale_rank,
+                'attn_scale_rank': args.attn_scale_rank,
+                # LoRA config
+                'lora_r': args.recovery_r,
+                'lora_alpha': lora_alpha,
+                'lora_mlp_only': args.mlp_only,
+                # Training info
+                'max_steps': args.max_steps,
+            }
+            with open(config_path, 'w') as f:
+                json.dump(config_data, f, indent=2)
+            log(f"  Config saved: {config_path}")
 
         if use_wandb:
             import wandb

@@ -867,6 +867,35 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         torch.save(model_cpu.state_dict(), final_path)
         log(f"  Saved: {final_path}")
 
+        # Save config.json if it doesn't exist
+        config_path = f"{args.output_dir}/config.json"
+        if not os.path.exists(config_path):
+            import json
+            # Compute lut_bits from LUT_SIZE (LUT16 = 4-bit, LUT4 = 2-bit)
+            mlp_lut_bits = {4: 2, 16: 4}.get(preset['mlp_lut'], 4)
+            attn_lut_bits = {4: 2, 16: 4}.get(preset['attn_lut'], 4)
+            config_data = {
+                'version': 'v2',
+                'model_id': args.model_id,
+                'config_preset': args.config,
+                # Quantization config
+                'lut_bits': mlp_lut_bits,
+                'mlp_lut_bits': mlp_lut_bits,
+                'attn_lut_bits': attn_lut_bits,
+                'scale_rank': preset['mlp_rank'],
+                'mlp_scale_rank': preset['mlp_rank'],
+                'attn_scale_rank': preset['attn_rank'],
+                # LoRA config (0 = no LoRA for this run)
+                'lora_r': 0,
+                'lora_alpha': 0,
+                'lora_mlp_only': False,
+                # Training info
+                'max_steps': args.max_steps,
+            }
+            with open(config_path, 'w') as f:
+                json.dump(config_data, f, indent=2)
+            log(f"  Config saved: {config_path}")
+
         # Upload to Google Drive if requested
         if args.upload:
             log("\n[Upload] Uploading run to Google Drive...")

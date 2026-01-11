@@ -806,6 +806,37 @@ def main():
     torch.save(v2_model.state_dict(), fp16_path)
     print(f"  FP16: {fp16_path}")
 
+    # Save config.json if it doesn't exist
+    config_path = Path(args.output_dir) / 'config.json'
+    if not config_path.exists():
+        import json
+        # Compute lut_bits from LUT_SIZE (LUT16 = 4-bit, LUT4 = 2-bit)
+        mlp_lut_bits = {4: 2, 16: 4}.get(MLP_LUT_SIZE, 4)
+        attn_lut_bits = {4: 2, 16: 4}.get(ATTN_LUT_SIZE, 4)
+        config_data = {
+            'version': 'v2',
+            'model_id': args.model_id,
+            'config_preset': args.config,
+            # Quantization config
+            'lut_bits': mlp_lut_bits,
+            'mlp_lut_bits': mlp_lut_bits,
+            'attn_lut_bits': attn_lut_bits,
+            'scale_rank': MLP_RANK,
+            'mlp_scale_rank': MLP_RANK,
+            'attn_scale_rank': ATTN_RANK,
+            'group_size': GROUP_SIZE,
+            # LoRA config (0 = no LoRA for this run)
+            'lora_r': 0,
+            'lora_alpha': 0,
+            'lora_mlp_only': False,
+            # Training info
+            'max_steps': args.max_steps,
+            'final_loss': result.get('final_loss'),
+        }
+        with open(config_path, 'w') as f:
+            json.dump(config_data, f, indent=2)
+        print(f"  Config: {config_path}")
+
     # =========================================================================
     # STEP 5: Upload to Google Drive (optional)
     # =========================================================================

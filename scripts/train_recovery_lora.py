@@ -527,6 +527,34 @@ def main():
     torch.save(model.state_dict(), final_path)
     print(f"\nFinal checkpoint saved: {final_path}")
 
+    # Save config.json if it doesn't exist
+    config_path = os.path.join(args.output, 'config.json')
+    if not os.path.exists(config_path):
+        import json
+        # Compute lut_bits from LUT_SIZE (LUT16 = 4-bit, LUT4 = 2-bit)
+        lut_bits = {4: 2, 16: 4}.get(args.lut_size, 4)
+        config_data = {
+            'version': 'v2',
+            'model_id': args.model,
+            # Quantization config
+            'lut_bits': lut_bits,
+            'mlp_lut_bits': lut_bits,
+            'attn_lut_bits': lut_bits if args.quantize_attn else 0,
+            'scale_rank': args.scale_rank,
+            'mlp_scale_rank': args.scale_rank,
+            'attn_scale_rank': args.scale_rank if args.quantize_attn else 0,
+            # LoRA config
+            'lora_r': args.recovery_r,
+            'lora_alpha': args.recovery_alpha if args.recovery_alpha else args.recovery_r,
+            'lora_mlp_only': args.mlp_only,
+            # Training info
+            'max_steps': args.max_steps,
+            'final_loss': results.get('best_loss'),
+        }
+        with open(config_path, 'w') as f:
+            json.dump(config_data, f, indent=2)
+        print(f"Config saved: {config_path}")
+
     # Print summary
     print(f"\n=== Training Complete ===")
     print(f"Best loss: {results['best_loss']:.4f}")
