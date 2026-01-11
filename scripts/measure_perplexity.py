@@ -225,6 +225,119 @@ def format_time(seconds: float) -> str:
         return f"{hours}h{mins:02d}m"
 
 
+def print_all_results():
+    """Print all saved results from results/perplexity.json in a nice table."""
+    repo_root = Path(__file__).parent.parent
+    results_file = repo_root / "results" / "perplexity.json"
+
+    if not results_file.exists():
+        print("No results found. Run perplexity measurements first.")
+        return 1
+
+    with open(results_file, 'r') as f:
+        results = json.load(f)
+
+    if not results:
+        print("No results found in perplexity.json")
+        return 1
+
+    # Sort by perplexity (best first)
+    sorted_results = sorted(results.items(), key=lambda x: x[1].get('perplexity', float('inf')))
+
+    print()
+    print("=" * 90)
+    print("PERPLEXITY RESULTS")
+    print("=" * 90)
+    print(f"{'Checkpoint':<50} {'PPL':>8} {'CE':>8} {'Dtype':>6} {'Dataset':>12}")
+    print("-" * 90)
+
+    for key, entry in sorted_results:
+        # Truncate long checkpoint names
+        display_key = key if len(key) <= 48 else "..." + key[-45:]
+        ppl = entry.get('perplexity', 0)
+        ce = entry.get('cross_entropy', 0)
+        dtype = entry.get('dtype', '?')
+        dataset = entry.get('dataset', '?')
+        # Truncate dataset name
+        if len(dataset) > 12:
+            dataset = dataset[:10] + ".."
+
+        print(f"{display_key:<50} {ppl:>8.2f} {ce:>8.4f} {dtype:>6} {dataset:>12}")
+
+    print("-" * 90)
+    print(f"Total: {len(results)} results")
+    print(f"File:  {results_file}")
+    print("=" * 90)
+
+    return 0
+
+
+def save_results_to_json(
+    checkpoint: str,
+    result: dict,
+    model_name: str,
+    dtype: str,
+    is_baseline: bool = False,
+    dataset: str = "wikitext2",
+):
+    """Save results to results/perplexity.json, updating existing entries."""
+    from datetime import datetime
+
+    # Find repo root (parent of scripts/)
+    repo_root = Path(__file__).parent.parent
+    results_dir = repo_root / "results"
+    results_dir.mkdir(exist_ok=True)
+    results_file = results_dir / "perplexity.json"
+
+    # Load existing results
+    existing_results = {}
+    if results_file.exists():
+        try:
+            with open(results_file, 'r') as f:
+                existing_results = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            existing_results = {}
+
+    # Create key for this result (normalize checkpoint path)
+    if is_baseline:
+        key = f"baseline:{model_name}"
+    else:
+        # Normalize checkpoint path (remove runs/ prefix, use just filename if in runs/)
+        ckpt_path = Path(checkpoint)
+        if ckpt_path.parts and ckpt_path.parts[0] == "runs":
+            # Format: runs/run_name/checkpoint.pt -> run_name/checkpoint.pt
+            key = str(Path(*ckpt_path.parts[1:]))
+        else:
+            key = str(ckpt_path)
+
+    # Create result entry
+    entry = {
+        "perplexity": round(result['perplexity'], 2),
+        "cross_entropy": round(result['cross_entropy'], 4),
+        "tokens": result['tokens'],
+        "time_seconds": round(result['time'], 1),
+        "tokens_per_sec": round(result['tokens_per_sec'], 0),
+        "model": model_name,
+        "dtype": dtype,
+        "dataset": dataset,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    # Add batch info if present
+    if 'batch_size' in result:
+        entry['batch_size'] = result['batch_size']
+        entry['seq_len'] = result['seq_len']
+
+    # Update or add entry
+    existing_results[key] = entry
+
+    # Save back to file
+    with open(results_file, 'w') as f:
+        json.dump(existing_results, f, indent=2)
+
+    return results_file, key
+
+
 def compute_perplexity_batched(
     model,
     input_ids: torch.Tensor,
@@ -327,7 +440,11 @@ def compute_perplexity_batched(
         if is_tpu:
             xm.mark_step()
 
-        if verbose:
+        # Print progress every 50 batches, plus first and last
+        is_first = batch_idx == 0
+        is_last = batch_idx == num_batches - 1
+        is_milestone = (batch_idx + 1) % 50 == 0
+        if verbose and (is_first or is_last or is_milestone):
             batch_ppl = math.exp(loss.item() / batch_tokens) if batch_tokens > 0 else float('inf')
             elapsed_so_far = time.time() - start_time
             throughput = tokens_processed / elapsed_so_far if elapsed_so_far > 0 else 0
@@ -442,7 +559,11 @@ def compute_perplexity(
         if is_tpu:
             xm.mark_step()
 
-        if verbose:
+        # Print progress every 50 chunks, plus first and last
+        is_first = chunk_num == 1
+        is_last = chunk_num == num_chunks
+        is_milestone = chunk_num % 50 == 0
+        if verbose and (is_first or is_last or is_milestone):
             chunk_ppl = math.exp(loss.item() / trg_len) if trg_len > 0 else float('inf')
             elapsed_so_far = time.time() - start_time
             if chunk_num > 1:
@@ -702,8 +823,14 @@ def main():
                         help='Sequence length for batched mode (default: 512)')
     parser.add_argument('--benchmark', action='store_true',
                         help='Run benchmark comparing different batch sizes (1,2,4,8,16)')
+    parser.add_argument('--list', action='store_true',
+                        help='List all saved perplexity results from results/perplexity.json')
 
     args = parser.parse_args()
+
+    # Handle --list early (doesn't need checkpoint)
+    if args.list:
+        return print_all_results()
 
     # Validate args
     if not args.baseline and args.checkpoint is None:
@@ -712,6 +839,9 @@ def main():
     # Get device and dtype
     device, dtype = get_device(args.device, args.dtype)
     dtype_name = {torch.float16: 'fp16', torch.bfloat16: 'bf16', torch.float32: 'fp32'}.get(dtype, str(dtype))
+
+    # Print header
+    print()
     print("=" * 60)
     print("PERPLEXITY MEASUREMENT")
     print("=" * 60)
@@ -720,7 +850,8 @@ def main():
     else:
         print(f"Checkpoint: {args.checkpoint}")
     print(f"Device:     {device}")
-    print(f"Dtype:      {dtype_name}" + (" (override)" if args.dtype != 'auto' else " (auto)"))
+    dtype_suffix = " (override)" if args.dtype != 'auto' else ""
+    print(f"Dtype:      {dtype_name}{dtype_suffix}")
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
@@ -860,6 +991,19 @@ def main():
     print(f"Time:           {result['time']:.1f}s ({result['tokens_per_sec']:.0f} tok/s)")
     if args.batch_size > 0:
         print(f"Batches:        {result['num_batches']} (B={result['batch_size']}, L={result['seq_len']})")
+    print("=" * 60)
+
+    # Save results to JSON
+    results_file, result_key = save_results_to_json(
+        checkpoint=args.checkpoint or "baseline",
+        result=result,
+        model_name=args.model,
+        dtype=dtype_name,
+        is_baseline=args.baseline,
+        dataset=data_source.split()[0] if data_source else "unknown",
+    )
+    print(f"\nSaved:          {results_file}")
+    print(f"Key:            {result_key}")
 
     return 0
 
