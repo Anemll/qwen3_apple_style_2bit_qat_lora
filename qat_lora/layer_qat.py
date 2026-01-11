@@ -3513,25 +3513,21 @@ def train_recovery_lora(
 
     model.train()
 
-    # Mixed precision setup
+    # Mixed precision setup: FP32 master weights + BF16/FP16 compute via autocast
     scaler = None
     autocast_dtype = None
     use_tpu = is_xla_device(device)
     if mixed_precision:
         if use_tpu:
-            # TPU: bfloat16 is native, but torch.amp.autocast doesn't support device_type='xla'
-            # Instead, we rely on model being in bfloat16 (set via --dtype bfloat16)
-            # Setting autocast_dtype=None skips autocast, which is correct for TPU
-            autocast_dtype = None  # TPU doesn't use autocast, use --dtype bfloat16 instead
-            if verbose:
-                print(f"  Mixed precision: TPU uses native bf16 (use --dtype bfloat16)")
+            # TPU: FP32 weights + BF16 compute via autocast (device_type='xla' is supported)
+            autocast_dtype = torch.bfloat16
         elif device.type == "cuda":
             autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             if autocast_dtype == torch.float16:
                 scaler = torch.amp.GradScaler('cuda')
         elif device.type == "mps":
             autocast_dtype = torch.float16
-        if autocast_dtype and verbose:
+        if verbose:
             print(f"  Mixed precision: {autocast_dtype}")
 
     # TPU detection for debug logging (use_tpu already set above)
@@ -3606,7 +3602,9 @@ def train_recovery_lora(
             _step_times[f's{step}_fwd_start'] = time.time()
             print(f"  [Step {step}] Forward pass starting...", flush=True)
 
-        autocast_ctx = torch.amp.autocast(device.type, dtype=autocast_dtype) if autocast_dtype else nullcontext()
+        # Use 'xla' device_type for TPU, otherwise use device.type
+        autocast_device_type = 'xla' if use_tpu else device.type
+        autocast_ctx = torch.amp.autocast(autocast_device_type, dtype=autocast_dtype) if autocast_dtype else nullcontext()
 
         with autocast_ctx:
             if use_kd_cache and kd_batch is not None:
