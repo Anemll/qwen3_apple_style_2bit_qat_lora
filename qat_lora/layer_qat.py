@@ -3516,18 +3516,25 @@ def train_recovery_lora(
     # Mixed precision setup
     scaler = None
     autocast_dtype = None
+    use_tpu = is_xla_device(device)
     if mixed_precision:
-        if device.type == "cuda":
+        if use_tpu:
+            # TPU: bfloat16 is native, but torch.amp.autocast doesn't support device_type='xla'
+            # Instead, we rely on model being in bfloat16 (set via --dtype bfloat16)
+            # Setting autocast_dtype=None skips autocast, which is correct for TPU
+            autocast_dtype = None  # TPU doesn't use autocast, use --dtype bfloat16 instead
+            if verbose:
+                print(f"  Mixed precision: TPU uses native bf16 (use --dtype bfloat16)")
+        elif device.type == "cuda":
             autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             if autocast_dtype == torch.float16:
                 scaler = torch.amp.GradScaler('cuda')
         elif device.type == "mps":
             autocast_dtype = torch.float16
-        if verbose:
+        if autocast_dtype and verbose:
             print(f"  Mixed precision: {autocast_dtype}")
 
-    # TPU detection for debug logging
-    use_tpu = is_xla_device(device)
+    # TPU detection for debug logging (use_tpu already set above)
     if verbose:
         if use_tpu:
             print(f"\n  Starting training on TPU/XLA...")
