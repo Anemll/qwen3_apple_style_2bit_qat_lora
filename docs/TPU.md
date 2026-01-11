@@ -326,6 +326,169 @@ TPU v6e-1 has **32GB HBM** per chip.
 
 ---
 
+## Sparse Logits Mode (L>=1024)
+
+For long sequence training (L>=1024), the full vocab logits tensor `[B, L, V]` can consume significant memory:
+
+| Seq Len | Vocab Size | Logits Size (FP32) |
+|---------|------------|-------------------|
+| 128 | 151,936 | 74 MiB |
+| 512 | 151,936 | 297 MiB |
+| 1024 | 151,936 | **594 MiB** |
+
+The `--no-full-logits` flag prevents any full-vocab `[B,L,V]` tensor materialization by:
+
+1. **Disabling hard label loss**: Forces `hard_top1_weight=0`, `hard_full_weight=0`
+2. **Using sparse top-K loss**: Only computes logits for K teacher tokens + R random negatives
+3. **Sparse anchor-KL**: Uses `anchor_topk_idx` instead of full anchor logits
+
+### Usage
+
+```bash
+# L=1024 training with sparse logits
+python scripts/train_v2_simple.py --tpu \
+    --v2-checkpoint runs/best.pt \
+    --cache-dir caches/wikitext103_L1024_K128_R64 \
+    --no-full-logits \
+    --disable-kv-cache \
+    --batch-size 1 \
+    --max-steps 2000
+```
+
+### Memory Comparison
+
+| Mode | Logits Memory (L=1024) | Notes |
+|------|----------------------|-------|
+| Full vocab | 594 MiB | `[1, 1024, 151936]` × 4 bytes |
+| Sparse K+R | **768 KiB** | `[1, 1024, 192]` × 4 bytes (K=128, R=64) |
+
+### Required Flags
+
+| Flag | Purpose |
+|------|---------|
+| `--no-full-logits` | Enable sparse logits mode |
+| `--disable-kv-cache` | Prevent KV buffer allocations at long seq_len |
+
+### Optional Flags
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--sampled-ce-weight` | 0.0 | Weight for sampled CE loss on K+R candidates |
+| `--sampled-negatives` | 64 | Number of random negatives (R) if cache lacks `rand_idx` |
+
+### Cache Requirements
+
+For sparse logits, your KD cache should contain:
+- `topk_idx`: Top-K token indices from teacher `[B, L, K]`
+- `topk_logits`: Corresponding teacher logits `[B, L, K]`
+
+Optionally:
+- `rand_idx`: Pre-sampled random negatives `[B, L, R]` (else sampled on-the-fly)
+
+---
+
+## Memory Debug Tools
+
+TPU/XLA-safe memory debugging for tracking HBM usage without perturbing XLA compilation.
+
+### Quick Start
+
+```bash
+# Basic HBM snapshots
+python scripts/train_v2_simple.py --tpu \
+    --mem-debug \
+    --mem-debug-level basic
+
+# Full diagnostics with tensor estimates
+python scripts/train_v2_simple.py --tpu \
+    --mem-debug \
+    --mem-debug-level tensors \
+    --mem-debug-phase all \
+    --mem-debug-json /tmp/mem_log.jsonl
+```
+
+### CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--mem-debug` | off | Enable TPU HBM memory logging |
+| `--mem-debug-level` | basic | Level: `basic`, `tensors`, `metrics`, `hlo` |
+| `--mem-debug-phase` | warmup,save | Phases: `warmup`, `train`, `save`, `all` |
+| `--mem-debug-interval` | 1 | Log every N optimizer steps |
+| `--mem-debug-json` | None | Path for JSONL output |
+| `--mem-debug-tag` | None | Optional run tag for filtering |
+| `--mem-debug-no-xla-metrics` | off | Skip XLA metrics (if they perturb compilation) |
+| `--mem-debug-step-axis` | opt | Step axis: `micro` or `opt` |
+
+### Debug Levels
+
+| Level | Information |
+|-------|-------------|
+| `basic` | HBM used/free/total, percentage |
+| `tensors` | + Attention/logits workspace estimates |
+| `metrics` | + XLA compilation counts (UncachedCompile, CachedCompile) |
+| `hlo` | + HLO graph dumps (heavy, use sparingly) |
+
+### Example Output
+
+```
+[MEM_DEBUG] before_warmup_compile micro=0 opt=0 t=2.5s | HBM: 4.52 GiB/31.25 GiB (14.5%) free=26.73 GiB | [EST] attn_worst=64.0 MiB (B=1,H=16,L=1024) | [EST] logits_full=593.5 MiB sparse=768.0 KiB
+[MEM_DEBUG] after_first_forward micro=0 opt=0 t=175.3s | HBM: 6.28 GiB/31.25 GiB (20.1%) free=24.96 GiB
+[MEM_DEBUG] after_mark_step micro=0 opt=0 t=208.8s | HBM: 10.52 GiB/31.25 GiB (33.7%) free=20.73 GiB
+[MEM_DEBUG] after_warmup_compile micro=0 opt=0 t=242.4s | HBM: 6.71 GiB/31.25 GiB (21.5%) free=24.54 GiB
+```
+
+### Logging Points
+
+| Point | Phase | When |
+|-------|-------|------|
+| `after_optimizer_init` | init | After optimizer creation |
+| `after_anchor_init` | init | After anchor model logits computed |
+| `before_warmup_compile` | warmup | Before TPU warmup forward |
+| `after_first_forward` | warmup | After warmup forward pass |
+| `before_mark_step` | warmup | Before XLA mark_step |
+| `after_mark_step` | warmup | After XLA mark_step (graph executed) |
+| `after_first_backward` | warmup | After warmup backward pass |
+| `after_warmup_compile` | warmup | After full warmup complete |
+| `on_checkpoint_save` | save | At each checkpoint save |
+| `after_autosnap_freeze` | save | After auto-snap freeze triggered |
+
+### JSONL Output
+
+With `--mem-debug-json /tmp/mem.jsonl`, each log point writes a JSON record:
+
+```json
+{
+  "timestamp": "2024-01-10T12:34:56.789",
+  "point": "after_mark_step",
+  "micro_step": 0,
+  "opt_step": 0,
+  "phase": "warmup",
+  "elapsed_sec": 208.8,
+  "hbm": {
+    "used_bytes": 11290066944,
+    "free_bytes": 22254583808,
+    "total_bytes": 33544650752,
+    "used_pct": 33.7
+  },
+  "estimates": {
+    "attention": {"worst_case": {"bytes": 67108864, "formatted": "64.0 MiB"}},
+    "logits": {"logits_full": {"bytes": 622329856}, "logits_sparse": {"bytes": 786432}}
+  }
+}
+```
+
+### XLA-Safety
+
+The memory debug tools are designed to not perturb XLA compilation:
+
+1. **No tensor reads**: Uses `xm.get_memory_info()` which doesn't trigger graph breaks
+2. **Optional XLA metrics**: `--mem-debug-no-xla-metrics` skips `torch_xla.debug.metrics` calls
+3. **Estimates only**: Tensor size estimates are computed from shapes, not actual tensors
+4. **Phase filtering**: `--mem-debug-phase warmup,save` avoids training loop overhead
+
+---
+
 ## Multi-Chip TPU Training (v6e-4, v6e-8)
 
 For larger TPU configurations with multiple chips, use data parallelism.
