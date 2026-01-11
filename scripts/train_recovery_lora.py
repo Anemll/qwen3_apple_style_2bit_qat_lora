@@ -259,6 +259,12 @@ def main():
     parser.add_argument("--tpu", action="store_true",
                        help="Use TPU (sets PJRT_DEVICE=TPU, requires torch_xla)")
 
+    # Google Drive upload
+    parser.add_argument("--upload", action="store_true",
+                       help="Auto-upload run to Google Drive after successful training (uses gdrive_sync.py)")
+    parser.add_argument("--upload-exclude", type=str, action="append", default=None,
+                       help="Glob patterns to exclude from upload (default: *checkpoint*). Can be used multiple times.")
+
     # Debug
     parser.add_argument("--debug", action="store_true",
                        help="Show detailed debug output (input sequences, tokens, etc.)")
@@ -561,6 +567,33 @@ def main():
     print(f"Steps: {results['steps']}")
     print(f"Time: {results['time_sec']:.1f}s")
     print(f"Output: {args.output}")
+
+    # Upload to Google Drive if requested
+    if args.upload:
+        print("\n[Upload] Uploading run to Google Drive...")
+        try:
+            sys.path.insert(0, str(Path(__file__).parent))
+            from gdrive_sync import sync_up
+
+            # Default exclude pattern: *checkpoint* (intermediate checkpoints are large)
+            exclude_patterns = args.upload_exclude if args.upload_exclude else ['*checkpoint*']
+
+            success = sync_up(
+                local_path=args.output,
+                run_name=None,  # Use output_dir name
+                dry_run=False,
+                is_cache=False,
+                exclude=exclude_patterns,
+                only=None,
+            )
+            if success:
+                print(f"  Upload complete: {args.output}")
+            else:
+                print(f"  Upload failed or skipped (check if Google Drive is mounted)")
+        except ImportError as e:
+            print(f"  ERROR: Could not import gdrive_sync: {e}")
+        except Exception as e:
+            print(f"  ERROR during upload: {e}")
 
 
 if __name__ == "__main__":
