@@ -23,6 +23,18 @@ Usage:
     python scripts/measure_perplexity.py checkpoint.pt --dtype fp16
     python scripts/measure_perplexity.py --baseline --dtype bf16
 
+    # Batch processing (faster on GPU/TPU)
+    python scripts/measure_perplexity.py checkpoint.pt --batch-size 8 --seq-len 512
+    python scripts/measure_perplexity.py --baseline --batch-size 4
+
+    # Benchmark different batch sizes
+    python scripts/measure_perplexity.py --baseline --benchmark
+    python scripts/measure_perplexity.py checkpoint.pt --benchmark --seq-len 1024
+
+Modes:
+    - Sliding window (default): Overlapping chunks for accurate PPL
+    - Batched (--batch-size N): Parallel processing, faster on GPU/TPU
+
 Perplexity = exp(cross-entropy loss) on next-token prediction.
 Lower is better. WikiText-2 baselines: GPT-2 ~22, good LLMs ~5-10.
 """
@@ -211,6 +223,140 @@ def format_time(seconds: float) -> str:
         hours = int(seconds // 3600)
         mins = int((seconds % 3600) // 60)
         return f"{hours}h{mins:02d}m"
+
+
+def compute_perplexity_batched(
+    model,
+    input_ids: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+    batch_size: int = 4,
+    seq_len: int = 512,
+    verbose: bool = False,
+):
+    """
+    Compute perplexity using batched processing for GPU/TPU parallelism.
+
+    Unlike sliding window, this splits data into independent non-overlapping
+    chunks and processes them in batches. Faster on GPU/TPU but slightly
+    less accurate than sliding window due to no context overlap.
+
+    Args:
+        model: Loaded model
+        input_ids: [1, total_tokens] tokenized text
+        device: Target device
+        dtype: Target dtype
+        batch_size: Number of sequences per batch
+        seq_len: Fixed sequence length for each chunk
+        verbose: Print per-batch stats
+
+    Returns:
+        dict with perplexity, cross_entropy, tokens, time, throughput
+    """
+    model.eval()
+    total_tokens = input_ids.size(1)
+
+    # Check if TPU
+    is_tpu = 'xla' in str(device)
+    if is_tpu:
+        import torch_xla.core.xla_model as xm
+
+    # Split into fixed-length chunks (discard remainder)
+    # Each chunk is [seq_len] tokens
+    num_chunks = total_tokens // seq_len
+    if num_chunks == 0:
+        print(f"Warning: input ({total_tokens} tokens) shorter than seq_len ({seq_len})")
+        seq_len = total_tokens
+        num_chunks = 1
+
+    # Reshape to [num_chunks, seq_len]
+    usable_tokens = num_chunks * seq_len
+    chunks = input_ids[0, :usable_tokens].reshape(num_chunks, seq_len)
+
+    if verbose:
+        print(f"  Total tokens: {total_tokens:,}")
+        print(f"  Usable tokens: {usable_tokens:,} ({num_chunks} chunks × {seq_len})")
+        print(f"  Batch size: {batch_size}")
+        print(f"  Batches: {(num_chunks + batch_size - 1) // batch_size}")
+
+    nlls = []
+    tokens_processed = 0
+    start_time = time.time()
+
+    num_batches = (num_chunks + batch_size - 1) // batch_size
+
+    for batch_idx in range(num_batches):
+        batch_start = batch_idx * batch_size
+        batch_end = min((batch_idx + 1) * batch_size, num_chunks)
+        batch_chunks = chunks[batch_start:batch_end].to(device)  # [B, L]
+
+        with torch.no_grad():
+            # Forward pass
+            if dtype != torch.float32:
+                device_type = 'xla' if is_tpu else str(device).split(':')[0]
+                if device_type == 'xla':
+                    # TPU: no autocast needed, model already in bf16
+                    outputs = model(batch_chunks)
+                else:
+                    with torch.autocast(device_type=device_type, dtype=dtype):
+                        outputs = model(batch_chunks)
+            else:
+                outputs = model(batch_chunks)
+
+            logits = outputs.logits.float()  # [B, L, V]
+
+        # Compute cross-entropy loss
+        # Predict token[i+1] from position[i], so shift by 1
+        # logits[:, :-1] predicts labels[:, 1:]
+        shift_logits = logits[:, :-1, :].contiguous()  # [B, L-1, V]
+        shift_labels = batch_chunks[:, 1:].contiguous()  # [B, L-1]
+
+        # Flatten for cross_entropy
+        B, L_minus_1, V = shift_logits.shape
+        loss = F.cross_entropy(
+            shift_logits.view(B * L_minus_1, V),
+            shift_labels.view(B * L_minus_1),
+            reduction='sum'
+        )
+
+        batch_tokens = B * L_minus_1
+        nlls.append(loss.item())
+        tokens_processed += batch_tokens
+
+        # TPU: mark_step to execute graph
+        if is_tpu:
+            xm.mark_step()
+
+        if verbose:
+            batch_ppl = math.exp(loss.item() / batch_tokens) if batch_tokens > 0 else float('inf')
+            elapsed_so_far = time.time() - start_time
+            throughput = tokens_processed / elapsed_so_far if elapsed_so_far > 0 else 0
+            if batch_idx > 0:
+                avg_time = elapsed_so_far / (batch_idx + 1)
+                eta = avg_time * (num_batches - batch_idx - 1)
+                eta_str = f" ETA: {format_time(eta)}"
+            else:
+                eta_str = ""
+            print(f"  Batch {batch_idx + 1}/{num_batches}: ppl={batch_ppl:.2f} "
+                  f"({batch_tokens} tokens, {throughput:.0f} tok/s){eta_str}")
+
+    elapsed = time.time() - start_time
+
+    # Compute final perplexity
+    total_nll = sum(nlls)
+    avg_nll = total_nll / tokens_processed if tokens_processed > 0 else float('inf')
+    ppl = math.exp(avg_nll)
+
+    return {
+        'perplexity': ppl,
+        'cross_entropy': avg_nll,
+        'tokens': tokens_processed,
+        'time': elapsed,
+        'tokens_per_sec': tokens_processed / elapsed if elapsed > 0 else 0,
+        'batch_size': batch_size,
+        'seq_len': seq_len,
+        'num_batches': num_batches,
+    }
 
 
 def compute_perplexity(
@@ -548,6 +694,14 @@ def main():
                         help='Show per-chunk perplexity')
     parser.add_argument('--baseline', action='store_true',
                         help='Measure baseline HuggingFace model (no QAT checkpoint needed)')
+    # Batch processing options
+    parser.add_argument('--batch-size', type=int, default=0,
+                        help='Batch size for parallel processing (0=use sliding window, default: 0). '
+                             'Higher values = faster on GPU/TPU but use more memory.')
+    parser.add_argument('--seq-len', type=int, default=512,
+                        help='Sequence length for batched mode (default: 512)')
+    parser.add_argument('--benchmark', action='store_true',
+                        help='Run benchmark comparing different batch sizes (1,2,4,8,16)')
 
     args = parser.parse_args()
 
@@ -595,8 +749,18 @@ def main():
 
     print(f"Dataset:    {data_source}")
     print(f"Tokens:     {input_ids.size(1):,}")
-    print(f"Context:    {args.max_length} tokens")
-    print(f"Stride:     {args.stride} tokens")
+
+    # Show mode info
+    if args.batch_size > 0 or args.benchmark:
+        print(f"Mode:       Batched (seq_len={args.seq_len})")
+        if args.benchmark:
+            print(f"Benchmark:  Testing batch sizes 1,2,4,8,16")
+        else:
+            print(f"Batch size: {args.batch_size}")
+    else:
+        print(f"Mode:       Sliding window")
+        print(f"Context:    {args.max_length} tokens")
+        print(f"Stride:     {args.stride} tokens")
 
     # Load model
     print()
@@ -615,17 +779,75 @@ def main():
             model_name=args.model,
         )
 
-    # Compute perplexity
-    print("\nComputing perplexity...")
-    result = compute_perplexity(
-        model=model,
-        input_ids=input_ids,
-        device=device,
-        dtype=dtype,
-        stride=args.stride,
-        max_length=args.max_length,
-        verbose=args.verbose,
-    )
+    # Benchmark mode: test multiple batch sizes
+    if args.benchmark:
+        print("\n" + "=" * 60)
+        print("BATCH SIZE BENCHMARK")
+        print("=" * 60)
+
+        batch_sizes = [1, 2, 4, 8, 16]
+        results = []
+
+        for bs in batch_sizes:
+            print(f"\n--- Batch size: {bs} ---")
+            try:
+                result = compute_perplexity_batched(
+                    model=model,
+                    input_ids=input_ids,
+                    device=device,
+                    dtype=dtype,
+                    batch_size=bs,
+                    seq_len=args.seq_len,
+                    verbose=False,
+                )
+                results.append((bs, result))
+                print(f"  PPL: {result['perplexity']:.2f} | "
+                      f"{result['tokens_per_sec']:.0f} tok/s | "
+                      f"{result['time']:.1f}s")
+            except RuntimeError as e:
+                if 'out of memory' in str(e).lower() or 'OOM' in str(e):
+                    print(f"  OOM at batch_size={bs}")
+                    break
+                raise
+
+        # Summary table
+        print("\n" + "=" * 60)
+        print("BENCHMARK SUMMARY")
+        print("=" * 60)
+        print(f"{'Batch':>6} | {'PPL':>8} | {'Tok/s':>10} | {'Time':>8} | {'Speedup':>8}")
+        print("-" * 60)
+        baseline_time = results[0][1]['time'] if results else 1
+
+        for bs, res in results:
+            speedup = baseline_time / res['time'] if res['time'] > 0 else 0
+            print(f"{bs:>6} | {res['perplexity']:>8.2f} | {res['tokens_per_sec']:>10.0f} | "
+                  f"{res['time']:>7.1f}s | {speedup:>7.2f}x")
+
+        return 0
+
+    # Compute perplexity (batched or sliding window)
+    if args.batch_size > 0:
+        print(f"\nComputing perplexity (batched, B={args.batch_size}, L={args.seq_len})...")
+        result = compute_perplexity_batched(
+            model=model,
+            input_ids=input_ids,
+            device=device,
+            dtype=dtype,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            verbose=args.verbose,
+        )
+    else:
+        print("\nComputing perplexity (sliding window)...")
+        result = compute_perplexity(
+            model=model,
+            input_ids=input_ids,
+            device=device,
+            dtype=dtype,
+            stride=args.stride,
+            max_length=args.max_length,
+            verbose=args.verbose,
+        )
 
     # Print results
     print()
@@ -636,6 +858,8 @@ def main():
     print(f"Cross-entropy:  {result['cross_entropy']:.4f} nats")
     print(f"Tokens:         {result['tokens']:,}")
     print(f"Time:           {result['time']:.1f}s ({result['tokens_per_sec']:.0f} tok/s)")
+    if args.batch_size > 0:
+        print(f"Batches:        {result['num_batches']} (B={result['batch_size']}, L={result['seq_len']})")
 
     return 0
 
