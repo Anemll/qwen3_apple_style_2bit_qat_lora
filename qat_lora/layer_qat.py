@@ -1734,6 +1734,16 @@ def train_e2e(
     anchor_topk_logits = None  # Sparse top-K logits [samples, L, K] - used if no_full_logits=True
     anchor_input_ids = None
     anchor_K = 128  # Number of top-K tokens to track for sparse anchor KL
+
+    # Warn about potential XLA OOM with sparse anchor-KL on TPU
+    # Works on multi-TPU with model parallelism, may OOM on single-chip v6e-1
+    _is_tpu_early = 'xla' in str(device).lower()
+    if no_full_logits and _is_tpu_early and anchor_ckpt and anchor_kl_weight > 0:
+        if verbose:
+            print(f"\n[Anchor KL] WARNING: sparse mode + TPU may cause XLA OOM on single-chip (v6e-1)")
+            print(f"  Multi-TPU (v6e-4, v6e-8) with model parallelism should work")
+            print(f"  If OOM occurs, use --anchor-kl-weight 0 to disable")
+
     if anchor_ckpt and anchor_kl_weight > 0 and anchor_samples > 0:
         if verbose:
             print(f"\n[Anchor KL] Loading anchor checkpoint: {anchor_ckpt}")
@@ -2101,6 +2111,7 @@ def train_e2e(
                     if no_full_logits and anchor_topk_idx is not None:
                         # Sparse anchor KL: compute hidden states, gather top-K logits
                         # This avoids materializing [1, L, V] tensor
+                        # CHUNKED to avoid XLA OOM on TPU (L*K gather is too large)
                         if use_fp16:
                             with torch.amp.autocast(device_type=autocast_device, dtype=torch.float16):
                                 hidden = model.model(anchor_input, use_cache=False).last_hidden_state
@@ -2110,26 +2121,45 @@ def train_e2e(
                         else:
                             hidden = model.model(anchor_input, use_cache=False).last_hidden_state
 
-                        # Gather top-K logits using anchor indices
+                        # Get dimensions
                         B_anc, L_anc, H_anc = hidden.shape
-                        h = hidden.reshape(B_anc * L_anc, H_anc)  # [N, H]
                         idx = anchor_topk_idx[anchor_sample_idx].to(device).long()  # [L, K]
-                        idx = idx.reshape(L_anc, -1)  # [L, K]
                         K_anc = idx.size(1)
-
-                        # Gather lm_head weights and compute sparse logits
-                        w = model.lm_head.weight[idx.reshape(-1)]  # [L*K, H]
-                        w = w.reshape(L_anc, K_anc, H_anc)  # [L, K, H]
-                        current_topk = torch.einsum('lh,lkh->lk', h.reshape(L_anc, H_anc), w)  # [L, K]
-
-                        # Get anchor's top-K logits
                         anchor_topk = anchor_topk_logits[anchor_sample_idx].to(device).float()  # [L, K]
 
-                        # Sparse KL divergence
-                        teacher_probs = F.softmax(anchor_topk, dim=-1)
-                        teacher_log_probs = F.log_softmax(anchor_topk, dim=-1)
-                        student_log_probs = F.log_softmax(current_topk, dim=-1)
-                        anchor_loss = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1).mean()
+                        # Process in chunks to avoid XLA OOM (gather L*K rows is too large)
+                        # For L=1024, K=128: full gather = 131K rows = 512MB
+                        # With chunk=64: gather = 8K rows = 32MB per chunk
+                        anchor_chunk_size = 64  # Positions per chunk
+                        chunk_losses = []
+
+                        for chunk_start in range(0, L_anc, anchor_chunk_size):
+                            chunk_end = min(chunk_start + anchor_chunk_size, L_anc)
+                            chunk_len = chunk_end - chunk_start
+
+                            # Get hidden states and indices for this chunk
+                            h_chunk = hidden[0, chunk_start:chunk_end]  # [chunk, H]
+                            idx_chunk = idx[chunk_start:chunk_end]  # [chunk, K]
+
+                            # Gather lm_head weights for this chunk's top-K indices
+                            w_chunk = model.lm_head.weight[idx_chunk.reshape(-1)]  # [chunk*K, H]
+                            w_chunk = w_chunk.reshape(chunk_len, K_anc, H_anc)  # [chunk, K, H]
+
+                            # Compute sparse logits: einsum('ch,ckh->ck')
+                            student_chunk = torch.einsum('ch,ckh->ck', h_chunk, w_chunk)  # [chunk, K]
+
+                            # Get anchor logits for this chunk
+                            teacher_chunk = anchor_topk[chunk_start:chunk_end]  # [chunk, K]
+
+                            # Compute KL loss for this chunk
+                            teacher_probs = F.softmax(teacher_chunk, dim=-1)
+                            teacher_log_probs = F.log_softmax(teacher_chunk, dim=-1)
+                            student_log_probs = F.log_softmax(student_chunk, dim=-1)
+                            chunk_kl = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1).mean()
+                            chunk_losses.append(chunk_kl)
+
+                        # Average loss across all chunks
+                        anchor_loss = sum(chunk_losses) / len(chunk_losses)
 
                     else:
                         # Full logits mode (original behavior)
