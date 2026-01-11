@@ -385,6 +385,25 @@ For sparse logits, your KD cache should contain:
 Optionally:
 - `rand_idx`: Pre-sampled random negatives `[B, L, R]` (else sampled on-the-fly)
 
+### Anchor-KL with Sparse Logits
+
+**Note:** Anchor-KL regularization (`--anchor-ckpt`) with sparse logits mode on TPU will show a warning about potential XLA OOM. The sparse anchor-KL gather operation can create a large XLA graph.
+
+| Configuration | Status |
+|--------------|--------|
+| Single-chip (v6e-1) | May OOM (~34GB needed vs 31GB available) |
+| Multi-TPU (v6e-4, v6e-8) | Should work with model parallelism |
+
+If you encounter XLA OOM on single-chip TPU, disable anchor-KL:
+
+```bash
+# Disable anchor-KL if OOM occurs
+python scripts/train_v2_simple.py --tpu \
+    --no-full-logits \
+    --anchor-kl-weight 0 \
+    ...
+```
+
 ---
 
 ## Memory Debug Tools
