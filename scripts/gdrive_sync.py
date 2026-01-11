@@ -115,39 +115,54 @@ def get_run_name(path: str) -> str:
     return Path(path).name
 
 
-def parse_down_path(path: str) -> tuple:
+def parse_path_with_type(path: str) -> tuple:
     """
-    Parse flexible path format for 'down' command.
+    Parse flexible path format for 'up' and 'down' commands.
+    Auto-detects cache vs run from path prefix.
 
     Supports:
-      - "SR-011_name" -> (run_name="SR-011_name", only_pattern=None)
-      - "runs/SR-011_name" -> (run_name="SR-011_name", only_pattern=None)
-      - "runs/SR-011_name/file.pt" -> (run_name="SR-011_name", only_pattern="file.pt")
-      - "SR-011_name/file.pt" -> (run_name="SR-011_name", only_pattern="file.pt")
+      - "SR-011_name" -> (name="SR-011_name", pattern=None, is_cache=False)
+      - "runs/SR-011_name" -> (name="SR-011_name", pattern=None, is_cache=False)
+      - "runs/SR-011_name/file.pt" -> (name="SR-011_name", pattern="file.pt", is_cache=False)
+      - "cache/alpaca_L128" -> (name="alpaca_L128", pattern=None, is_cache=True)
+      - "caches/alpaca_L128" -> (name="alpaca_L128", pattern=None, is_cache=True)
+      - "caches/alpaca_L128/shard_*.pt" -> (name="alpaca_L128", pattern="shard_*.pt", is_cache=True)
 
     Returns:
-        (run_name, only_pattern) tuple
+        (name, only_pattern, is_cache) tuple
     """
     # Normalize path
     path = path.strip('/')
     parts = path.split('/')
 
-    # Remove 'runs' prefix if present
-    if parts[0] == 'runs':
+    # Detect type from prefix
+    is_cache = False
+    if parts[0] in ('cache', 'caches'):
+        is_cache = True
+        parts = parts[1:]
+    elif parts[0] == 'runs':
+        is_cache = False
         parts = parts[1:]
 
     if len(parts) == 0:
-        return None, None
+        return None, None, is_cache
     elif len(parts) == 1:
-        # Just run name: "SR-011_name"
-        return parts[0], None
+        # Just name: "SR-011_name" or "alpaca_L128"
+        return parts[0], None, is_cache
     elif len(parts) == 2:
-        # Run name + file: "SR-011_name/file.pt"
-        return parts[0], parts[1]
+        # Name + file: "SR-011_name/file.pt"
+        return parts[0], parts[1], is_cache
     else:
-        # Multiple levels: take first as run_name, last as file pattern
-        # e.g., "SR-011/subdir/file.pt" -> run_name="SR-011", pattern="file.pt"
-        return parts[0], parts[-1]
+        # Multiple levels: take first as name, last as file pattern
+        # e.g., "SR-011/subdir/file.pt" -> name="SR-011", pattern="file.pt"
+        return parts[0], parts[-1], is_cache
+
+
+# Backward compatibility alias
+def parse_down_path(path: str) -> tuple:
+    """Legacy function - returns (name, pattern) only. Use parse_path_with_type for full info."""
+    name, pattern, _ = parse_path_with_type(path)
+    return name, pattern
 
 
 def list_runs(location: str = "both", is_cache: bool = False):
@@ -718,10 +733,12 @@ Examples:
   # Exclude files by pattern (e.g., skip intermediate checkpoints)
   python scripts/gdrive_sync.py up runs/SR-011 --exclude "checkpoint_step*"
 
-  # Sync caches (use --cache flag)
-  python scripts/gdrive_sync.py up caches/alpaca_L128 --cache
-  python scripts/gdrive_sync.py down alpaca_L128 --cache
-  python scripts/gdrive_sync.py list --cache
+  # Sync caches (auto-detected from path prefix: cache/, caches/)
+  python scripts/gdrive_sync.py up caches/alpaca_L128
+  python scripts/gdrive_sync.py down cache/alpaca_L128
+  python scripts/gdrive_sync.py down caches/wikitext103_L1024_K128
+  python scripts/gdrive_sync.py status caches/alpaca_L128
+  python scripts/gdrive_sync.py list --cache  # --cache still needed for list
 
 Environment:
   GDRIVE_BASE: Google Drive base path for runs (default: /content/drive/MyDrive/qwen3_runs)
@@ -738,10 +755,11 @@ Environment:
 
     # up (sync local -> drive)
     up_parser = subparsers.add_parser('up', help='Sync local run/cache to Google Drive')
-    up_parser.add_argument('local_path', help='Local directory (e.g., runs/SR-011_foo or caches/alpaca_L128)')
+    up_parser.add_argument('local_path', help='Local directory (e.g., runs/SR-011_foo or caches/alpaca_L128). '
+                          'Auto-detects cache from path prefix (cache/, caches/)')
     up_parser.add_argument('--name', help='Override name on Drive')
     up_parser.add_argument('--dry-run', action='store_true', help='Show what would be synced')
-    up_parser.add_argument('--cache', action='store_true', help='Sync as cache (recursive) instead of run')
+    up_parser.add_argument('--cache', action='store_true', help='Force cache mode (auto-detected from path prefix)')
     up_parser.add_argument('--exclude', action='append', default=[],
                           help='Glob pattern to exclude (can be used multiple times, e.g., --exclude "checkpoint_step*")')
     up_parser.add_argument('--only', action='append', default=[],
@@ -749,10 +767,11 @@ Environment:
 
     # down (sync drive -> local)
     down_parser = subparsers.add_parser('down', help='Sync run/cache from Google Drive to local')
-    down_parser.add_argument('path', help='Run name or path (e.g., SR-011_foo, runs/SR-011_foo/file.pt)')
+    down_parser.add_argument('path', help='Name or path (e.g., SR-011_foo, runs/SR-011_foo/file.pt, cache/alpaca_L128). '
+                            'Auto-detects cache from path prefix (cache/, caches/)')
     down_parser.add_argument('--local', help='Local destination path')
     down_parser.add_argument('--dry-run', action='store_true', help='Show what would be synced')
-    down_parser.add_argument('--cache', action='store_true', help='Sync as cache (recursive) instead of run')
+    down_parser.add_argument('--cache', action='store_true', help='Force cache mode (auto-detected from path prefix)')
     down_parser.add_argument('--only', action='append', default=[],
                           help='Only sync files matching pattern (can be used multiple times, e.g., --only "*1200*")')
     down_parser.add_argument('--exclude', action='append', default=[],
@@ -772,17 +791,25 @@ Environment:
     if args.command == 'list':
         list_runs(args.location, args.cache)
     elif args.command == 'up':
-        sync_up(args.local_path, args.name, args.dry_run, args.cache, args.exclude, args.only)
+        # Auto-detect cache from path prefix (cache/, caches/)
+        _, _, detected_cache = parse_path_with_type(args.local_path)
+        is_cache = args.cache or detected_cache
+        sync_up(args.local_path, args.name, args.dry_run, is_cache, args.exclude, args.only)
     elif args.command == 'down':
-        # Parse flexible path format: "SR-011_name", "runs/SR-011_name", "runs/SR-011_name/file.pt"
-        run_name, path_pattern = parse_down_path(args.path)
+        # Parse flexible path format with auto-detection of cache vs run
+        # Supports: "SR-011_name", "runs/SR-011_name", "cache/alpaca_L128", "caches/alpaca_L128/shard_*.pt"
+        name, path_pattern, detected_cache = parse_path_with_type(args.path)
+        is_cache = args.cache or detected_cache
         # Combine patterns from path and --only flag
         only_patterns = list(args.only)  # Copy to avoid modifying original
         if path_pattern:
             only_patterns.append(path_pattern)
-        sync_down(run_name, args.local, args.dry_run, args.cache, only_patterns if only_patterns else None, args.exclude if args.exclude else None)
+        sync_down(name, args.local, args.dry_run, is_cache, only_patterns if only_patterns else None, args.exclude if args.exclude else None)
     elif args.command == 'status':
-        show_status(args.local_path, args.cache)
+        # Auto-detect cache from path prefix
+        _, _, detected_cache = parse_path_with_type(args.local_path)
+        is_cache = args.cache or detected_cache
+        show_status(args.local_path, is_cache)
     elif args.command == 'resume':
         path = resume_path(args.run_name)
         if path:

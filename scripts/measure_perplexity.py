@@ -227,11 +227,12 @@ def format_time(seconds: float) -> str:
 
 def print_all_results():
     """Print all saved results from results/perplexity.json in a nice table."""
-    repo_root = Path(__file__).parent.parent
+    repo_root = Path(__file__).resolve().parent.parent
     results_file = repo_root / "results" / "perplexity.json"
 
     if not results_file.exists():
         print("No results found. Run perplexity measurements first.")
+        print(f"  Expected file: {results_file}")
         return 1
 
     with open(results_file, 'r') as f:
@@ -241,33 +242,59 @@ def print_all_results():
         print("No results found in perplexity.json")
         return 1
 
-    # Sort by perplexity (best first)
+    # Sort by perplexity (best first = lowest perplexity)
     sorted_results = sorted(results.items(), key=lambda x: x[1].get('perplexity', float('inf')))
 
-    print()
-    print("=" * 90)
-    print("PERPLEXITY RESULTS")
-    print("=" * 90)
-    print(f"{'Checkpoint':<50} {'PPL':>8} {'CE':>8} {'Dtype':>6} {'Dataset':>12}")
-    print("-" * 90)
+    # ANSI escape codes for formatting
+    BOLD = "\033[1m"
+    GREEN = "\033[92m"
+    CYAN = "\033[96m"
+    RESET = "\033[0m"
 
-    for key, entry in sorted_results:
-        # Truncate long checkpoint names
-        display_key = key if len(key) <= 48 else "..." + key[-45:]
+    print()
+    print("=" * 70)
+    print(f"{BOLD}PERPLEXITY RESULTS{RESET} (sorted by best PPL)")
+    print("=" * 70)
+
+    for rank, (key, entry) in enumerate(sorted_results, 1):
         ppl = entry.get('perplexity', 0)
         ce = entry.get('cross_entropy', 0)
         dtype = entry.get('dtype', '?')
         dataset = entry.get('dataset', '?')
-        # Truncate dataset name
-        if len(dataset) > 12:
-            dataset = dataset[:10] + ".."
 
-        print(f"{display_key:<50} {ppl:>8.2f} {ce:>8.4f} {dtype:>6} {dataset:>12}")
+        # Parse key to extract run name and filename
+        # Format is usually: run_name/checkpoint.pt or baseline:model_name
+        if key.startswith('baseline:'):
+            run_name = "BASELINE"
+            filename = key.replace('baseline:', '')
+        elif '/' in key:
+            parts = key.split('/')
+            run_name = parts[0]
+            filename = '/'.join(parts[1:])
+        else:
+            run_name = "(unknown)"
+            filename = key
 
-    print("-" * 90)
-    print(f"Total: {len(results)} results")
+        # Truncate dataset name if too long
+        if len(dataset) > 15:
+            dataset = dataset[:13] + ".."
+
+        # Line 1: Rank + Run name (bold, highlighted)
+        print(f"{CYAN}#{rank}{RESET} {BOLD}{run_name}{RESET}")
+
+        # Line 2: Filename + metrics (indented)
+        # Highlight best result (rank 1) in green
+        if rank == 1:
+            print(f"    {GREEN}PPL: {ppl:.2f}{RESET}  CE: {ce:.4f}  [{dtype}]  {dataset}")
+        else:
+            print(f"    PPL: {ppl:.2f}  CE: {ce:.4f}  [{dtype}]  {dataset}")
+        print(f"    {filename}")
+        print()
+
+    print("-" * 70)
+    print(f"Total: {len(results)} results (sorted by perplexity, best first)")
     print(f"File:  {results_file}")
-    print("=" * 90)
+    print("=" * 70)
 
     return 0
 
@@ -283,11 +310,13 @@ def save_results_to_json(
     """Save results to results/perplexity.json, updating existing entries."""
     from datetime import datetime
 
-    # Find repo root (parent of scripts/)
-    repo_root = Path(__file__).parent.parent
+    # Find repo root (parent of scripts/) - use resolve() for absolute path
+    repo_root = Path(__file__).resolve().parent.parent
     results_dir = repo_root / "results"
-    results_dir.mkdir(exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
     results_file = results_dir / "perplexity.json"
+
+    print(f"[DEBUG] Saving to: {results_file}")
 
     # Load existing results
     existing_results = {}
@@ -334,6 +363,12 @@ def save_results_to_json(
     # Save back to file
     with open(results_file, 'w') as f:
         json.dump(existing_results, f, indent=2)
+
+    # Verify file was written
+    if results_file.exists():
+        print(f"[DEBUG] Saved {len(existing_results)} entries ({results_file.stat().st_size} bytes)")
+    else:
+        print(f"[ERROR] File NOT created: {results_file}")
 
     return results_file, key
 
@@ -980,20 +1015,7 @@ def main():
             verbose=args.verbose,
         )
 
-    # Print results
-    print()
-    print("=" * 60)
-    print("RESULTS")
-    print("=" * 60)
-    print(f"Perplexity:     {result['perplexity']:.2f}")
-    print(f"Cross-entropy:  {result['cross_entropy']:.4f} nats")
-    print(f"Tokens:         {result['tokens']:,}")
-    print(f"Time:           {result['time']:.1f}s ({result['tokens_per_sec']:.0f} tok/s)")
-    if args.batch_size > 0:
-        print(f"Batches:        {result['num_batches']} (B={result['batch_size']}, L={result['seq_len']})")
-    print("=" * 60)
-
-    # Save results to JSON
+    # Save results to JSON first
     results_file, result_key = save_results_to_json(
         checkpoint=args.checkpoint or "baseline",
         result=result,
@@ -1002,8 +1024,26 @@ def main():
         is_baseline=args.baseline,
         dataset=data_source.split()[0] if data_source else "unknown",
     )
-    print(f"\nSaved:          {results_file}")
+
+    # ANSI escape codes for formatting
+    RED = "\033[91m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+    # Print results with save info in header
+    print()
+    print("=" * 60)
+    print("RESULTS")
+    print(f"Saved:          {results_file}")
     print(f"Key:            {result_key}")
+    print("=" * 60)
+    print(f"{RED}{BOLD}Perplexity:     {result['perplexity']:.2f}{RESET}")
+    print(f"Cross-entropy:  {result['cross_entropy']:.4f} nats")
+    print(f"Tokens:         {result['tokens']:,}")
+    print(f"Time:           {result['time']:.1f}s ({result['tokens_per_sec']:.0f} tok/s)")
+    if args.batch_size > 0:
+        print(f"Batches:        {result['num_batches']} (B={result['batch_size']}, L={result['seq_len']})")
+    print("=" * 60)
 
     return 0
 
