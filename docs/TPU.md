@@ -192,6 +192,16 @@ sudo lsof /dev/vfio/0 2>/dev/null || sudo fuser -v /dev/vfio/0
 sudo kill -9 <PID>
 ```
 
+**Or use the automated script:**
+
+```bash
+# Preview what will be killed (dry run)
+./scripts/killtpu.sh --dry-run
+
+# Actually kill processes
+./scripts/killtpu.sh
+```
+
 If the above commands don't show a process, the handle may be held by a zombie process. Restart the Colab runtime:
 
 ```python
