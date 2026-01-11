@@ -93,6 +93,12 @@ def parse_args():
     parser.add_argument('--bf16', action='store_true',
                         help='Use pure BF16 (saves ~50%% HBM, default is FP32 master weights)')
 
+    # Google Drive upload
+    parser.add_argument('--upload', action='store_true',
+                        help='Auto-upload run to Google Drive after successful training (uses gdrive_sync.py)')
+    parser.add_argument('--upload-exclude', type=str, action='append', default=None,
+                        help='Glob patterns to exclude from upload (default: *checkpoint*). Can be used multiple times.')
+
     return parser.parse_args()
 
 
@@ -860,6 +866,34 @@ def _train_worker_impl(index, args, device, rank, world_size, is_master, log, lo
         model_cpu = model.cpu().float()
         torch.save(model_cpu.state_dict(), final_path)
         log(f"  Saved: {final_path}")
+
+        # Upload to Google Drive if requested
+        if args.upload:
+            log("\n[Upload] Uploading run to Google Drive...")
+            try:
+                import sys
+                sys.path.insert(0, str(Path(__file__).parent))
+                from gdrive_sync import sync_up
+
+                # Default exclude pattern: *checkpoint* (intermediate checkpoints are large)
+                exclude_patterns = args.upload_exclude if args.upload_exclude else ['*checkpoint*']
+
+                success = sync_up(
+                    local_path=args.output_dir,
+                    run_name=None,  # Use output_dir name
+                    dry_run=False,
+                    is_cache=False,
+                    exclude=exclude_patterns,
+                    only=None,
+                )
+                if success:
+                    log(f"  Upload complete: {args.output_dir}")
+                else:
+                    log(f"  Upload failed or skipped (check if Google Drive is mounted)")
+            except ImportError as e:
+                log(f"  ERROR: Could not import gdrive_sync: {e}")
+            except Exception as e:
+                log(f"  ERROR during upload: {e}")
 
         if use_wandb:
             wandb.finish()

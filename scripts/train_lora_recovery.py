@@ -367,6 +367,20 @@ def parse_args():
         help="Path to a training checkpoint .pt file. Use auto/latest/last to pick from output_dir.",
     )
 
+    # Google Drive upload
+    p.add_argument(
+        "--upload",
+        action="store_true",
+        help="Auto-upload run to Google Drive after successful training (uses gdrive_sync.py)",
+    )
+    p.add_argument(
+        "--upload-exclude",
+        type=str,
+        action="append",
+        default=None,
+        help="Glob patterns to exclude from upload (default: *checkpoint*). Can be used multiple times.",
+    )
+
     return p.parse_args()
 
 
@@ -515,6 +529,33 @@ def main():
         json.dump(vars(args), f, indent=2)
 
     print(f"Done. Saved LoRA adapter to: {out/'lora_only_state_dict.pt'}")
+
+    # Upload to Google Drive if requested
+    if args.upload:
+        print("\n[Upload] Uploading run to Google Drive...")
+        try:
+            sys.path.insert(0, str(Path(__file__).parent))
+            from gdrive_sync import sync_up
+
+            # Default exclude pattern: *checkpoint* (intermediate checkpoints are large)
+            exclude_patterns = args.upload_exclude if args.upload_exclude else ['*checkpoint*']
+
+            success = sync_up(
+                local_path=str(out),
+                run_name=None,  # Use output_dir name
+                dry_run=False,
+                is_cache=False,
+                exclude=exclude_patterns,
+                only=None,
+            )
+            if success:
+                print(f"  Upload complete: {out}")
+            else:
+                print(f"  Upload failed or skipped (check if Google Drive is mounted)")
+        except ImportError as e:
+            print(f"  ERROR: Could not import gdrive_sync: {e}")
+        except Exception as e:
+            print(f"  ERROR during upload: {e}")
 
 
 if __name__ == "__main__":

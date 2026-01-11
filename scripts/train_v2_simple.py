@@ -129,9 +129,14 @@ def main():
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
     parser.add_argument('--wandb-project', type=str, default='qwen3-qat', help='W&B project name')
     parser.add_argument('--wandb-run', type=str, default=None, help='W&B run name (default: auto)')
-    # Google Drive upload
+    # Google Drive upload (legacy)
     parser.add_argument('--gdrive-dir', type=str, default=None,
-                        help='Google Drive directory to upload FP32 checkpoint (creates if missing)')
+                        help='[DEPRECATED] Use --upload instead. Google Drive directory to upload FP32 checkpoint')
+    # New upload flag using gdrive_sync API
+    parser.add_argument('--upload', action='store_true',
+                        help='Auto-upload run to Google Drive after successful training (uses gdrive_sync.py)')
+    parser.add_argument('--upload-exclude', type=str, action='append', default=None,
+                        help='Glob patterns to exclude from upload (default: *checkpoint*). Can be used multiple times.')
     # Memory optimization
     parser.add_argument('--gradient-checkpointing', action='store_true',
                         help='Enable gradient checkpointing (trades ~15%% speed for ~40%% memory)')
@@ -827,6 +832,37 @@ def main():
                 print(f"  Uploaded: {dest_native}")
             except Exception as e:
                 print(f"  ERROR uploading: {e}")
+
+    # =========================================================================
+    # STEP 6: Upload to Google Drive using gdrive_sync (new API)
+    # =========================================================================
+    if args.upload:
+        print("\n[6/6] Uploading run to Google Drive...")
+        try:
+            # Import sync_up from gdrive_sync
+            sys.path.insert(0, str(REPO_DIR / 'scripts'))
+            from gdrive_sync import sync_up
+
+            # Default exclude pattern: *checkpoint* (intermediate checkpoints are large)
+            exclude_patterns = args.upload_exclude if args.upload_exclude else ['*checkpoint*']
+
+            # Upload the output directory (run folder)
+            success = sync_up(
+                local_path=args.output_dir,
+                run_name=None,  # Use output_dir name
+                dry_run=False,
+                is_cache=False,  # This is a run, not a cache
+                exclude=exclude_patterns,
+                only=None,
+            )
+            if success:
+                print(f"  Upload complete: {args.output_dir}")
+            else:
+                print(f"  Upload failed or skipped (check if Google Drive is mounted)")
+        except ImportError as e:
+            print(f"  ERROR: Could not import gdrive_sync: {e}")
+        except Exception as e:
+            print(f"  ERROR during upload: {e}")
 
     print("\nDone!")
 
