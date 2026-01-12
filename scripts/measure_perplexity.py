@@ -706,13 +706,14 @@ def load_checkpoint(
         print(f"  Attn:     Q{attn_lut_bits} (LUT{2**attn_lut_bits}), rank={attn_scale_rank}")
 
         # Auto-detect LoRA from config if not explicitly set via --lora-r
+        # lora_r: None = auto-detect, 0 = explicitly disabled, >0 = explicitly enabled
         # Support both naming conventions: lora_r/lora_alpha/lora_mlp_only and recovery_r/recovery_alpha/mlp_only
         config_lora_r = config.get('lora_r') or config.get('recovery_r') or 0
         if config_lora_r > 0:
             config_lora_alpha = config.get('lora_alpha') or config.get('recovery_alpha') or config_lora_r
             config_lora_mlp_only = config.get('lora_mlp_only') or config.get('mlp_only') or False
 
-            if lora_r == 0:
+            if lora_r is None:
                 # Auto-set from config
                 lora_r = config_lora_r
                 # Only use config's mlp_only if not explicitly set via CLI
@@ -722,10 +723,15 @@ def load_checkpoint(
                 RESET = "\033[0m"
                 mlp_only_str = ", mlp_only=True" if lora_mlp_only else ""
                 print(f"  LoRA:     {GREEN}r={lora_r} (auto-detected from config){RESET}, alpha={config_lora_alpha}{mlp_only_str}")
+            elif lora_r == 0:
+                # User explicitly disabled LoRA
+                YELLOW = "\033[93m"
+                RESET = "\033[0m"
+                print(f"  LoRA:     {YELLOW}DISABLED (--lora-r 0 overrides config r={config_lora_r}){RESET}")
             else:
-                # User explicitly specified, just show info
+                # User explicitly specified a rank
                 mlp_only_str = ", mlp_only=True" if lora_mlp_only else ""
-                print(f"  LoRA:     r={config_lora_r}, alpha={config_lora_alpha}{mlp_only_str}")
+                print(f"  LoRA:     r={lora_r} (CLI), config has r={config_lora_r}{mlp_only_str}")
     else:
         print(f"Config:     (not found, using defaults)")
         print(f"  MLP:      Q{lut_bits} (LUT{2**lut_bits}), rank={scale_rank}")
@@ -819,9 +825,10 @@ def load_checkpoint(
     if q_loaded > 0:
         print(f"  Loaded {q_loaded} _Q buffers (manual)")
 
-    # Handle LoRA if present in checkpoint and lora_r is set (auto-detected or explicit)
+    # Handle LoRA if present in checkpoint and lora_r is set (auto-detected or explicit >0)
+    # lora_r: None = config had no LoRA, 0 = user explicitly disabled, >0 = enabled
     lora_keys = [k for k in state_dict if 'lora_' in k]
-    if lora_keys and lora_r > 0:
+    if lora_keys and lora_r is not None and lora_r > 0:
         from qat_lora.ane_qat_linear_v2 import enable_recovery_lora_all
 
         mlp_str = ", mlp_only" if lora_mlp_only else ""
@@ -840,8 +847,12 @@ def load_checkpoint(
         model.load_state_dict(lora_only, strict=False)
         print(f"  Loaded {len(lora_keys)} LoRA tensors")
     elif lora_keys and lora_r == 0:
-        # Make this warning prominent - LoRA weights will be ignored!
-        # (This only triggers if config.json doesn't have lora_r set)
+        # User explicitly disabled LoRA with --lora-r 0
+        YELLOW = "\033[93m"
+        RESET = "\033[0m"
+        print(f"{YELLOW}  LoRA DISABLED by --lora-r 0: {len(lora_keys)} LoRA keys will be IGNORED{RESET}")
+    elif lora_keys and lora_r is None:
+        # Config didn't have LoRA info but checkpoint has LoRA keys
         RED = "\033[91m"
         BOLD = "\033[1m"
         RESET = "\033[0m"
@@ -850,8 +861,8 @@ def load_checkpoint(
         print(f"{RED}      Add lora_r to config.json or use --lora-r 8 to load LoRA weights.{RESET}\n")
 
     if real_missing:
-        # Filter out LoRA keys if LoRA not enabled
-        if lora_r == 0:
+        # Filter out LoRA keys if LoRA not enabled (0 or None)
+        if lora_r is None or lora_r == 0:
             real_missing = [k for k in real_missing if 'lora_' not in k]
         if real_missing:
             print(f"  Missing keys: {len(real_missing)}")
@@ -915,8 +926,8 @@ def main():
                         help='Sliding window stride (default: 512)')
     parser.add_argument('--num-samples', type=int, default=100,
                         help='Number of samples from cache (default: 100)')
-    parser.add_argument('--lora-r', type=int, default=0,
-                        help='LoRA rank if checkpoint has LoRA (default: 0, auto-detected from config)')
+    parser.add_argument('--lora-r', type=int, default=None,
+                        help='LoRA rank: None=auto-detect from config, 0=disable, >0=enable with rank')
     parser.add_argument('--lora-mlp-only', action='store_true',
                         help='Apply LoRA only to MLP layers (use if checkpoint was trained with mlp_only)')
     parser.add_argument('--model', type=str, default='Qwen/Qwen3-0.6B',
