@@ -175,22 +175,16 @@ def compute_perplexity_mlx(
         shift_logits = logits[:, :-1, :]  # [B, L-1, V]
         shift_labels = batch_chunks[:, 1:]  # [B, L-1]
 
-        # Compute cross-entropy loss manually
-        # log_softmax for numerical stability
-        log_probs = mx.log(mx.softmax(shift_logits, axis=-1) + 1e-10)
+        # Compute cross-entropy loss using numerically stable log_softmax
+        # log_softmax = x - logsumexp(x)
+        log_probs = shift_logits - mx.logsumexp(shift_logits, axis=-1, keepdims=True)
 
-        # Gather log probs at label positions
-        # shift_labels: [B, L-1], we need to index into log_probs [B, L-1, V]
+        # Gather log probs at label positions using take_along_axis
+        # shift_labels: [B, L-1], expand to [B, L-1, 1] for gathering
         B, L_minus_1, V = shift_logits.shape
-
-        # Flatten and use take
-        flat_log_probs = log_probs.reshape(-1, V)  # [B*L_minus_1, V]
-        flat_labels = shift_labels.reshape(-1)  # [B*L_minus_1]
-
-        # Get log prob at each label
-        # Use advanced indexing
-        batch_indices = mx.arange(B * L_minus_1)
-        selected_log_probs = flat_log_probs[batch_indices, flat_labels]  # [B*L_minus_1]
+        labels_expanded = mx.expand_dims(shift_labels, axis=-1)  # [B, L-1, 1]
+        selected_log_probs = mx.take_along_axis(log_probs, labels_expanded, axis=-1)  # [B, L-1, 1]
+        selected_log_probs = mx.squeeze(selected_log_probs, axis=-1)  # [B, L-1]
 
         # NLL = -log_prob, sum over all tokens
         nll = -mx.sum(selected_log_probs)
