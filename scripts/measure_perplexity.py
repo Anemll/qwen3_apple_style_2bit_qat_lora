@@ -753,6 +753,7 @@ def load_checkpoint(
 
     # Create separate configs for MLP and attention (different quantization)
     print(f"Converting to V2 QAT model (LUT={lut_size}/{attn_lut_size})...")
+    sys.stdout.flush()
     mlp_config = AnemllQuantConfigV2(
         lut_size=lut_size,
         scale_rank=scale_rank,
@@ -776,6 +777,7 @@ def load_checkpoint(
 
     # Load checkpoint
     print(f"Loading checkpoint: {ckpt_file}")
+    sys.stdout.flush()
     state_dict = torch.load(ckpt_file, map_location='cpu', weights_only=False)
 
     # Unwrap if needed
@@ -824,6 +826,7 @@ def load_checkpoint(
 
         mlp_str = ", mlp_only" if lora_mlp_only else ""
         print(f"  Enabling LoRA (r={lora_r}{mlp_str})...")
+        sys.stdout.flush()
         enable_recovery_lora_all(
             model,
             r=lora_r,
