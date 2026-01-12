@@ -444,21 +444,69 @@ class AnemllQATLinearV2(nn.Module):
         # When True, _get_normalized_scales() returns raw params without re-normalizing
         # Registered as buffer so it's saved/loaded with the model
         self.register_buffer("_scales_baked_flag", torch.tensor(0, dtype=torch.int8))
+        # Python cache to avoid .item() calls on XLA (causes graph breaks!)
+        # Initialize to False for fresh models (scales are never baked at init)
+        self._scales_baked_python: bool = False
+
+        # Register hook to sync Python cache from tensor buffer after load_state_dict
+        self.register_load_state_dict_post_hook(self._sync_scales_baked_from_buffer)
 
         self.reset_parameters()
 
     @property
     def _scales_baked(self) -> bool:
-        """Check if scales are already baked (magnitude in A, g=1)."""
-        if self._scales_baked_flag is not None:
-            return bool(self._scales_baked_flag.item())
-        return False
+        """Check if scales are already baked (magnitude in A, g=1).
+
+        Uses Python cache to avoid .item() calls which cause XLA graph breaks.
+        The cache is:
+        - Initialized to False in __init__ for fresh models
+        - Synced from tensor buffer by _sync_scales_baked_from_buffer hook after load_state_dict
+        - Updated by setter whenever the flag changes
+        """
+        return self._scales_baked_python
 
     @_scales_baked.setter
     def _scales_baked(self, value: bool):
         """Set the scales_baked flag."""
+        # Update Python cache (fast path for XLA)
+        self._scales_baked_python = value
+        # Update tensor buffer (for save/load persistence)
         if self._scales_baked_flag is not None:
             self._scales_baked_flag.fill_(1 if value else 0)
+
+    @staticmethod
+    def _sync_scales_baked_from_buffer(module, incompatible_keys):
+        """Hook called after load_state_dict to sync Python cache from tensor buffer.
+
+        This ensures the Python cache is correct after loading a checkpoint,
+        avoiding .item() calls in the forward path on XLA.
+        """
+        if hasattr(module, '_scales_baked_flag') and module._scales_baked_flag is not None:
+            # Read tensor value ONCE here (during load, not in forward)
+            module._scales_baked_python = bool(module._scales_baked_flag.item())
+
+    def mark_scales_baked(self, force: bool = False) -> bool:
+        """Detect and mark scales as baked (for old checkpoints).
+
+        Call this ONCE after loading a snapped checkpoint that doesn't have
+        _scales_baked_flag set. This avoids torch.allclose() in the hot path.
+
+        Args:
+            force: If True, mark as baked without checking. Otherwise auto-detect.
+
+        Returns:
+            True if scales were marked as baked.
+        """
+        if force:
+            self._scales_baked = True
+            return True
+        # Auto-detect: if rank_magnitude is all ones, scales are baked
+        if self.rank_magnitude is not None:
+            g = self.rank_magnitude
+            if g.numel() > 0 and torch.allclose(g, torch.ones_like(g), atol=1e-5):
+                self._scales_baked = True
+                return True
+        return False
 
     def reset_parameters(self):
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
@@ -538,19 +586,13 @@ class AnemllQATLinearV2(nn.Module):
         """
         # Fast path: scales already baked (after snap_for_ane/snap_for_export)
         # Return raw params without re-normalizing
+        # Note: _scales_baked uses Python cache to avoid XLA graph breaks
         if self._scales_baked:
             return self.scale_A, self.scale_B, self.rank_magnitude
 
-        # Auto-detect baked scales for old checkpoints without _scales_baked_flag
-        # If rank_magnitude is all ones, scales were likely baked (magnitude in scale_A)
-        # This prevents double-normalization when loading snapped checkpoints
-        if self.rank_magnitude is not None:
-            with torch.no_grad():
-                g = self.rank_magnitude
-                if g.numel() > 0 and torch.allclose(g, torch.ones_like(g), atol=1e-5):
-                    # Auto-set the flag so we don't check every forward pass
-                    self._scales_baked = True
-                    return self.scale_A, self.scale_B, self.rank_magnitude
+        # NOTE: Auto-detection of baked scales removed to avoid XLA graph breaks.
+        # torch.allclose() forces tensor sync which breaks XLA compilation.
+        # If loading old snapped checkpoints, call mark_scales_baked() explicitly.
 
         # Use config-driven eps (1e-6 is FP16-safe, 1e-8 underflows in FP16)
         eps = getattr(self.config, 'norm_eps', 1e-6)
