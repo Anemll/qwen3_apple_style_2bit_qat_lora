@@ -2101,24 +2101,51 @@ def freeze_for_recovery_training(model: nn.Module, verbose: bool = True) -> dict
                 trainable_count += 2
                 lora_params += module.lora_A.numel() + module.lora_B.numel()
 
-    # Also freeze non-V2 parameters (embeddings, layernorm, etc.)
+    # Collect V2 module names so we can skip their params (already frozen above)
+    v2_module_names = set()
+    for name, module in model.named_modules():
+        if isinstance(module, AnemllQATLinearV2):
+            v2_module_names.add(name)
+
+    # Also freeze non-V2 parameters (embeddings, layernorm, lm_head, etc.)
     other_frozen = 0
+    embed_frozen = 0
+    norm_frozen = 0
+    lm_head_frozen = 0
     for name, param in model.named_parameters():
-        # Skip V2 LoRA params (already handled)
+        # Skip V2 LoRA params (keep trainable)
         if 'lora_A' in name or 'lora_B' in name:
             continue
-        # Skip params we've already processed
-        if any(f'.{attr}' in name for attr in ['weight', 'scale_A', 'scale_B', 'rank_magnitude', 'lut', 'A_lut', 'B_lut']):
+
+        # Skip params belonging to V2 layers (already frozen above)
+        # Check if this param belongs to a V2 module
+        is_v2_param = False
+        for v2_name in v2_module_names:
+            if name.startswith(v2_name + '.'):
+                is_v2_param = True
+                break
+        if is_v2_param:
             continue
-        # Freeze everything else
+
+        # Freeze everything else (embeddings, layernorm, lm_head, etc.)
         if param.requires_grad:
             param.requires_grad = False
             other_frozen += 1
+            # Track what we're freezing for verbose output
+            if 'embed_tokens' in name:
+                embed_frozen += 1
+            elif 'norm' in name.lower() or 'layernorm' in name.lower():
+                norm_frozen += 1
+            elif 'lm_head' in name:
+                lm_head_frozen += 1
 
     stats = {
         'v2_frozen': frozen_count,
         'lora_trainable': trainable_count,
         'other_frozen': other_frozen,
+        'embed_frozen': embed_frozen,
+        'norm_frozen': norm_frozen,
+        'lm_head_frozen': lm_head_frozen,
         'total_lora_params': lora_params,
     }
 
@@ -2126,8 +2153,34 @@ def freeze_for_recovery_training(model: nn.Module, verbose: bool = True) -> dict
         print(f"\n[Freeze for Recovery Training]")
         print(f"  V2 params frozen: {frozen_count}")
         print(f"  Other params frozen: {other_frozen}")
+        if embed_frozen:
+            print(f"    - embed_tokens: {embed_frozen}")
+        if norm_frozen:
+            print(f"    - layernorms: {norm_frozen}")
+        if lm_head_frozen:
+            print(f"    - lm_head: {lm_head_frozen}")
         print(f"  LoRA params trainable: {trainable_count}")
         print(f"  Total LoRA params: {lora_params:,}")
+
+    # Sanity check: verify only LoRA params are trainable
+    non_lora_trainable = []
+    for name, param in model.named_parameters():
+        if param.requires_grad and 'lora_' not in name:
+            non_lora_trainable.append(name)
+
+    if non_lora_trainable:
+        import warnings
+        warnings.warn(
+            f"[freeze_for_recovery_training] WARNING: {len(non_lora_trainable)} non-LoRA params "
+            f"are still trainable! First 5: {non_lora_trainable[:5]}"
+        )
+        stats['non_lora_trainable'] = non_lora_trainable
+        if verbose:
+            print(f"  ⚠️  WARNING: {len(non_lora_trainable)} non-LoRA params still trainable!")
+            for n in non_lora_trainable[:5]:
+                print(f"      {n}")
+            if len(non_lora_trainable) > 5:
+                print(f"      ... and {len(non_lora_trainable) - 5} more")
 
     return stats
 
