@@ -854,7 +854,7 @@ def load_checkpoint(
 
     # Move to device
     print(f"Moving model to {device}...")
-    import sys; sys.stdout.flush()
+    sys.stdout.flush()
     model = model.to(device)
     print(f"  Model moved to device, setting eval mode...")
     sys.stdout.flush()
