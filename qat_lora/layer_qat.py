@@ -1809,6 +1809,9 @@ def train_e2e(
             except StopIteration:
                 temp_iter = iter(DataLoader(temp_dataset, batch_size=1, shuffle=False))
         anchor_input_ids = torch.stack(anchor_batches[:anchor_samples], dim=0).to(device)
+        # Truncate anchor_input_ids to seq_len for consistent XLA shapes
+        if seq_len > 0 and anchor_input_ids.size(1) > seq_len:
+            anchor_input_ids = anchor_input_ids[:, :seq_len].contiguous()
 
         # Compute anchor logits (sparse top-K if no_full_logits, otherwise full)
         if verbose:
@@ -2629,6 +2632,43 @@ def train_e2e(
 # ==============================================================================
 
 
+def _truncate_kd_batch_to_seq_len(batch: dict, seq_len: int) -> dict:
+    """
+    Force KD batch tensors to match seq_len.
+    This ensures shapes are constant for XLA compilation.
+
+    - input_ids: [B, L] -> [B, seq_len]
+    - attention_mask: [B, L] -> [B, seq_len]
+    - topk_idx/topk_logits: [B, L-1, K] -> [B, seq_len-1, K]
+    - rand_idx/rand_logits (if present): same as topk_*
+    """
+    if seq_len <= 0:
+        return batch
+
+    # input_ids
+    input_ids = batch.get("input_ids", None)
+    if input_ids is not None and input_ids.size(1) > seq_len:
+        batch["input_ids"] = input_ids[:, :seq_len].contiguous()
+
+    # attention_mask
+    attn_mask = batch.get("attention_mask", None)
+    if attn_mask is not None and attn_mask.size(1) > seq_len:
+        batch["attention_mask"] = attn_mask[:, :seq_len].contiguous()
+
+    # For top-k tensors, sequence dimension is usually L-1 (because predicting next token)
+    seq_k = max(seq_len - 1, 1)
+
+    for k in ["topk_idx", "topk_logits", "rand_idx", "rand_logits"]:
+        t = batch.get(k, None)
+        if t is None:
+            continue
+        # Expect [B, S, ...]
+        if t.dim() >= 2 and t.size(1) > seq_k:
+            batch[k] = t[:, :seq_k, ...].contiguous()
+
+    return batch
+
+
 def train_recovery_lora(
     model: nn.Module,
     train_data: Optional[str] = None,
@@ -3361,12 +3401,20 @@ def train_recovery_lora(
                 except StopIteration:
                     temp_iter = iter(kd_cache_dataset)
             anchor_batch = torch.stack(anchor_batches[:anchor_samples], dim=0).to(device)
+            # Truncate anchor_batch to seq_len for consistent XLA shapes
+            if seq_len > 0 and anchor_batch.size(1) > seq_len:
+                anchor_batch = anchor_batch[:, :seq_len].contiguous()
 
             # For sparse mode with KD cache, use cache's topk as anchor
             if use_sparse_anchor and anchor_topk_idx_list:
                 # Stack and use cache's topk directly as anchor (teacher logits)
                 anchor_topk_idx = torch.stack(anchor_topk_idx_list[:anchor_samples], dim=0)  # [A, L, K]
                 anchor_topk_logits = torch.stack(anchor_topk_logits_list[:anchor_samples], dim=0)  # [A, L, K]
+                # Truncate anchor topk to seq_len-1 for consistent XLA shapes
+                seq_k = max(seq_len - 1, 1)
+                if seq_len > 0 and anchor_topk_idx.size(1) > seq_k:
+                    anchor_topk_idx = anchor_topk_idx[:, :seq_k, :].contiguous()
+                    anchor_topk_logits = anchor_topk_logits[:, :seq_k, :].contiguous()
                 # Update K from cache
                 anchor_K = anchor_topk_idx.size(-1)
                 if verbose:
@@ -3379,6 +3427,9 @@ def train_recovery_lora(
             while sum(b.shape[0] for b in anchor_batches) < anchor_samples:
                 anchor_batches.append(streaming_tokenizer.get_batch().to(device))
             anchor_batch = torch.cat(anchor_batches, dim=0)[:anchor_samples]
+            # Truncate anchor_batch to seq_len for consistent XLA shapes
+            if seq_len > 0 and anchor_batch.size(1) > seq_len:
+                anchor_batch = anchor_batch[:, :seq_len].contiguous()
         elif input_ids is not None:
             # Use pre-tokenized input_ids
             total_tokens = input_ids.numel()
@@ -3626,6 +3677,8 @@ def train_recovery_lora(
                 'topk_idx': torch.stack([ex['topk_idx'] for ex in batch_examples]).to(device),
                 'topk_logits': torch.stack([ex['topk_logits'] for ex in batch_examples]).to(device),
             }
+            # Truncate to seq_len for consistent XLA shapes (cache may be longer)
+            kd_batch = _truncate_kd_batch_to_seq_len(kd_batch, seq_len)
             input_batch = kd_batch['input_ids']
             if _timing:
                 print(f"  [Step {step}] Batch collated: {input_batch.shape}", flush=True)
