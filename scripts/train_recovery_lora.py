@@ -257,6 +257,12 @@ def main():
     parser.add_argument("--keep-checkpoints", type=int, default=3,
                        help="Number of checkpoints to keep")
 
+    # Evaluation (TPU: set --eval-steps 0 to disable and avoid recompilations)
+    parser.add_argument("--eval-steps", type=int, default=0,
+                       help="Steps between evaluation (0=disable, recommended for TPU)")
+    parser.add_argument("--eval-samples", type=int, default=0,
+                       help="Number of samples for evaluation (0=disable eval)")
+
     # Quantization config (for loading checkpoint)
     parser.add_argument("--lut-size", type=int, default=16,
                        help="LUT size (4=2bit, 16=4bit)")
@@ -555,6 +561,8 @@ def main():
         mixed_precision=args.mixed_precision,
         dropout=args.dropout,
         log_interval=args.log_interval,
+        eval_interval=args.eval_steps,
+        eval_samples=args.eval_samples,
         save_dir=args.output,
         save_steps=args.save_steps,
         keep_checkpoints=args.keep_checkpoints,
