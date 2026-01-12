@@ -3987,6 +3987,7 @@ def train_recovery_lora(
 
                 if use_wandb and wandb_run is not None:
                     wandb.log({
+                        'step': optimizer_step,
                         'train/loss': avg_loss,
                         'train/lr': current_lr,
                         'train/tokens_per_sec': tok_per_sec,
