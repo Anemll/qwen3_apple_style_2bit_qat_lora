@@ -335,8 +335,12 @@ def compute_kd_loss_batch(
         # If all ones (no padding), skip mask entirely
         if torch.all(mask_cpu == 1):
             attention_mask = None
+            if _dbg:
+                print(f"    [kd_loss] attention_mask dropped (all ones, no padding)", flush=True)
         else:
             attention_mask = attention_mask.to(device)
+            if _dbg:
+                print(f"    [kd_loss] attention_mask kept (padding detected)", flush=True)
 
     topk_idx = batch['topk_idx'].to(device).long()
     topk_logits = batch['topk_logits'].to(device).to(model_dtype)  # Match model dtype
