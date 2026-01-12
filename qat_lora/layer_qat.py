@@ -352,8 +352,8 @@ def compute_kd_loss_batch(
     if _dbg:
         print(f"    [kd_loss] step={debug_step} model.model() done ({_time.time()-_t0:.1f}s), hidden.shape={hidden.shape}", flush=True)
 
-    # NaN detection for debugging
-    if hidden.isnan().any() or hidden.isinf().any():
+    # NaN detection for debugging (only when _dbg=True to avoid XLA graph breaks)
+    if _dbg and (hidden.isnan().any() or hidden.isinf().any()):
         nan_count = hidden.isnan().sum().item()
         inf_count = hidden.isinf().sum().item()
         print(f"[NaN DEBUG] hidden has {nan_count} NaN, {inf_count} inf values!")
@@ -373,8 +373,8 @@ def compute_kd_loss_batch(
     w = model.lm_head.weight[idx]  # [N, K, H]
     student_topk = torch.einsum('nh,nkh->nk', h, w).view(B, seq_len, K)
 
-    # NaN detection for student logits
-    if student_topk.isnan().any() or student_topk.isinf().any():
+    # NaN detection for student logits (only when _dbg=True to avoid XLA graph breaks)
+    if _dbg and (student_topk.isnan().any() or student_topk.isinf().any()):
         nan_count = student_topk.isnan().sum().item()
         inf_count = student_topk.isinf().sum().item()
         print(f"[NaN DEBUG] student_topk has {nan_count} NaN, {inf_count} inf values!")
@@ -395,8 +395,8 @@ def compute_kd_loss_batch(
     kl_per_token = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)  # [B, S]
     kl_loss = kl_per_token.mean() * (temperature ** 2)
 
-    # NaN detection for KL loss
-    if kl_loss.isnan() or kl_loss.isinf():
+    # NaN detection for KL loss (only when _dbg=True to avoid XLA graph breaks)
+    if _dbg and (kl_loss.isnan() or kl_loss.isinf()):
         print(f"[NaN DEBUG] kl_loss is {kl_loss.item()}")
         if teacher_probs.isnan().any() or teacher_probs.isinf().any():
             print(f"[NaN DEBUG] teacher_probs has NaN/inf")
