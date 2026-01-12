@@ -2140,11 +2140,14 @@ def train_e2e(
                         else:
                             hidden = model.model(anchor_input, use_cache=False).last_hidden_state
 
+                        # Remove last position to align with topk tensors (which are L-1 for next-token prediction)
+                        hidden = hidden[:, :-1, :]
+
                         # Get dimensions
                         B_anc, L_anc, H_anc = hidden.shape
-                        idx = anchor_topk_idx[anchor_sample_idx].to(device).long()  # [L, K]
+                        idx = anchor_topk_idx[anchor_sample_idx].to(device).long()  # [L-1, K]
                         K_anc = idx.size(1)
-                        anchor_topk = anchor_topk_logits[anchor_sample_idx].to(device).float()  # [L, K]
+                        anchor_topk = anchor_topk_logits[anchor_sample_idx].to(device).float()  # [L-1, K]
 
                         # Process in chunks to avoid XLA OOM (gather L*K rows is too large)
                         # For L=1024, K=128: full gather = 131K rows = 512MB
@@ -3827,11 +3830,14 @@ def train_recovery_lora(
                     else:
                         hidden = model.model(anchor_input, use_cache=False).last_hidden_state
 
+                    # Remove last position to align with topk tensors (which are L-1 for next-token prediction)
+                    hidden = hidden[:, :-1, :]
+
                     # Get dimensions
                     B_anc, L_anc, H_anc = hidden.shape
-                    idx = anchor_topk_idx[anchor_idx].to(device).long()  # [L, K]
+                    idx = anchor_topk_idx[anchor_idx].to(device).long()  # [L-1, K]
                     K_anc = idx.size(1)
-                    anchor_topk = anchor_topk_logits[anchor_idx].to(device).float()  # [L, K]
+                    anchor_topk = anchor_topk_logits[anchor_idx].to(device).float()  # [L-1, K]
 
                     # Process in chunks to avoid XLA OOM (gather L*K rows is too large)
                     # For L=1024, K=128: full gather = 131K rows = 512MB
