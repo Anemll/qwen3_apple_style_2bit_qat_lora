@@ -174,6 +174,14 @@ def main():
     parser.add_argument("--freeze-all", action="store_true",
                        help="Snap + freeze ALL V2 params (scale_A, scale_B, rank_magnitude) for FP16 export. Only LoRA trains.")
 
+    # Optional: unfreeze specific components (default: freeze everything except LoRA)
+    parser.add_argument("--train-norms", action="store_true",
+                       help="Also train layernorm weights (default: frozen)")
+    parser.add_argument("--train-embeddings", action="store_true",
+                       help="Also train embed_tokens (default: frozen)")
+    parser.add_argument("--train-lm-head", action="store_true",
+                       help="Also train lm_head (default: frozen)")
+
     # Training mode
     parser.add_argument("--lora-mode", type=str, default="recover",
                        choices=["recover", "sft", "kd"],
@@ -574,6 +582,9 @@ def main():
         freeze_mags=args.freeze_mags,
         freeze_mags_mlp=args.freeze_mags_mlp,
         freeze_all=args.freeze_all,
+        train_norms=args.train_norms,
+        train_embeddings=args.train_embeddings,
+        train_lm_head=args.train_lm_head,
     )
 
     # Save final checkpoint

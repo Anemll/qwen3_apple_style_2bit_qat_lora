@@ -2759,6 +2759,9 @@ def train_recovery_lora(
     freeze_mags: bool = False,
     freeze_mags_mlp: bool = False,
     freeze_all: bool = False,
+    train_norms: bool = False,
+    train_embeddings: bool = False,
+    train_lm_head: bool = False,
 ) -> dict:
     """Train recovery LoRA adapters with multiple training modes.
 
@@ -2853,7 +2856,13 @@ def train_recovery_lora(
             skip_k_proj=skip_k_proj,
             verbose=verbose,
         )
-        freeze_for_recovery_training(model, verbose=verbose)
+        freeze_for_recovery_training(
+            model,
+            verbose=verbose,
+            train_norms=train_norms,
+            train_embeddings=train_embeddings,
+            train_lm_head=train_lm_head,
+        )
 
     # Freeze mags/scales if requested (snap to FP16 + freeze)
     if freeze_all or freeze_mags or freeze_mags_mlp:

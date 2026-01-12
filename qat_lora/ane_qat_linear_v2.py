@@ -2046,15 +2046,29 @@ def enable_recovery_lora_all(
     return result
 
 
-def freeze_for_recovery_training(model: nn.Module, verbose: bool = True) -> dict:
+def freeze_for_recovery_training(
+    model: nn.Module,
+    verbose: bool = True,
+    train_norms: bool = False,
+    train_embeddings: bool = False,
+    train_lm_head: bool = False,
+) -> dict:
     """Freeze all quantized params, keep only LoRA trainable.
 
     After calling this, only lora_A and lora_B will have requires_grad=True.
     All other parameters (weights, scales, Q, rank_magnitude, LUTs) are frozen.
 
+    Optionally, specific components can be kept trainable:
+    - train_norms: Keep layernorm weights trainable
+    - train_embeddings: Keep embed_tokens trainable
+    - train_lm_head: Keep lm_head trainable
+
     Args:
         model: Model with V2 layers (after enable_recovery_lora_all)
         verbose: Print summary
+        train_norms: Keep layernorm weights trainable (default: False)
+        train_embeddings: Keep embed_tokens trainable (default: False)
+        train_lm_head: Keep lm_head trainable (default: False)
 
     Returns:
         Dictionary with frozen/trainable counts
@@ -2108,10 +2122,15 @@ def freeze_for_recovery_training(model: nn.Module, verbose: bool = True) -> dict
             v2_module_names.add(name)
 
     # Also freeze non-V2 parameters (embeddings, layernorm, lm_head, etc.)
+    # Unless explicitly kept trainable via flags
     other_frozen = 0
     embed_frozen = 0
     norm_frozen = 0
     lm_head_frozen = 0
+    embed_kept_trainable = 0
+    norm_kept_trainable = 0
+    lm_head_kept_trainable = 0
+
     for name, param in model.named_parameters():
         # Skip V2 LoRA params (keep trainable)
         if 'lora_A' in name or 'lora_B' in name:
@@ -2127,12 +2146,28 @@ def freeze_for_recovery_training(model: nn.Module, verbose: bool = True) -> dict
         if is_v2_param:
             continue
 
+        # Check if this param should stay trainable based on flags
+        is_embed = 'embed_tokens' in name
+        is_norm = 'norm' in name.lower() or 'layernorm' in name.lower()
+        is_lm_head = 'lm_head' in name
+
+        # Keep trainable if flag is set
+        if is_embed and train_embeddings:
+            embed_kept_trainable += 1
+            continue
+        if is_norm and train_norms:
+            norm_kept_trainable += 1
+            continue
+        if is_lm_head and train_lm_head:
+            lm_head_kept_trainable += 1
+            continue
+
         # Freeze everything else (embeddings, layernorm, lm_head, etc.)
         if param.requires_grad:
             param.requires_grad = False
             other_frozen += 1
             # Track what we're freezing for verbose output
-            if 'embed_tokens' in name:
+            if is_embed:
                 embed_frozen += 1
             elif 'norm' in name.lower() or 'layernorm' in name.lower():
                 norm_frozen += 1
@@ -2146,6 +2181,9 @@ def freeze_for_recovery_training(model: nn.Module, verbose: bool = True) -> dict
         'embed_frozen': embed_frozen,
         'norm_frozen': norm_frozen,
         'lm_head_frozen': lm_head_frozen,
+        'embed_kept_trainable': embed_kept_trainable,
+        'norm_kept_trainable': norm_kept_trainable,
+        'lm_head_kept_trainable': lm_head_kept_trainable,
         'total_lora_params': lora_params,
     }
 
@@ -2161,26 +2199,45 @@ def freeze_for_recovery_training(model: nn.Module, verbose: bool = True) -> dict
             print(f"    - lm_head: {lm_head_frozen}")
         print(f"  LoRA params trainable: {trainable_count}")
         print(f"  Total LoRA params: {lora_params:,}")
+        # Show intentionally kept trainable params
+        kept_trainable_total = embed_kept_trainable + norm_kept_trainable + lm_head_kept_trainable
+        if kept_trainable_total > 0:
+            print(f"  Extra params kept trainable: {kept_trainable_total}")
+            if embed_kept_trainable:
+                print(f"    - embed_tokens: {embed_kept_trainable} (--train-embeddings)")
+            if norm_kept_trainable:
+                print(f"    - layernorms: {norm_kept_trainable} (--train-norms)")
+            if lm_head_kept_trainable:
+                print(f"    - lm_head: {lm_head_kept_trainable} (--train-lm-head)")
 
-    # Sanity check: verify only LoRA params are trainable
-    non_lora_trainable = []
+    # Sanity check: verify only LoRA params (+ intentionally kept params) are trainable
+    unexpected_trainable = []
     for name, param in model.named_parameters():
         if param.requires_grad and 'lora_' not in name:
-            non_lora_trainable.append(name)
+            # Check if this param was intentionally kept trainable
+            is_allowed = False
+            if train_norms and ('norm' in name.lower() or 'layernorm' in name.lower()):
+                is_allowed = True
+            if train_embeddings and 'embed_tokens' in name:
+                is_allowed = True
+            if train_lm_head and 'lm_head' in name:
+                is_allowed = True
+            if not is_allowed:
+                unexpected_trainable.append(name)
 
-    if non_lora_trainable:
+    if unexpected_trainable:
         import warnings
         warnings.warn(
-            f"[freeze_for_recovery_training] WARNING: {len(non_lora_trainable)} non-LoRA params "
-            f"are still trainable! First 5: {non_lora_trainable[:5]}"
+            f"[freeze_for_recovery_training] WARNING: {len(unexpected_trainable)} unexpected params "
+            f"are still trainable! First 5: {unexpected_trainable[:5]}"
         )
-        stats['non_lora_trainable'] = non_lora_trainable
+        stats['unexpected_trainable'] = unexpected_trainable
         if verbose:
-            print(f"  ⚠️  WARNING: {len(non_lora_trainable)} non-LoRA params still trainable!")
-            for n in non_lora_trainable[:5]:
+            print(f"  ⚠️  WARNING: {len(unexpected_trainable)} unexpected params still trainable!")
+            for n in unexpected_trainable[:5]:
                 print(f"      {n}")
-            if len(non_lora_trainable) > 5:
-                print(f"      ... and {len(non_lora_trainable) - 5} more")
+            if len(unexpected_trainable) > 5:
+                print(f"      ... and {len(unexpected_trainable) - 5} more")
 
     return stats
 
