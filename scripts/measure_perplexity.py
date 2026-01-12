@@ -709,10 +709,11 @@ def load_checkpoint(
         print(f"  Attn:     Q{attn_lut_bits} (LUT{2**attn_lut_bits}), rank={attn_scale_rank}")
 
         # Auto-detect LoRA from config if not explicitly set via --lora-r
-        if 'lora_r' in config and config['lora_r'] > 0:
-            config_lora_r = config['lora_r']
-            config_lora_alpha = config.get('lora_alpha', config_lora_r)
-            config_lora_mlp_only = config.get('lora_mlp_only', False)
+        # Support both naming conventions: lora_r/lora_alpha/lora_mlp_only and recovery_r/recovery_alpha/mlp_only
+        config_lora_r = config.get('lora_r') or config.get('recovery_r') or 0
+        if config_lora_r > 0:
+            config_lora_alpha = config.get('lora_alpha') or config.get('recovery_alpha') or config_lora_r
+            config_lora_mlp_only = config.get('lora_mlp_only') or config.get('mlp_only') or False
 
             if lora_r == 0:
                 # Auto-set from config
