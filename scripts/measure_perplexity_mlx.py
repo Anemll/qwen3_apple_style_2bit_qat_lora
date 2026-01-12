@@ -22,6 +22,7 @@ Usage:
 Compares MLX-LM quantization with our QAT approach.
 Results saved to results/perplexity.json (same format as measure_perplexity.py).
 """
+from __future__ import annotations
 
 import argparse
 import json
@@ -30,17 +31,22 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-# MLX imports
+# MLX imports - deferred to avoid NameError on type hints
+MLX_AVAILABLE = False
+mx = None  # Will be set if mlx is available
+
+if TYPE_CHECKING:
+    import mlx.core as mx
+
 try:
     import mlx.core as mx
     import mlx.nn as nn
     from mlx_lm import load, generate
-    from mlx_lm.utils import generate_step
     MLX_AVAILABLE = True
 except ImportError:
-    MLX_AVAILABLE = False
-    print("Warning: mlx-lm not installed. Install with: pip install mlx-lm")
+    pass  # Warning printed in main()
 
 
 def format_time(seconds: float) -> str:
@@ -67,10 +73,8 @@ def load_wikitext2(tokenizer, max_tokens: int = None):
     # Concatenate all text
     text = "\n\n".join([x for x in dataset["text"] if x.strip()])
 
-    # Tokenize
+    # Tokenize - returns list of ints
     tokens = tokenizer.encode(text)
-    if isinstance(tokens, list):
-        tokens = mx.array(tokens)
 
     if max_tokens and len(tokens) > max_tokens:
         tokens = tokens[:max_tokens]
@@ -85,9 +89,8 @@ def load_custom_text(tokenizer, text_file: str, max_tokens: int = None):
     with open(text_file, 'r', encoding='utf-8') as f:
         text = f.read()
 
+    # Tokenize - returns list of ints
     tokens = tokenizer.encode(text)
-    if isinstance(tokens, list):
-        tokens = mx.array(tokens)
 
     if max_tokens and len(tokens) > max_tokens:
         tokens = tokens[:max_tokens]
@@ -98,7 +101,7 @@ def load_custom_text(tokenizer, text_file: str, max_tokens: int = None):
 
 def compute_perplexity_mlx(
     model,
-    tokens: mx.array,
+    tokens,
     batch_size: int = 1,
     seq_len: int = 512,
     verbose: bool = True,
@@ -110,7 +113,7 @@ def compute_perplexity_mlx(
 
     Args:
         model: MLX model
-        tokens: mx.array of token IDs
+        tokens: list or mx.array of token IDs
         batch_size: Batch size for parallel processing
         seq_len: Sequence length per chunk
         verbose: Print progress
@@ -118,6 +121,10 @@ def compute_perplexity_mlx(
     Returns:
         dict with perplexity, cross_entropy, tokens, time, throughput
     """
+    # Convert to mx.array if needed
+    if isinstance(tokens, list):
+        tokens = mx.array(tokens)
+
     total_tokens = len(tokens)
 
     # Split into fixed-length chunks
