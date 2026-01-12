@@ -322,9 +322,21 @@ def compute_kd_loss_batch(
     if _dbg:
         print(f"    [kd_loss] step={debug_step} moving batch to device...", flush=True)
     input_ids = batch['input_ids'].to(device)
+
+    # Conditionally drop attention_mask if it's all-ones (no padding)
+    # This avoids HF's masking_utils path which causes XLA sync noise
+    # Check on CPU to avoid XLA graph breaks
     attention_mask = batch.get('attention_mask')
     if attention_mask is not None:
-        attention_mask = attention_mask.to(device)
+        # Ensure long dtype for comparison
+        mask_cpu = attention_mask.cpu() if attention_mask.device.type != 'cpu' else attention_mask
+        if mask_cpu.dtype not in (torch.long, torch.int64, torch.int32):
+            mask_cpu = mask_cpu.long()
+        # If all ones (no padding), skip mask entirely
+        if torch.all(mask_cpu == 1):
+            attention_mask = None
+        else:
+            attention_mask = attention_mask.to(device)
 
     topk_idx = batch['topk_idx'].to(device).long()
     topk_logits = batch['topk_logits'].to(device).to(model_dtype)  # Match model dtype
