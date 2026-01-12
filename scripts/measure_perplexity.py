@@ -655,6 +655,7 @@ def load_checkpoint(
     device: torch.device,
     dtype: torch.dtype,
     lora_r: int = 0,
+    lora_mlp_only: bool = False,
     model_name: str = "Qwen/Qwen3-0.6B",
 ):
     """Load V2 QAT checkpoint."""
@@ -680,7 +681,7 @@ def load_checkpoint(
     attn_lut_bits = 4
     scale_rank = 32
     attn_scale_rank = 8  # Default for attention
-    lora_mlp_only = False  # Will be read from config if available
+    # Note: lora_mlp_only comes from function parameter (CLI flag or default False)
 
     # Check for config.json or v2_config.json
     config_dir = checkpoint_path.parent if checkpoint_path.is_file() else checkpoint_path
@@ -696,6 +697,9 @@ def load_checkpoint(
 
     if config_found:
         print(f"Config:     {config_found}")
+        # Print raw config for debugging
+        import json as json_mod
+        print(f"  Raw:      {json_mod.dumps(config, indent=None)}")
         # Support both naming conventions: lut_bits/mlp_lut_bits, scale_rank/mlp_scale_rank
         lut_bits = config.get('lut_bits') or config.get('mlp_lut_bits') or 4
         attn_lut_bits = config.get('attn_lut_bits') or lut_bits
@@ -713,14 +717,17 @@ def load_checkpoint(
             if lora_r == 0:
                 # Auto-set from config
                 lora_r = config_lora_r
-                lora_mlp_only = config_lora_mlp_only
+                # Only use config's mlp_only if not explicitly set via CLI
+                if not lora_mlp_only:
+                    lora_mlp_only = config_lora_mlp_only
                 GREEN = "\033[92m"
                 RESET = "\033[0m"
                 mlp_only_str = ", mlp_only=True" if lora_mlp_only else ""
                 print(f"  LoRA:     {GREEN}r={lora_r} (auto-detected from config){RESET}, alpha={config_lora_alpha}{mlp_only_str}")
             else:
                 # User explicitly specified, just show info
-                print(f"  LoRA:     r={config_lora_r}, alpha={config_lora_alpha}")
+                mlp_only_str = ", mlp_only=True" if lora_mlp_only else ""
+                print(f"  LoRA:     r={config_lora_r}, alpha={config_lora_alpha}{mlp_only_str}")
     else:
         print(f"Config:     (not found, using defaults)")
         print(f"  MLP:      Q{lut_bits} (LUT{2**lut_bits}), rank={scale_rank}")
@@ -908,7 +915,9 @@ def main():
     parser.add_argument('--num-samples', type=int, default=100,
                         help='Number of samples from cache (default: 100)')
     parser.add_argument('--lora-r', type=int, default=0,
-                        help='LoRA rank if checkpoint has LoRA (default: 0)')
+                        help='LoRA rank if checkpoint has LoRA (default: 0, auto-detected from config)')
+    parser.add_argument('--lora-mlp-only', action='store_true',
+                        help='Apply LoRA only to MLP layers (use if checkpoint was trained with mlp_only)')
     parser.add_argument('--model', type=str, default='Qwen/Qwen3-0.6B',
                         help='Base model name (default: Qwen/Qwen3-0.6B)')
     parser.add_argument('--device', choices=['auto', 'mps', 'cuda', 'cpu', 'tpu'], default='auto',
@@ -1011,6 +1020,7 @@ def main():
             device=device,
             dtype=dtype,
             lora_r=args.lora_r,
+            lora_mlp_only=args.lora_mlp_only,
             model_name=args.model,
         )
 
