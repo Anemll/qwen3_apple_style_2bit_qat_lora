@@ -441,14 +441,13 @@ def compute_perplexity_batched(
 
         with torch.no_grad():
             # Forward pass
-            if dtype != torch.float32:
-                device_type = 'xla' if is_tpu else str(device).split(':')[0]
-                if device_type == 'xla':
-                    # TPU: no autocast needed, model already in bf16
+            # TPU: no autocast, model uses specified dtype (fp16 or bf16)
+            # GPU: use autocast for mixed precision
+            if is_tpu:
+                outputs = model(batch_chunks)
+            elif dtype != torch.float32:
+                with torch.autocast(device_type=str(device).split(':')[0], dtype=dtype):
                     outputs = model(batch_chunks)
-                else:
-                    with torch.autocast(device_type=device_type, dtype=dtype):
-                        outputs = model(batch_chunks)
             else:
                 outputs = model(batch_chunks)
 
@@ -761,6 +760,22 @@ def load_checkpoint(
     # Unwrap if needed
     if 'model_state_dict' in state_dict:
         state_dict = state_dict['model_state_dict']
+
+    # Check checkpoint dtype and warn if mismatch
+    ckpt_dtypes = set()
+    for k, v in list(state_dict.items())[:20]:  # Sample first 20 tensors
+        if isinstance(v, torch.Tensor) and v.is_floating_point():
+            ckpt_dtypes.add(v.dtype)
+    if ckpt_dtypes:
+        ckpt_dtype = max(ckpt_dtypes, key=lambda d: {torch.float16: 1, torch.bfloat16: 2, torch.float32: 3}.get(d, 0))
+        if ckpt_dtype == torch.float16 and dtype == torch.bfloat16:
+            YELLOW = "\033[93m"
+            RESET = "\033[0m"
+            print(f"{YELLOW}  Warning: checkpoint is FP16 but using BF16 - consider --dtype fp16{RESET}")
+        elif ckpt_dtype == torch.bfloat16 and dtype == torch.float16:
+            YELLOW = "\033[93m"
+            RESET = "\033[0m"
+            print(f"{YELLOW}  Warning: checkpoint is BF16 but using FP16 - consider --dtype bf16{RESET}")
 
     # Load state dict
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
