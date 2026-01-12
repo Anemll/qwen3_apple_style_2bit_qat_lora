@@ -697,9 +697,6 @@ def load_checkpoint(
 
     if config_found:
         print(f"Config:     {config_found}")
-        # Print raw config for debugging
-        import json as json_mod
-        print(f"  Raw:      {json_mod.dumps(config, indent=None)}")
         # Support both naming conventions: lut_bits/mlp_lut_bits, scale_rank/mlp_scale_rank
         lut_bits = config.get('lut_bits') or config.get('mlp_lut_bits') or 4
         attn_lut_bits = config.get('attn_lut_bits') or lut_bits
