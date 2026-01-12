@@ -26,3 +26,4 @@ caches/
 
 # Local terminal guides (contain project-specific configs)
 docs/SR-008B-terminal.md
+results/perplexity.json

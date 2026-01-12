@@ -68,31 +68,47 @@ def get_device(device_arg: str = 'auto', dtype_arg: str = 'auto'):
     device = None
     default_dtype = None
 
+    # Debug: show what we're looking for
+    print(f"[Device] Requested: {device_arg}")
+
     if device_arg == 'tpu':
         try:
             import torch_xla.core.xla_model as xm
             device = xm.xla_device()
             default_dtype = torch.bfloat16
-        except ImportError:
+            print(f"[Device] TPU found: {device}")
+        except ImportError as e:
+            print(f"[Device] torch_xla not installed: {e}")
             print("Warning: torch_xla not installed, falling back to CPU")
+            device = torch.device('cpu')
+            default_dtype = torch.float32
+        except Exception as e:
+            print(f"[Device] TPU error: {e}")
             device = torch.device('cpu')
             default_dtype = torch.float32
     elif device_arg == 'auto':
         # TPU > MPS > CUDA > CPU
+        print("[Device] Auto-detecting: trying TPU...")
         try:
             import torch_xla.core.xla_model as xm
             device = xm.xla_device()
             default_dtype = torch.bfloat16
-        except ImportError:
-            pass
+            print(f"[Device] TPU found: {device}")
+        except ImportError as e:
+            print(f"[Device] torch_xla not available: {e}")
+        except Exception as e:
+            print(f"[Device] TPU init failed: {e}")
         if device is None:
             if torch.backends.mps.is_available():
+                print("[Device] MPS available")
                 device = torch.device('mps')
                 default_dtype = torch.float32
             elif torch.cuda.is_available():
+                print("[Device] CUDA available")
                 device = torch.device('cuda')
                 default_dtype = torch.bfloat16
             else:
+                print("[Device] Falling back to CPU")
                 device = torch.device('cpu')
                 default_dtype = torch.float32
     elif device_arg == 'mps':
@@ -837,7 +853,11 @@ def load_checkpoint(
                 print(f"    ... and {len(real_missing) - 3} more")
 
     # Move to device
+    print(f"Moving model to {device}...")
+    import sys; sys.stdout.flush()
     model = model.to(device)
+    print(f"  Model moved to device, setting eval mode...")
+    sys.stdout.flush()
     model.eval()
 
     # Count parameters
