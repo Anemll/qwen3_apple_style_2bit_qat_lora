@@ -285,6 +285,8 @@ def main():
                        help="Device (auto, cuda, mps, cpu, tpu)")
     parser.add_argument("--tpu", action="store_true",
                        help="Use TPU (sets PJRT_DEVICE=TPU, requires torch_xla)")
+    parser.add_argument("--xla-cache-dir", type=str, default=None,
+                       help="XLA persistent cache directory for faster TPU restarts")
 
     # Google Drive upload
     parser.add_argument("--upload", action="store_true",
@@ -333,6 +335,12 @@ def main():
             print(f"Note: Auto-enabling --generate-targets for {args.template_mode} mode with text format")
             print("      (Required for <think> tokens in training data)")
             args.generate_targets = True
+
+    # Set up XLA persistent cache (must be before TPU init)
+    if args.xla_cache_dir:
+        os.makedirs(args.xla_cache_dir, exist_ok=True)
+        os.environ['XLA_PERSISTENT_CACHE_PATH'] = args.xla_cache_dir
+        print(f"[XLA Cache] {args.xla_cache_dir}")
 
     # Determine device
     if args.tpu or args.device == "tpu":
