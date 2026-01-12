@@ -3698,7 +3698,7 @@ def train_recovery_lora(
         _timing = step <= 3 and (use_tpu or debug)
         if _timing:
             _step_times[f's{step}_start'] = time.time()
-            print(f"\n  [Step {step}] Starting...", flush=True)
+            print(f"\n  [Step {step}/{total_steps}] Data loading...", flush=True)
 
         # Get batch - KD cache, streaming tokenizer, or pre-tokenized data
         kd_batch = None
@@ -3722,7 +3722,7 @@ def train_recovery_lora(
             kd_batch = _truncate_kd_batch_to_seq_len(kd_batch, seq_len)
             input_batch = kd_batch['input_ids']
             if _timing:
-                print(f"  [Step {step}] Batch collated: {input_batch.shape}", flush=True)
+                print(f"  [Step {step}/{total_steps}] Data ready: {input_batch.shape}", flush=True)
         elif streaming_tokenizer is not None:
             input_batch = streaming_tokenizer.get_batch().to(device)  # [B, seq_len]
         else:
@@ -3749,7 +3749,7 @@ def train_recovery_lora(
         # Mode-specific loss computation (with optional mixed precision)
         if _timing:
             _step_times[f's{step}_fwd_start'] = time.time()
-            print(f"  [Step {step}] Forward pass starting...", flush=True)
+            print(f"  [Step {step}/{total_steps}] Forward pass (XLA compile on step 1)...", flush=True)
 
         # Use 'xla' device_type for TPU, otherwise use device.type
         autocast_device_type = 'xla' if use_tpu else device.type
@@ -3828,7 +3828,7 @@ def train_recovery_lora(
         if _timing:
             _step_times[f's{step}_fwd_end'] = time.time()
             _fwd_time = _step_times[f's{step}_fwd_end'] - _step_times[f's{step}_fwd_start']
-            print(f"  [Step {step}] Forward pass done ({_fwd_time:.1f}s)", flush=True)
+            print(f"  [Step {step}/{total_steps}] Forward done ({_fwd_time:.1f}s)", flush=True)
 
         # Optional anchor KL regularizer (soft CE, TPU/XLA safe)
         # Supports two modes: dense (anchor_logits) or sparse (anchor_topk_idx/anchor_topk_logits)
@@ -3912,7 +3912,7 @@ def train_recovery_lora(
         # Backward pass with optional mixed precision
         if _timing:
             _step_times[f's{step}_bwd_start'] = time.time()
-            print(f"  [Step {step}] Backward pass starting...", flush=True)
+            print(f"  [Step {step}/{total_steps}] Backward pass (XLA compile on step 1)...", flush=True)
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -3927,7 +3927,7 @@ def train_recovery_lora(
         if _timing:
             _step_times[f's{step}_bwd_end'] = time.time()
             _bwd_time = _step_times[f's{step}_bwd_end'] - _step_times[f's{step}_bwd_start']
-            print(f"  [Step {step}] Backward pass done ({_bwd_time:.1f}s)", flush=True)
+            print(f"  [Step {step}/{total_steps}] Backward done ({_bwd_time:.1f}s)", flush=True)
 
         # Accumulate loss - on TPU this causes device->host sync but mark_step mitigates it
         total_loss += loss.item() * accumulation_steps
@@ -3936,7 +3936,7 @@ def train_recovery_lora(
         if step % accumulation_steps == 0:
             if _timing:
                 _step_times[f's{step}_opt_start'] = time.time()
-                print(f"  [Step {step}] Optimizer step starting...", flush=True)
+                print(f"  [Step {step}/{total_steps}] Optimizer update...", flush=True)
 
             if scaler is not None:
                 scaler.unscale_(optimizer)
@@ -3963,7 +3963,7 @@ def train_recovery_lora(
                 _step_times[f's{step}_opt_end'] = time.time()
                 _opt_time = _step_times[f's{step}_opt_end'] - _step_times[f's{step}_opt_start']
                 _total_step = _step_times[f's{step}_opt_end'] - _step_times[f's{step}_start']
-                print(f"  [Step {step}] Optimizer done ({_opt_time:.1f}s), total step: {_total_step:.1f}s", flush=True)
+                print(f"  [Step {step}/{total_steps}] Complete ({_opt_time:.1f}s opt, {_total_step:.1f}s total)", flush=True)
 
             # Logging
             if optimizer_step % log_interval == 0:
