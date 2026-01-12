@@ -2347,18 +2347,25 @@ def train_e2e(
                         try:
                             # Try new API first (no device arg, returns object)
                             mem = xm.get_memory_info(device)
+                            used_gb = 0
+                            total_gb = 0
                             if hasattr(mem, 'bytes_limit'):
                                 # New API: object with bytes_limit/bytes_used attributes
-                                log_dict['tpu/memory_total_gb'] = getattr(mem, 'bytes_limit', 0) / 1e9
-                                log_dict['tpu/memory_used_gb'] = getattr(mem, 'bytes_used', 0) / 1e9
+                                total_gb = getattr(mem, 'bytes_limit', 0) / 1e9
+                                used_gb = getattr(mem, 'bytes_used', 0) / 1e9
                             elif isinstance(mem, dict):
                                 # Old API: dict with kb_total or bytes_used
                                 if "kb_total" in mem:
-                                    log_dict['tpu/memory_used_gb'] = (mem["kb_total"] - mem.get("kb_free", 0)) / 1024 / 1024
-                                    log_dict['tpu/memory_total_gb'] = mem["kb_total"] / 1024 / 1024
+                                    used_gb = (mem["kb_total"] - mem.get("kb_free", 0)) / 1024 / 1024
+                                    total_gb = mem["kb_total"] / 1024 / 1024
                                 elif "bytes_used" in mem:
-                                    log_dict['tpu/memory_used_gb'] = mem["bytes_used"] / 1e9
-                                    log_dict['tpu/memory_total_gb'] = mem.get("bytes_limit", 0) / 1e9
+                                    used_gb = mem["bytes_used"] / 1e9
+                                    total_gb = mem.get("bytes_limit", 0) / 1e9
+                            # Log to wandb
+                            log_dict['tpu/memory_used_gb'] = used_gb
+                            log_dict['tpu/memory_total_gb'] = total_gb
+                            if total_gb > 0:
+                                log_dict['tpu/memory_pct'] = 100.0 * used_gb / total_gb
                         except Exception as e:
                             # Log first failure for debugging
                             if optimizer_step == log_interval:
@@ -3642,6 +3649,12 @@ def train_recovery_lora(
     scaler = None
     autocast_dtype = None
     use_tpu = is_xla_device(device)
+    xm = None
+    if use_tpu:
+        try:
+            import torch_xla.core.xla_model as xm
+        except ImportError:
+            use_tpu = False
     if mixed_precision:
         if use_tpu:
             # TPU: FP32 weights + BF16 compute via autocast (device_type='xla' is supported)
@@ -3986,12 +3999,35 @@ def train_recovery_lora(
                     print(f"  Step {optimizer_step}/{max_steps}: loss={avg_loss:.4f}, lr={current_lr:.2e}, tok/s={tok_per_sec:.0f}, elapsed={elapsed_str}, ETA={eta_str}")
 
                 if use_wandb and wandb_run is not None:
-                    wandb.log({
+                    log_dict = {
                         'step': optimizer_step,
                         'train/loss': avg_loss,
                         'train/lr': current_lr,
                         'train/tokens_per_sec': tok_per_sec,
-                    }, step=optimizer_step)
+                    }
+                    # Add TPU memory stats if available
+                    if use_tpu and xm is not None:
+                        try:
+                            mem = xm.get_memory_info(device)
+                            used_gb = 0
+                            total_gb = 0
+                            if hasattr(mem, 'bytes_limit'):
+                                total_gb = getattr(mem, 'bytes_limit', 0) / 1e9
+                                used_gb = getattr(mem, 'bytes_used', 0) / 1e9
+                            elif isinstance(mem, dict):
+                                if "kb_total" in mem:
+                                    used_gb = (mem["kb_total"] - mem.get("kb_free", 0)) / 1024 / 1024
+                                    total_gb = mem["kb_total"] / 1024 / 1024
+                                elif "bytes_used" in mem:
+                                    used_gb = mem["bytes_used"] / 1e9
+                                    total_gb = mem.get("bytes_limit", 0) / 1e9
+                            log_dict['tpu/memory_used_gb'] = used_gb
+                            log_dict['tpu/memory_total_gb'] = total_gb
+                            if total_gb > 0:
+                                log_dict['tpu/memory_pct'] = 100.0 * used_gb / total_gb
+                        except Exception:
+                            pass
+                    wandb.log(log_dict, step=optimizer_step)
 
                 loss_history.append(avg_loss)
                 total_loss = 0.0

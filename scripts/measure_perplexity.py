@@ -408,6 +408,7 @@ def compute_perplexity_batched(
     is_tpu = 'xla' in str(device)
     if is_tpu:
         import torch_xla.core.xla_model as xm
+        print(f"  [TPU] First batch will trigger XLA compilation (~1-5 min)...")
 
     # Split into fixed-length chunks (discard remainder)
     # Each chunk is [seq_len] tokens
@@ -468,19 +469,22 @@ def compute_perplexity_batched(
         )
 
         batch_tokens = B * L_minus_1
-        nlls.append(loss.item())
-        tokens_processed += batch_tokens
 
-        # TPU: mark_step to execute graph
+        # TPU: mark_step BEFORE .item() to flush graph
         if is_tpu:
             xm.mark_step()
+
+        # Now safe to call .item()
+        loss_val = loss.item()
+        nlls.append(loss_val)
+        tokens_processed += batch_tokens
 
         # Print progress every 50 batches, plus first and last
         is_first = batch_idx == 0
         is_last = batch_idx == num_batches - 1
         is_milestone = (batch_idx + 1) % 50 == 0
         if verbose and (is_first or is_last or is_milestone):
-            batch_ppl = math.exp(loss.item() / batch_tokens) if batch_tokens > 0 else float('inf')
+            batch_ppl = math.exp(loss_val / batch_tokens) if batch_tokens > 0 else float('inf')
             elapsed_so_far = time.time() - start_time
             throughput = tokens_processed / elapsed_so_far if elapsed_so_far > 0 else 0
             if batch_idx > 0:
@@ -542,6 +546,7 @@ def compute_perplexity(
     is_tpu = 'xla' in str(device)
     if is_tpu:
         import torch_xla.core.xla_model as xm
+        print(f"  [TPU] First chunk will trigger XLA compilation (~1-5 min)...")
 
     # Calculate number of chunks
     num_chunks = max(1, (seq_len - 1) // stride)
@@ -565,8 +570,10 @@ def compute_perplexity(
         input_chunk = input_ids[:, begin:end].to(device)
 
         with torch.no_grad():
-            # Forward pass
-            if dtype != torch.float32:
+            # Forward pass - TPU doesn't use autocast, model is already in correct dtype
+            if is_tpu:
+                outputs = model(input_chunk)
+            elif dtype != torch.float32:
                 with torch.autocast(device_type=str(device).split(':')[0], dtype=dtype):
                     outputs = model(input_chunk)
             else:
@@ -587,19 +594,21 @@ def compute_perplexity(
             reduction='sum'
         )
 
-        nlls.append(loss.item())
-        total_tokens += trg_len
-
-        # TPU: mark_step to avoid graph explosion
+        # TPU: mark_step BEFORE .item() to flush graph, avoiding recompilation
         if is_tpu:
             xm.mark_step()
+
+        # Now safe to call .item() after mark_step
+        loss_val = loss.item()
+        nlls.append(loss_val)
+        total_tokens += trg_len
 
         # Print progress every 50 chunks, plus first and last
         is_first = chunk_num == 1
         is_last = chunk_num == num_chunks
         is_milestone = chunk_num % 50 == 0
         if verbose and (is_first or is_last or is_milestone):
-            chunk_ppl = math.exp(loss.item() / trg_len) if trg_len > 0 else float('inf')
+            chunk_ppl = math.exp(loss_val / trg_len) if trg_len > 0 else float('inf')
             elapsed_so_far = time.time() - start_time
             if chunk_num > 1:
                 avg_time_per_chunk = elapsed_so_far / chunk_num
@@ -656,6 +665,7 @@ def load_checkpoint(
     attn_lut_bits = 4
     scale_rank = 32
     attn_scale_rank = 8  # Default for attention
+    lora_mlp_only = False  # Will be read from config if available
 
     # Check for config.json or v2_config.json
     config_dir = checkpoint_path.parent if checkpoint_path.is_file() else checkpoint_path
@@ -678,8 +688,24 @@ def load_checkpoint(
         attn_scale_rank = config.get('attn_scale_rank') or scale_rank
         print(f"  MLP:      Q{lut_bits} (LUT{2**lut_bits}), rank={scale_rank}")
         print(f"  Attn:     Q{attn_lut_bits} (LUT{2**attn_lut_bits}), rank={attn_scale_rank}")
+
+        # Auto-detect LoRA from config if not explicitly set via --lora-r
         if 'lora_r' in config and config['lora_r'] > 0:
-            print(f"  LoRA:     r={config['lora_r']}, alpha={config.get('lora_alpha', config['lora_r'])}")
+            config_lora_r = config['lora_r']
+            config_lora_alpha = config.get('lora_alpha', config_lora_r)
+            config_lora_mlp_only = config.get('lora_mlp_only', False)
+
+            if lora_r == 0:
+                # Auto-set from config
+                lora_r = config_lora_r
+                lora_mlp_only = config_lora_mlp_only
+                GREEN = "\033[92m"
+                RESET = "\033[0m"
+                mlp_only_str = ", mlp_only=True" if lora_mlp_only else ""
+                print(f"  LoRA:     {GREEN}r={lora_r} (auto-detected from config){RESET}, alpha={config_lora_alpha}{mlp_only_str}")
+            else:
+                # User explicitly specified, just show info
+                print(f"  LoRA:     r={config_lora_r}, alpha={config_lora_alpha}")
     else:
         print(f"Config:     (not found, using defaults)")
         print(f"  MLP:      Q{lut_bits} (LUT{2**lut_bits}), rank={scale_rank}")
@@ -755,16 +781,17 @@ def load_checkpoint(
     if q_loaded > 0:
         print(f"  Loaded {q_loaded} _Q buffers (manual)")
 
-    # Handle LoRA if present in checkpoint and --lora-r specified
+    # Handle LoRA if present in checkpoint and lora_r is set (auto-detected or explicit)
     lora_keys = [k for k in state_dict if 'lora_' in k]
     if lora_keys and lora_r > 0:
         from qat_lora.ane_qat_linear_v2 import enable_recovery_lora_all
 
-        print(f"  Enabling LoRA (r={lora_r})...")
+        mlp_str = ", mlp_only" if lora_mlp_only else ""
+        print(f"  Enabling LoRA (r={lora_r}{mlp_str})...")
         enable_recovery_lora_all(
             model,
             r=lora_r,
-            mlp_only=False,
+            mlp_only=lora_mlp_only,
             skip_k_proj=True,
             verbose=False,
         )
@@ -774,7 +801,14 @@ def load_checkpoint(
         model.load_state_dict(lora_only, strict=False)
         print(f"  Loaded {len(lora_keys)} LoRA tensors")
     elif lora_keys and lora_r == 0:
-        print(f"  Warning: checkpoint has {len(lora_keys)} LoRA keys but --lora-r not set")
+        # Make this warning prominent - LoRA weights will be ignored!
+        # (This only triggers if config.json doesn't have lora_r set)
+        RED = "\033[91m"
+        BOLD = "\033[1m"
+        RESET = "\033[0m"
+        print(f"\n{RED}{BOLD}  ⚠️  WARNING: checkpoint has {len(lora_keys)} LoRA keys but LoRA not enabled!{RESET}")
+        print(f"{RED}      LoRA recovery weights will be IGNORED - perplexity will be worse!{RESET}")
+        print(f"{RED}      Add lora_r to config.json or use --lora-r 8 to load LoRA weights.{RESET}\n")
 
     if real_missing:
         # Filter out LoRA keys if LoRA not enabled

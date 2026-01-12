@@ -70,11 +70,15 @@ def load_wikitext2(tokenizer, max_tokens: int = None):
     print("Loading WikiText-2 test set...")
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
 
-    # Concatenate all text
-    text = "\n\n".join([x for x in dataset["text"] if x.strip()])
+    # Concatenate all text (same as PyTorch script - don't filter empties)
+    text = "\n\n".join(dataset["text"])
 
     # Tokenize - returns list of ints
+    # Note: mlx_lm tokenizers may handle special tokens differently
     tokens = tokenizer.encode(text)
+
+    # Debug: show first few tokens to verify tokenization
+    print(f"  First 10 tokens: {tokens[:10]}")
 
     if max_tokens and len(tokens) > max_tokens:
         tokens = tokens[:max_tokens]
@@ -99,6 +103,127 @@ def load_custom_text(tokenizer, text_file: str, max_tokens: int = None):
     return tokens
 
 
+def compute_perplexity_mlx_sliding(
+    model,
+    tokens,
+    stride: int = 512,
+    max_length: int = 1024,
+    verbose: bool = True,
+):
+    """
+    Compute perplexity using sliding window (more accurate, slower).
+
+    This matches the exact logic of the PyTorch measure_perplexity.py script.
+
+    Args:
+        model: MLX model
+        tokens: list or mx.array of token IDs
+        stride: Sliding window stride
+        max_length: Context window size
+        verbose: Print progress
+
+    Returns:
+        dict with perplexity, cross_entropy, tokens, time, throughput
+    """
+    # Convert to mx.array if needed
+    if isinstance(tokens, list):
+        tokens = mx.array(tokens)
+
+    seq_len = len(tokens)
+    num_chunks = max(1, (seq_len - 1) // stride)
+
+    if verbose:
+        print(f"\n  Total tokens: {seq_len:,}")
+        print(f"  Stride: {stride}, Max length: {max_length}")
+        print(f"  Chunks: ~{num_chunks}")
+
+    nlls = []
+    total_tokens = 0
+    start_time = time.time()
+
+    prev_end = 0
+    chunk_num = 0
+
+    # Match PyTorch sliding window logic exactly
+    for i in range(0, seq_len - 1, stride):
+        chunk_num += 1
+        begin = max(i + stride - max_length, 0)
+        end = min(i + stride, seq_len)
+
+        # Target length: how many new tokens we're predicting
+        target_len = end - prev_end
+        prev_end = end
+
+        # Get input chunk
+        input_chunk = tokens[begin:end]
+        chunk_input = mx.expand_dims(input_chunk, axis=0)  # [1, L]
+
+        # Forward pass
+        logits = model(chunk_input)
+        if hasattr(logits, 'logits'):
+            logits = logits.logits
+        elif isinstance(logits, tuple):
+            logits = logits[0]
+
+        # Compute loss on target tokens only (avoid counting overlapping tokens twice)
+        # shift_logits: predict positions [begin+1:end]
+        # We only want the last target_len predictions
+        trg_len = min(target_len, logits.shape[1] - 1)
+        if trg_len <= 0:
+            continue
+
+        # shift_logits: logits at positions [-trg_len-1:-1]
+        shift_logits = logits[0, -trg_len-1:-1, :]  # [trg_len, V]
+        # shift_labels: tokens at positions [end-trg_len:end]
+        shift_labels = tokens[end-trg_len:end]  # [trg_len]
+
+        # Compute log_softmax
+        log_probs = shift_logits - mx.logsumexp(shift_logits, axis=-1, keepdims=True)
+
+        # Gather log probs at label positions
+        labels_expanded = mx.expand_dims(shift_labels, axis=-1)  # [trg_len, 1]
+        selected_log_probs = mx.take_along_axis(log_probs, labels_expanded, axis=-1)  # [trg_len, 1]
+        selected_log_probs = mx.squeeze(selected_log_probs, axis=-1)  # [trg_len]
+
+        # NLL = -sum(log_probs)
+        nll = -mx.sum(selected_log_probs)
+        mx.eval(nll)
+
+        nlls.append(float(nll))
+        total_tokens += trg_len
+
+        # Progress every 50 chunks
+        is_first = chunk_num == 1
+        is_last = chunk_num == num_chunks
+        is_milestone = chunk_num % 50 == 0
+        if verbose and (is_first or is_last or is_milestone):
+            chunk_ppl = math.exp(float(nll) / trg_len) if trg_len > 0 else float('inf')
+            elapsed_so_far = time.time() - start_time
+            if chunk_num > 1:
+                avg_time = elapsed_so_far / chunk_num
+                eta = avg_time * (num_chunks - chunk_num)
+                eta_str = f" ETA: {format_time(eta)}"
+            else:
+                eta_str = ""
+            print(f"  Chunk {chunk_num}/{num_chunks}: ppl={chunk_ppl:.2f} (tokens={trg_len}){eta_str}")
+
+    elapsed = time.time() - start_time
+    total_nll = sum(nlls)
+    avg_nll = total_nll / total_tokens if total_tokens > 0 else float('inf')
+    ppl = math.exp(avg_nll)
+
+    return {
+        'perplexity': ppl,
+        'cross_entropy': avg_nll,
+        'tokens': total_tokens,
+        'time': elapsed,
+        'tokens_per_sec': total_tokens / elapsed if elapsed > 0 else 0,
+        'mode': 'sliding_window',
+        'stride': stride,
+        'max_length': max_length,
+    }
+
+
 def compute_perplexity_mlx(
     model,
     tokens,
@@ -107,9 +232,7 @@ def compute_perplexity_mlx(
     verbose: bool = True,
 ):
     """
-    Compute perplexity for MLX model.
-
-    Uses non-overlapping chunks for efficiency (same as batched mode in PyTorch script).
+    Compute perplexity using batched non-overlapping chunks (faster, less accurate).
 
     Args:
         model: MLX model
@@ -227,6 +350,7 @@ def compute_perplexity_mlx(
         'tokens': tokens_processed,
         'time': elapsed,
         'tokens_per_sec': tokens_processed / elapsed if elapsed > 0 else 0,
+        'mode': 'batched',
         'batch_size': batch_size,
         'seq_len': seq_len,
         'num_batches': num_batches,
@@ -279,6 +403,11 @@ def save_results_to_json(
     if 'batch_size' in result:
         entry['batch_size'] = result['batch_size']
         entry['seq_len'] = result['seq_len']
+    if 'mode' in result:
+        entry['mode'] = result['mode']
+        if result['mode'] == 'sliding_window':
+            entry['stride'] = result['stride']
+            entry['max_length'] = result['max_length']
 
     existing_results[key] = entry
 
@@ -368,9 +497,15 @@ def main():
 
     # Processing options
     parser.add_argument("--batch-size", type=int, default=1,
-                        help="Batch size for processing (default: 1)")
+                        help="Batch size for batched mode (default: 1)")
     parser.add_argument("--seq-len", type=int, default=512,
                         help="Sequence length per chunk (default: 512)")
+    parser.add_argument("--stride", type=int, default=512,
+                        help="Stride for sliding window mode (default: 512)")
+    parser.add_argument("--max-length", type=int, default=1024,
+                        help="Max context length for sliding window (default: 1024)")
+    parser.add_argument("--batched", action="store_true",
+                        help="Use faster batched mode instead of sliding window")
 
     # Output options
     parser.add_argument("--tag", type=str, default=None,
@@ -428,15 +563,24 @@ def main():
         dataset_name = "wikitext2"
 
     # Compute perplexity
-    print(f"\nComputing perplexity (B={args.batch_size}, L={args.seq_len})...")
-
-    result = compute_perplexity_mlx(
-        model=model,
-        tokens=tokens,
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
-        verbose=True,
-    )
+    if args.batched:
+        print(f"\nComputing perplexity (batched mode, B={args.batch_size}, L={args.seq_len})...")
+        result = compute_perplexity_mlx(
+            model=model,
+            tokens=tokens,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            verbose=True,
+        )
+    else:
+        print(f"\nComputing perplexity (sliding window, stride={args.stride}, max_len={args.max_length})...")
+        result = compute_perplexity_mlx_sliding(
+            model=model,
+            tokens=tokens,
+            stride=args.stride,
+            max_length=args.max_length,
+            verbose=True,
+        )
 
     # Print results
     print("\n" + "=" * 60)
