@@ -141,6 +141,8 @@ def main():
                         help='Auto-upload run to Google Drive after successful training (uses gdrive_sync.py)')
     parser.add_argument('--upload-exclude', type=str, action='append', default=None,
                         help='Glob patterns to exclude from upload (default: *checkpoint*). Can be used multiple times.')
+    parser.add_argument('--upload-all', action='store_true',
+                        help='Upload everything without exclusions (overrides --upload-exclude)')
     # Memory optimization
     parser.add_argument('--gradient-checkpointing', action='store_true',
                         help='Enable gradient checkpointing (trades ~15%% speed for ~40%% memory)')
@@ -892,7 +894,11 @@ def main():
             from gdrive_sync import sync_up
 
             # Default exclude pattern: *checkpoint* (intermediate checkpoints are large)
-            exclude_patterns = args.upload_exclude if args.upload_exclude else ['*checkpoint*']
+            # --upload-all overrides to upload everything
+            if args.upload_all:
+                exclude_patterns = []
+            else:
+                exclude_patterns = args.upload_exclude if args.upload_exclude else ['*checkpoint*']
 
             # Upload the output directory (run folder)
             success = sync_up(
