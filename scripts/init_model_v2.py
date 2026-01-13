@@ -85,6 +85,149 @@ sys.path.insert(0, str(REPO_DIR))
 
 
 # =============================================================================
+# LUT CANDIDATES (FP16-snapped)
+# =============================================================================
+
+def build_fp16_lut(target_values: List[float]) -> torch.Tensor:
+    """
+    Build a monotonically increasing FP16 LUT with distinct values.
+
+    Takes target values and ensures:
+    1. All values are exactly representable in FP16
+    2. All values are distinct (no duplicates)
+    3. Values are monotonically increasing
+
+    If snapping creates duplicates, increments to next distinct FP16 value.
+
+    Args:
+        target_values: Desired LUT values (will be adjusted to valid FP16)
+
+    Returns:
+        Tensor of distinct, monotonic FP16 values
+    """
+    import struct
+
+    def float_to_fp16_bits(f: float) -> int:
+        """Convert float to FP16 bit representation."""
+        return struct.unpack('H', struct.pack('e', f))[0]
+
+    def fp16_bits_to_float(bits: int) -> float:
+        """Convert FP16 bits back to float."""
+        return struct.unpack('e', struct.pack('H', bits))[0]
+
+    def next_fp16(f: float) -> float:
+        """Get the next larger FP16 value."""
+        bits = float_to_fp16_bits(f)
+        if f >= 0:
+            return fp16_bits_to_float(bits + 1)
+        else:
+            return fp16_bits_to_float(bits - 1)
+
+    def snap_to_fp16(f: float) -> float:
+        """Snap to nearest FP16 value."""
+        return float(torch.tensor(f, dtype=torch.float32).to(torch.float16).item())
+
+    # Sort target values
+    targets = sorted(target_values)
+
+    # Build LUT with distinct FP16 values
+    result = []
+    prev_fp16 = float('-inf')
+
+    for target in targets:
+        # Snap to FP16
+        fp16_val = snap_to_fp16(target)
+
+        # Ensure monotonically increasing and distinct
+        while fp16_val <= prev_fp16:
+            fp16_val = next_fp16(fp16_val)
+
+        result.append(fp16_val)
+        prev_fp16 = fp16_val
+
+    return torch.tensor(result, dtype=torch.float32)
+
+
+def make_lut_candidates(lut_size: int = 16) -> Dict[str, torch.Tensor]:
+    """
+    Generate FP16 LUT candidates for per-tensor LUT search.
+
+    All LUTs have exactly lut_size distinct, monotonically increasing FP16 values.
+
+    Args:
+        lut_size: Number of LUT entries (default: 16 for 4-bit)
+
+    Returns:
+        Dict mapping LUT name to FP16 tensor of values
+    """
+    import numpy as np
+
+    # Helper to create symmetric LUT from positive half
+    def symmetric_lut(positive_values: List[float]) -> torch.Tensor:
+        """Create symmetric LUT: [-pos_n, ..., -pos_1, pos_1, ..., pos_n]"""
+        n = len(positive_values)
+        if n * 2 != lut_size:
+            raise ValueError(f"Need {lut_size // 2} positive values for {lut_size}-entry LUT")
+        negative = [-v for v in reversed(positive_values)]
+        return build_fp16_lut(negative + positive_values)
+
+    half = lut_size // 2  # 8 positive values for 16-entry LUT
+
+    # Generate positive half values for different distributions
+    y = np.linspace(0, 1, half + 1)[1:]  # [0.125, 0.25, ..., 1.0] for half=8
+
+    candidates = {
+        # === Standard [-1, 1] LUTs ===
+
+        # === FP4-ish LUTs with outlier bins ===
+
+        # 7 uniform in (0,1] + 1 outlier at 1.5
+        #'fp4_soft': symmetric_lut([0.143, 0.286, 0.429, 0.571, 0.714, 0.857, 1.0, 1.5]),
+
+        # 7 uniform in (0,1] + 1 outlier at 2.0
+        #'fp4_med': symmetric_lut([0.143, 0.286, 0.429, 0.571, 0.714, 0.857, 1.0, 2.0]),
+
+        # 6 uniform in (0,1] + 2 outliers at 1.5, 3.0
+        #'fp4_strong': symmetric_lut([0.167, 0.333, 0.5, 0.667, 0.833, 1.0, 1.5, 3.0]),
+
+
+        # Uniform: linspace - good default
+        'uniform': symmetric_lut(y.tolist()),
+
+
+        # Dense near 0 (power-law spacing) + 1 outlier at 2.0
+        'fp4_dense': symmetric_lut([0.0625, 0.125, 0.25, 0.375, 0.5, 0.75, 1.0, 2.0]),
+   
+
+        # Power-2 (quadratic): more resolution near 0
+        #'power2': symmetric_lut((y ** 2.0).tolist()),
+
+        # Power-3 (cubic): much more resolution near 0
+        #'power3': symmetric_lut((y ** 3.0).tolist()),
+
+        # Inverse μ-law (μ=50): dense near 0
+        #'inv_mu50': symmetric_lut((np.expm1(y * np.log1p(50)) / 50).tolist()),
+
+
+   
+    }
+
+    return candidates
+
+
+# Default LUT candidates for LUT16 (4-bit) search
+LUT16_CANDIDATES = None  # Lazily initialized
+
+
+def get_lut16_candidates() -> Dict[str, torch.Tensor]:
+    """Get or create the default LUT16 candidates."""
+    global LUT16_CANDIDATES
+    if LUT16_CANDIDATES is None:
+        LUT16_CANDIDATES = make_lut_candidates(lut_size=16)
+    return LUT16_CANDIDATES
+
+
+# =============================================================================
 # STEP 1: CONFIGURATION
 # =============================================================================
 
@@ -878,6 +1021,392 @@ def replace_linear_layers_with_optimal_groups(
 
 
 # =============================================================================
+# STEP 4e: SEARCH OPTIMAL LUT PER TENSOR
+# =============================================================================
+
+@torch.no_grad()
+def search_optimal_luts(
+    model: nn.Module,
+    model_id: str,
+    lut_candidates: Dict[str, torch.Tensor],
+    group_size: int = 32,
+    mlp_lut_bits: int = 4,
+    mlp_scale_rank: int = 32,
+    attn_lut_bits: int = 4,
+    attn_scale_rank: int = 32,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Search for optimal LUT per tensor by testing candidates and minimizing MAE.
+
+    For each 4-bit linear layer, tests each LUT candidate by:
+    1. Computing SVD-based scale initialization with that LUT
+    2. Quantizing to LUT
+    3. Measuring reconstruction MAE = |W_ref - Q * S|
+    4. Selecting LUT with minimum MAE
+
+    NOTE: Only searches for 4-bit layers (LUT16). 2-bit layers keep uniform LUT.
+
+    Args:
+        model: Base model with nn.Linear layers (BEFORE V2 replacement)
+        model_id: HuggingFace model ID (for reference, model already loaded)
+        lut_candidates: Dict mapping LUT name to tensor (e.g., {'uniform': tensor, ...})
+        group_size: Group size for SVD scale initialization
+        mlp_lut_bits: LUT bits for MLP layers
+        mlp_scale_rank: Scale rank for MLP layers
+        attn_lut_bits: LUT bits for Attention layers
+        attn_scale_rank: Scale rank for Attention layers
+        verbose: Print progress
+
+    Returns:
+        Dict with per-layer optimal LUT names and statistics
+    """
+    from qat_lora.ane_qat_linear_v2 import AnemllQuantConfigV2, AnemllQATLinearV2
+
+    if verbose:
+        print(f"\n[Step 4e] Searching optimal LUT per tensor")
+        print(f"  Testing LUTs: {list(lut_candidates.keys())}")
+        print(f"  MLP: LUT{2**mlp_lut_bits} ({mlp_lut_bits}-bit), rank={mlp_scale_rank}")
+        print(f"  Attn: LUT{2**attn_lut_bits} ({attn_lut_bits}-bit), rank={attn_scale_rank}")
+
+    t0 = time.time()
+
+    # Collect all linear layers that would be quantized (MLP + Attn, not lm_head/embeddings)
+    linear_layers = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            # Skip lm_head and embeddings
+            if 'lm_head' in name or 'embed' in name:
+                continue
+            # Only include MLP and attention layers
+            if 'mlp' in name or 'self_attn' in name or 'attention' in name:
+                linear_layers.append((name, module))
+
+    if verbose:
+        print(f"  Found {len(linear_layers)} linear layers to analyze")
+
+    # Results storage
+    layer_results = []
+    lut_names = list(lut_candidates.keys())
+    lut_counts = {name: 0 for name in lut_names}
+    mlp_lut_counts = {name: 0 for name in lut_names}
+    attn_lut_counts = {name: 0 for name in lut_names}
+
+    for layer_idx, (name, linear_module) in enumerate(linear_layers):
+        # Get device from original module
+        device = linear_module.weight.device
+        W_ref = linear_module.weight.data.clone()
+        out_features, in_features = W_ref.shape
+
+        # Determine layer type and select appropriate config
+        is_mlp = 'mlp' in name
+        is_attn = 'self_attn' in name or 'attention' in name
+        layer_type = 'mlp' if is_mlp else ('attn' if is_attn else 'other')
+
+        # Use appropriate LUT size and scale rank for this layer type
+        if is_mlp:
+            lut_bits = mlp_lut_bits
+            lut_size = 2 ** mlp_lut_bits
+            scale_rank = mlp_scale_rank
+        else:  # Attention
+            lut_bits = attn_lut_bits
+            lut_size = 2 ** attn_lut_bits
+            scale_rank = attn_scale_rank
+
+        # Only search LUT for 4-bit layers (LUT16)
+        # 2-bit layers (LUT4) keep uniform - we'll handle that later
+        if lut_bits != 4:
+            # Skip search, use uniform
+            layer_result = {
+                'name': name,
+                'shape': [out_features, in_features],
+                'type': layer_type,
+                'optimal_lut': 'uniform',
+                'optimal_mse': 0.0,
+                'all_mses': {'uniform': 0.0},
+                'skipped': True,
+                'skip_reason': f'{lut_bits}-bit, search only for 4-bit',
+            }
+            layer_results.append(layer_result)
+            lut_counts['uniform'] += 1
+            if is_mlp:
+                mlp_lut_counts['uniform'] += 1
+            elif is_attn:
+                attn_lut_counts['uniform'] += 1
+            continue
+
+        # Test each LUT candidate
+        best_lut_name = 'uniform'
+        best_mse = float('inf')
+        lut_mses = {}
+
+        for lut_name, lut_tensor in lut_candidates.items():
+            # Create temporary config
+            temp_config = AnemllQuantConfigV2(
+                lut_size=lut_size,
+                scale_rank=scale_rank,
+                group_size=group_size,
+                force_positive_scales=False,
+                positive_scale_method="abs",
+                magnitude_activation="identity",
+                magnitude_eps=0.0,
+            )
+
+            # Create temporary V2 layer with this LUT
+            try:
+                temp_v2 = AnemllQATLinearV2.from_linear(
+                    linear_module,
+                    config=temp_config,
+                    skip_init=False,  # Do full SVD init
+                    custom_lut=lut_tensor,  # Use this LUT candidate
+                )
+
+                # Ensure all tensors are on the same device
+                temp_v2.to(device)
+
+                # DEBUG: Print LUT values for first layer
+                if layer_idx == 0 and verbose:
+                    print(f"      DEBUG: {lut_name} LUT values: {temp_v2.lut.tolist()[:4]}...{temp_v2.lut.tolist()[-4:]}")
+
+                # Freeze Q to populate _Q buffer
+                temp_v2.freeze_Q()
+
+                # Get effective weight: W_eff = Q * S
+                Q = temp_v2._Q.view(temp_v2.out_features, temp_v2.in_features)
+                S = temp_v2._compute_full_scales()
+                W_eff = Q * S
+
+                # DEBUG: Print Q stats for first layer
+                if layer_idx == 0 and verbose:
+                    unique_q = torch.unique(Q)
+                    # Index histogram
+                    indices = temp_v2._indices
+                    idx_counts = torch.bincount(indices.flatten(), minlength=16)
+                    idx_hist = idx_counts.tolist()
+                    print(f"      DEBUG: {lut_name} Q unique={len(unique_q)}, range=[{Q.min():.4f}, {Q.max():.4f}]")
+                    print(f"      DEBUG: {lut_name} idx histogram: {idx_hist}")
+
+                # Compute MSE (penalizes large errors more than MAE)
+                mse = ((W_ref - W_eff) ** 2).mean().item()
+                lut_mses[lut_name] = mse
+
+                if mse < best_mse:
+                    best_mse = mse
+                    best_lut_name = lut_name
+
+                # Clean up
+                del temp_v2
+
+            except Exception as e:
+                if verbose:
+                    print(f"    [WARN] LUT '{lut_name}' failed for {name}: {e}")
+                lut_mses[lut_name] = float('inf')
+
+        layer_result = {
+            'name': name,
+            'shape': [out_features, in_features],
+            'type': layer_type,
+            'optimal_lut': best_lut_name,
+            'optimal_mse': best_mse,
+            'all_mses': lut_mses,
+            'skipped': False,
+        }
+        layer_results.append(layer_result)
+
+        # Update counts
+        lut_counts[best_lut_name] += 1
+        if is_mlp:
+            mlp_lut_counts[best_lut_name] += 1
+        elif is_attn:
+            attn_lut_counts[best_lut_name] += 1
+
+        # Progress (print every layer for debugging)
+        if verbose:
+            short_name = name.split('.')[-2] + '.' + name.split('.')[-1] if '.' in name else name
+            # Show MSE for ALL LUTs, sorted by MSE value (scientific notation)
+            # Highlight lowest (best) MSE in green if terminal supports colors
+            sorted_mses = sorted(lut_mses.items(), key=lambda x: x[1])
+            use_color = sys.stdout.isatty()
+            GREEN = '\033[92m' if use_color else ''
+            RESET = '\033[0m' if use_color else ''
+            mse_parts = []
+            for i, (n, m) in enumerate(sorted_mses):
+                if i == 0:  # Best (lowest) MSE - show in green
+                    mse_parts.append(f"{GREEN}{n}={m:.2e}{RESET}")
+                else:
+                    mse_parts.append(f"{n}={m:.2e}")
+            mse_str = ', '.join(mse_parts)
+            print(f"    [{layer_idx+1}/{len(linear_layers)}] {short_name}: best={best_lut_name}")
+            print(f"        MSEs: {mse_str}")
+
+    elapsed = time.time() - t0
+
+    # Build optimal LUT map
+    optimal_lut_map = {r['name']: r['optimal_lut'] for r in layer_results}
+
+    # Aggregate statistics
+    stats = {
+        'num_layers': len(layer_results),
+        'lut_names_tested': lut_names,
+        'lut_counts': lut_counts,
+        'mlp_lut_counts': mlp_lut_counts,
+        'attn_lut_counts': attn_lut_counts,
+        'optimal_lut_map': optimal_lut_map,
+        'layer_results': layer_results,
+        'time_seconds': elapsed,
+    }
+
+    if verbose:
+        print(f"\n  LUT Search Results:")
+        print(f"    Layers analyzed: {stats['num_layers']}")
+        print(f"    Time: {elapsed:.1f}s")
+        print(f"\n  Optimal LUT Distribution:")
+        for lut_name in lut_names:
+            count = lut_counts[lut_name]
+            pct = 100 * count / max(1, len(layer_results))
+            mlp_count = mlp_lut_counts[lut_name]
+            attn_count = attn_lut_counts[lut_name]
+            print(f"    {lut_name:10s}: {count:3d} layers ({pct:5.1f}%) - MLP: {mlp_count}, Attn: {attn_count}")
+
+        # Show breakdown by layer type
+        print(f"\n  MLP layers LUT distribution:")
+        mlp_total = sum(mlp_lut_counts.values())
+        for lut_name in lut_names:
+            if mlp_lut_counts[lut_name] > 0:
+                pct = 100 * mlp_lut_counts[lut_name] / max(1, mlp_total)
+                print(f"    {lut_name}: {mlp_lut_counts[lut_name]} ({pct:.1f}%)")
+
+        print(f"\n  Attention layers LUT distribution:")
+        attn_total = sum(attn_lut_counts.values())
+        for lut_name in lut_names:
+            if attn_lut_counts[lut_name] > 0:
+                pct = 100 * attn_lut_counts[lut_name] / max(1, attn_total)
+                print(f"    {lut_name}: {attn_lut_counts[lut_name]} ({pct:.1f}%)")
+
+    return stats
+
+
+def replace_linear_layers_with_optimal_luts(
+    model: nn.Module,
+    optimal_lut_map: Dict[str, str],
+    lut_candidates: Dict[str, torch.Tensor],
+    group_size: int = 32,
+    mlp_lut_bits: int = 4,
+    mlp_scale_rank: int = 32,
+    attn_lut_bits: int = 4,
+    attn_scale_rank: int = 32,
+    quantize_attn: bool = True,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Replace linear layers using per-layer optimal LUTs.
+
+    Args:
+        model: Base model with nn.Linear layers
+        optimal_lut_map: Dict mapping layer name -> optimal LUT name
+        lut_candidates: Dict mapping LUT name -> tensor
+        group_size: Group size for SVD scale initialization
+        mlp_lut_bits: LUT bits for MLP layers
+        mlp_scale_rank: Scale rank for MLP layers
+        attn_lut_bits: LUT bits for Attention layers
+        attn_scale_rank: Scale rank for Attention layers
+        quantize_attn: Whether to quantize attention layers
+        verbose: Print progress
+
+    Returns:
+        Dict with replacement stats
+    """
+    from qat_lora.ane_qat_linear_v2 import AnemllQuantConfigV2, AnemllQATLinearV2
+
+    if verbose:
+        print(f"\n[Step 4f] Replacing layers with optimal LUTs")
+        print(f"  MLP: LUT{2**mlp_lut_bits} ({mlp_lut_bits}-bit), rank={mlp_scale_rank}")
+        print(f"  Attn: LUT{2**attn_lut_bits} ({attn_lut_bits}-bit), rank={attn_scale_rank}")
+
+    t0 = time.time()
+
+    # Collect layers to replace
+    layers_to_replace = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            if 'lm_head' in name or 'embed' in name:
+                continue
+            is_mlp = 'mlp' in name
+            is_attn = 'self_attn' in name or 'attention' in name
+            if is_mlp or (quantize_attn and is_attn):
+                layers_to_replace.append((name, module))
+
+    if verbose:
+        print(f"  Replacing {len(layers_to_replace)} layers")
+
+    replaced_count = 0
+    lut_used = {}
+
+    for layer_idx, (name, linear_module) in enumerate(layers_to_replace):
+        # Get optimal LUT for this layer
+        lut_name = optimal_lut_map.get(name, 'uniform')
+        custom_lut = lut_candidates.get(lut_name)
+
+        # Determine layer type and use appropriate config
+        is_mlp = 'mlp' in name
+        if is_mlp:
+            lut_size = 2 ** mlp_lut_bits
+            scale_rank = mlp_scale_rank
+        else:  # Attention
+            lut_size = 2 ** attn_lut_bits
+            scale_rank = attn_scale_rank
+
+        # Create config
+        config = AnemllQuantConfigV2(
+            lut_size=lut_size,
+            scale_rank=scale_rank,
+            group_size=group_size,
+            force_positive_scales=False,
+            positive_scale_method="abs",
+            magnitude_activation="identity",
+            magnitude_eps=0.0,
+        )
+
+        # Create V2 layer with custom LUT
+        v2_layer = AnemllQATLinearV2.from_linear(
+            linear_module,
+            config=config,
+            skip_init=False,
+            custom_lut=custom_lut,
+        )
+
+        # Replace in model
+        parent_name, layer_name = name.rsplit('.', 1) if '.' in name else ('', name)
+        parent = model
+        for part in parent_name.split('.'):
+            if part:
+                parent = getattr(parent, part)
+        setattr(parent, layer_name, v2_layer)
+
+        replaced_count += 1
+        lut_used[lut_name] = lut_used.get(lut_name, 0) + 1
+
+        # Progress
+        if verbose and (layer_idx % 40 == 0 or layer_idx == len(layers_to_replace) - 1):
+            short_name = name.split('.')[-2] + '.' + name.split('.')[-1] if '.' in name else name
+            print(f"    [{layer_idx+1}/{len(layers_to_replace)}] {short_name} (lut={lut_name})")
+
+    elapsed = time.time() - t0
+
+    stats = {
+        'replaced_count': replaced_count,
+        'luts_used': lut_used,
+        'time_seconds': elapsed,
+    }
+
+    if verbose:
+        print(f"\n  Replaced {replaced_count} layers in {elapsed:.1f}s")
+        print(f"  LUTs used: {lut_used}")
+
+    return stats
+
+
+# =============================================================================
 # STEP 5: FREEZE Q (QUANTIZED WEIGHTS)
 # =============================================================================
 
@@ -1168,7 +1697,7 @@ def tighten_and_measure_ppl(
         pct = 100 * tighten_stats['total_changed'] / max(1, tighten_stats['total_params'])
         print(f"  Tightened {tighten_stats['layers_tightened']} layers")
         print(f"  Q values changed: {tighten_stats['total_changed']:,} / {tighten_stats['total_params']:,} ({pct:.1f}%)")
-        print(f"  Avg MAE delta: {tighten_stats['avg_mae_delta']:+.6f}")
+        print(f"  Avg MAE delta: {tighten_stats['avg_mae_delta']:+.2e}")
 
     results['tighten'] = tighten_stats
 
@@ -1228,6 +1757,7 @@ def save_checkpoint(
     model_id: str,
     group_size: int,
     init_metrics: Dict[str, Any],
+    optimal_lut_map: Optional[Dict[str, str]] = None,
     verbose: bool = True,
 ) -> Dict[str, str]:
     """
@@ -1245,6 +1775,7 @@ def save_checkpoint(
         model_id: Base model ID
         group_size: Group size used for initialization
         init_metrics: Collected metrics from all steps
+        optimal_lut_map: Per-layer optimal LUT names (from LUT search)
         verbose: Print save progress
 
     Returns:
@@ -1291,6 +1822,13 @@ def save_checkpoint(
         'magnitude_activation': 'identity',
     }
 
+    # Add LUT search results if present
+    if optimal_lut_map is not None:
+        config_data['lut_search_enabled'] = True
+        config_data['optimal_lut_map'] = optimal_lut_map
+    else:
+        config_data['lut_search_enabled'] = False
+
     config_path = output_path / "config.json"
     with open(config_path, 'w') as f:
         json.dump(config_data, f, indent=2)
@@ -1328,6 +1866,7 @@ def init_v2_model(
     ppl_chunks: int = 14,
     measure_svd_error: bool = False,
     search_group_sizes: Optional[List[int]] = None,
+    search_lut: bool = False,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -1348,6 +1887,7 @@ def init_v2_model(
         ppl_chunks: Number of chunks for perplexity measurement
         measure_svd_error: Measure SVD approximation error (MAE vs original)
         search_group_sizes: List of group sizes to test per tensor (e.g., [128, 64, 32, 16])
+        search_lut: Search for optimal LUT per tensor (only for 4-bit layers)
         verbose: Print progress
 
     Returns:
@@ -1406,10 +1946,65 @@ def init_v2_model(
     )
 
     # Step 4: Replace linear layers
-    # If search_group_sizes is provided with multiple sizes, search for optimal per tensor
-    if search_group_sizes is not None and len(search_group_sizes) > 1:
+    # Pipeline order: LUT search (if enabled) -> group_size search (if enabled) -> replace
+
+    # Initialize optimal maps
+    optimal_lut_map = None
+    lut_candidates = None
+
+    # Step 4a: LUT search (only for 4-bit layers)
+    if search_lut and (preset.mlp_lut_bits == 4 or preset.attn_lut_bits == 4):
         if verbose:
-            print(f"\n[Step 4a] Searching optimal group sizes per tensor...")
+            print(f"\n[Step 4a] Searching optimal LUT per tensor...")
+
+        # Get LUT candidates
+        lut_candidates = get_lut16_candidates()
+
+        # Search for optimal LUT per tensor
+        # Use group_size=16 for LUT search (fixed, regardless of final group_size)
+        lut_search_stats = search_optimal_luts(
+            model=model,
+            model_id=model_id,
+            lut_candidates=lut_candidates,
+            group_size=16,  # Fixed for LUT search
+            mlp_lut_bits=preset.mlp_lut_bits,
+            mlp_scale_rank=preset.mlp_rank,
+            attn_lut_bits=preset.attn_lut_bits,
+            attn_scale_rank=preset.attn_rank,
+            verbose=verbose,
+        )
+        metrics['steps']['lut_search'] = lut_search_stats
+        optimal_lut_map = lut_search_stats['optimal_lut_map']
+    elif search_lut:
+        if verbose:
+            print(f"\n[Step 4a] LUT search SKIPPED (only for 4-bit layers, preset has {preset.mlp_lut_bits}-bit MLP, {preset.attn_lut_bits}-bit Attn)")
+
+    # Step 4b: Group size search (if enabled, and LUT search not done)
+    # Note: Currently LUT search and group_size search are mutually exclusive
+    # If both are requested, LUT search takes precedence
+
+    if optimal_lut_map is not None:
+        # LUT search was done - use replace_linear_layers_with_optimal_luts
+        if verbose:
+            print(f"\n[Step 4c] Replacing layers with optimal LUTs...")
+
+        replace_stats = replace_linear_layers_with_optimal_luts(
+            model=model,
+            optimal_lut_map=optimal_lut_map,
+            lut_candidates=lut_candidates,
+            group_size=group_size,
+            mlp_lut_bits=preset.mlp_lut_bits,
+            mlp_scale_rank=preset.mlp_rank,
+            attn_lut_bits=preset.attn_lut_bits,
+            attn_scale_rank=preset.attn_rank,
+            quantize_attn=quantize_attn,
+            verbose=verbose,
+        )
+        metrics['steps']['replace'] = replace_stats
+
+    elif search_group_sizes is not None and len(search_group_sizes) > 1:
+        if verbose:
+            print(f"\n[Step 4b] Searching optimal group sizes per tensor...")
 
         # Search for optimal group sizes (on base model with nn.Linear layers)
         search_stats = search_optimal_group_sizes(
@@ -1436,6 +2031,7 @@ def init_v2_model(
             verbose=verbose,
         )
         metrics['steps']['replace'] = replace_stats
+
     elif search_group_sizes is not None and len(search_group_sizes) == 1:
         # Single group size specified - use it directly without searching
         single_group_size = search_group_sizes[0]
@@ -1460,6 +2056,7 @@ def init_v2_model(
         metrics['steps']['replace'] = replace_stats
         # Update group_size for saving
         group_size = single_group_size
+
     else:
         # Standard replacement with uniform group_size
         replace_stats = replace_linear_layers(
@@ -1502,6 +2099,7 @@ def init_v2_model(
         model_id=model_id,
         group_size=group_size,
         init_metrics=metrics,
+        optimal_lut_map=optimal_lut_map,
         verbose=verbose,
     )
     metrics['paths'] = save_paths
@@ -1726,6 +2324,8 @@ Examples:
                         help='Measure SVD approximation error (MAE vs original weights)')
     parser.add_argument('--search-group', type=str, default=None,
                         help='Search optimal group size per tensor. Comma-separated sizes (e.g., "128,64,32,16")')
+    parser.add_argument('--search-lut', action='store_true',
+                        help='Search optimal LUT per tensor (4-bit layers only). Tests: uniform, power2, power3, inv_mu50')
 
     # Other options
     parser.add_argument('--quiet', '-q', action='store_true',
@@ -1801,6 +2401,7 @@ Examples:
             ppl_chunks=args.ppl_chunks,
             measure_svd_error=args.svd_error,
             search_group_sizes=search_group_sizes,
+            search_lut=args.search_lut,
             verbose=not args.quiet,
         )
 

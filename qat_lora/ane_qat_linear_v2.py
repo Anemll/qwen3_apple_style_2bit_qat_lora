@@ -111,10 +111,44 @@ def quantize_to_lut_indices(
     normalized: torch.Tensor,
     lut_size: int,
     include_zero: bool = False,
+    lut: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Map normalized values [-1, 1] to nearest LUT indices."""
+    """Map normalized values [-1, 1] to nearest LUT indices.
+
+    Args:
+        normalized: Tensor of values in [-1, 1] to quantize
+        lut_size: Number of LUT entries (used for uniform fallback)
+        include_zero: Whether LUT includes exact zero (for uniform fallback)
+        lut: Optional actual LUT tensor. If provided, finds nearest LUT value
+             for each input. If None, assumes uniform spacing.
+
+    Returns:
+        Tensor of LUT indices (same shape as normalized)
+    """
+    # If actual LUT provided, find nearest value in LUT
+    if lut is not None:
+        # Clamp to LUT's range (supports fp4_x LUTs with values >1)
+        lut_f = lut.float()
+        lut_min, lut_max = lut_f.min().item(), lut_f.max().item()
+        x = normalized.clamp(lut_min, lut_max)
+
+        # lut: [lut_size], x: [*, in] -> distances: [*, in, lut_size]
+        # Use broadcasting: x[..., None] - lut[None, :]
+        lut_f = lut_f.to(x.device)
+        orig_shape = x.shape
+        x_flat = x.flatten()  # [N]
+
+        # Compute distance to each LUT value: [N, lut_size]
+        distances = (x_flat.unsqueeze(1) - lut_f.unsqueeze(0)).abs()
+
+        # Find index of minimum distance
+        indices = distances.argmin(dim=1)  # [N]
+        return indices.view(orig_shape).long()
+
+    # Legacy fallback: uniform LUT assumption (clamp to [-1, 1])
     x = normalized.clamp(-1.0, 1.0)
 
+    # Fallback: uniform LUT assumption (legacy behavior)
     if not include_zero or (lut_size % 2 == 1):
         # Uniform LUT
         step = 2.0 / (lut_size - 1)
@@ -341,6 +375,8 @@ class AnemllQATLinearV2(nn.Module):
         lora_dropout: float = 0.0,
         # Internal: skip SVD init (used by from_linear with skip_init=True)
         _skip_scale_init: bool = False,
+        # Custom LUT: override default uniform LUT with custom values
+        custom_lut: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self._skip_scale_init = _skip_scale_init
@@ -365,13 +401,22 @@ class AnemllQATLinearV2(nn.Module):
         self.scale_B = nn.Parameter(torch.empty(self.scale_rank, in_features))
         self.rank_magnitude = nn.Parameter(torch.ones(self.scale_rank))
 
-        # LUT
-        lut = make_lut(
-            self.config.lut_size,
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-            include_zero=self.config.lut_include_zero,
-        )
+        # LUT - use custom_lut if provided, otherwise create default uniform LUT
+        if custom_lut is not None:
+            # Use custom LUT (e.g., power2, power3, inv_mu50 from per-tensor search)
+            lut = custom_lut.clone().to(torch.float32)
+            if lut.size(0) != self.config.lut_size:
+                raise ValueError(
+                    f"custom_lut size {lut.size(0)} doesn't match config.lut_size {self.config.lut_size}"
+                )
+        else:
+            # Default: uniform LUT via make_lut
+            lut = make_lut(
+                self.config.lut_size,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                include_zero=self.config.lut_include_zero,
+            )
         if self.config.learnable_lut:
             self.lut = nn.Parameter(lut)
         else:
@@ -685,10 +730,12 @@ class AnemllQATLinearV2(nn.Module):
         normalized = self.weight / scales
 
         # Quantize to LUT indices (on CPU for compatibility, then move)
+        # Pass actual LUT values for non-uniform LUTs (power2, power3, inv_mu50, etc.)
         indices_cpu = quantize_to_lut_indices(
             normalized.cpu(),
             lut_size=self.lut.size(0),
             include_zero=self.config.lut_include_zero,
+            lut=self.lut.cpu(),  # Use actual LUT values for nearest-neighbor search
         )
 
         # Store indices on the same device as weights
@@ -894,7 +941,8 @@ class AnemllQATLinearV2(nn.Module):
             scales = self._compute_full_scales()
             normalized = self.weight / scales
             indices = quantize_to_lut_indices(
-                normalized, self.lut.size(0), self.config.lut_include_zero
+                normalized, self.lut.size(0), self.config.lut_include_zero,
+                lut=self.lut,  # Use actual LUT values
             )
             Q = self.lut[indices]
 
@@ -1147,6 +1195,7 @@ class AnemllQATLinearV2(nn.Module):
                 normalized,
                 lut_size=self.config.lut_size,
                 include_zero=self.config.lut_include_zero,
+                lut=lut_fp16,  # Use actual LUT values for nearest-neighbor search
             )
 
             # Store indices
@@ -1261,6 +1310,7 @@ class AnemllQATLinearV2(nn.Module):
         linear: nn.Linear,
         config: Optional[AnemllQuantConfigV2] = None,
         skip_init: bool = False,
+        custom_lut: Optional[torch.Tensor] = None,
     ) -> "AnemllQATLinearV2":
         """Create AnemllQATLinearV2 from existing nn.Linear.
 
@@ -1268,6 +1318,7 @@ class AnemllQATLinearV2(nn.Module):
             linear: Source nn.Linear to convert
             config: Quantization config
             skip_init: If True, skip SVD-based scale initialization (caller will load state_dict)
+            custom_lut: Optional custom LUT tensor to use instead of default uniform LUT
         """
         config = config or AnemllQuantConfigV2()
 
@@ -1278,6 +1329,7 @@ class AnemllQATLinearV2(nn.Module):
             bias=linear.bias is not None,
             config=config,
             _skip_scale_init=True,  # Skip SVD in reset_parameters
+            custom_lut=custom_lut,  # Pass through custom LUT
         )
 
         # Copy weights (handle dtype/device mismatch on TPU/XLA)
@@ -2387,6 +2439,7 @@ def resnap_with_lora(
             normalized,
             lut_size=module.lut.size(0),
             include_zero=module.config.lut_include_zero,
+            lut=module.lut,  # Use actual LUT values
         )
 
         # Update Q buffer
