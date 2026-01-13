@@ -113,6 +113,10 @@ def main():
                         help='Snap + freeze ALL V2 params (scale_A, scale_B, rank_magnitude) for FP16 export. Nothing trains.')
     parser.add_argument('--mlp-only', action='store_true', help='Train only MLP layers, freeze attention')
     parser.add_argument('--attn-only', action='store_true', help='Train only attention layers, freeze MLP (for 2-phase training)')
+    parser.add_argument('--train-norms-only', action='store_true',
+                        help='Train ONLY LayerNorm weights (freeze all QAT params). '
+                             'Use with --no-full-logits for safe L>=1024 TPU training. '
+                             'Targets: model.norm, input_layernorm, post_attention_layernorm (56 tensors).')
     parser.add_argument('--save-steps', type=int, default=0, help='Save checkpoint every N steps (0=disabled)')
     parser.add_argument('--keep-checkpoints', type=int, default=0,
                         help='Keep only the last N checkpoints (0=keep all). Useful for long runs.')
@@ -251,6 +255,18 @@ def main():
             raise ValueError("--auto-snap-mags conflicts with --g-only (auto-snap targets mags)")
         if args.save_steps <= 0:
             raise ValueError("--auto-snap-mags requires --save-steps > 0 (audit happens at saves)")
+
+    # Validate train-norms-only mode
+    if args.train_norms_only:
+        if args.g_only:
+            raise ValueError("--train-norms-only conflicts with --g-only")
+        if args.mlp_only:
+            raise ValueError("--train-norms-only conflicts with --mlp-only")
+        if args.attn_only:
+            raise ValueError("--train-norms-only conflicts with --attn-only")
+        # Recommend --no-full-logits for L>=1024 TPU safety
+        if not args.no_full_logits:
+            print("[WARN] Consider using --no-full-logits with --train-norms-only for L>=1024 TPU safety")
 
     # Device detection (TPU > CUDA > CPU)
     device, device_type = get_device()
@@ -740,6 +756,7 @@ def main():
         freeze_mags=args.freeze_mags,
         freeze_mags_mlp=args.freeze_mags_mlp,
         freeze_all=args.freeze_all,
+        train_norms_only=args.train_norms_only,
         hard_top1_weight=effective_hard_top1,
         hard_top1_end=args.hard_top1_end if not args.no_full_logits else 0.0,
         hard_full_weight=effective_hard_full,

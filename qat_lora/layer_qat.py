@@ -1361,6 +1361,7 @@ def train_e2e(
     freeze_mags: bool = False,
     freeze_mags_mlp: bool = False,
     freeze_all: bool = False,
+    train_norms_only: bool = False,
     hard_top1_weight: float = 0.0,
     hard_top1_end: float = None,
     hard_full_weight: float = 0.0005,
@@ -1416,6 +1417,9 @@ def train_e2e(
         freeze_mags_mlp: If True, freeze rank_magnitude for MLP layers only (attention mags trainable)
         freeze_all: If True, snap and freeze ALL V2 params (scale_A, scale_B, rank_magnitude).
                     Nothing trains. Use for FP16 snap verification.
+        train_norms_only: If True, train ONLY LayerNorm weights (model.norm, input_layernorm,
+                          post_attention_layernorm). All QAT params frozen. Good for stabilizing
+                          long-context behavior without touching quantized weights.
         train_mlp_only: If True, freeze attention layers (q/k/v/o_proj) and only train MLP
                         (gate/up/down_proj). Useful for mixed-bit configs (e.g., 4-bit attn, 2-bit MLP)
         train_attn_only: If True, freeze MLP layers (gate/up/down_proj) and only train attention
@@ -1539,6 +1543,7 @@ def train_e2e(
     mlp_frozen = 0
     mags_snapped = 0
     scales_snapped = 0
+    norms_trained = 0
     for p in model.parameters():
         p.requires_grad = False
 
@@ -1546,7 +1551,21 @@ def train_e2e(
     attn_proj_names = ('q_proj', 'k_proj', 'v_proj', 'o_proj')
     mlp_proj_names = ('gate_proj', 'up_proj', 'down_proj')
 
+    # LayerNorm names for train_norms_only mode
+    norm_names = ('input_layernorm', 'post_attention_layernorm', 'model.norm')
+
     for name, module in model.named_modules():
+        # Handle train_norms_only: train LayerNorm weights only
+        if train_norms_only:
+            # Check if this is a LayerNorm module
+            is_norm = any(n in name for n in norm_names)
+            if is_norm and hasattr(module, 'weight') and module.weight is not None:
+                module.weight.requires_grad = True
+                trainable += module.weight.numel()
+                norms_trained += 1
+            # Skip QAT param training entirely
+            continue
+
         if type(module).__name__ in ('AnemllQATLinear', 'AnemllQATLinearV2'):
             # Check if this is an attention projection
             is_attn_proj = any(proj in name for proj in attn_proj_names)
@@ -1611,7 +1630,9 @@ def train_e2e(
 
     # Describe mode
     mode_parts = []
-    if freeze_all:
+    if train_norms_only:
+        mode = f"NORMS ONLY ({norms_trained} LayerNorm tensors)"
+    elif freeze_all:
         mode = "FREEZE ALL (A+B+G snapped/frozen)"
     else:
         if train_weights:
