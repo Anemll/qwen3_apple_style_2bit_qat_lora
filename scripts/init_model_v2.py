@@ -1164,6 +1164,11 @@ def search_optimal_luts(
                 # Ensure all tensors are on the same device
                 temp_v2.to(device)
 
+                # Snap rank_magnitude to FP16 before computing scales
+                # (SVD init gives FP32 values; we need FP16-representable values for accurate MSE)
+                with torch.no_grad():
+                    temp_v2.rank_magnitude.data = temp_v2.rank_magnitude.data.to(torch.float16).to(torch.float32)
+
                 # DEBUG: Print LUT values for first layer
                 if layer_idx == 0 and verbose:
                     print(f"      DEBUG: {lut_name} LUT values: {temp_v2.lut.tolist()[:4]}...{temp_v2.lut.tolist()[-4:]}")
@@ -1374,6 +1379,10 @@ def replace_linear_layers_with_optimal_luts(
             skip_init=False,
             custom_lut=custom_lut,
         )
+
+        # Snap rank_magnitude to FP16 (SVD init gives FP32 values)
+        with torch.no_grad():
+            v2_layer.rank_magnitude.data = v2_layer.rank_magnitude.data.to(torch.float16).to(torch.float32)
 
         # Replace in model
         parent_name, layer_name = name.rsplit('.', 1) if '.' in name else ('', name)
@@ -1646,7 +1655,27 @@ def tighten_and_measure_ppl(
     if verbose:
         print(f"  Loaded {len(W_ref_map)} baseline weight tensors")
 
-    # --- Step 8b: Tighten Q for all V2 layers using tighten_q.py logic ---
+    # --- Step 8b: Snap magnitudes to FP16 before tightening ---
+    v2_layers = [(name, m) for name, m in model.named_modules() if isinstance(m, AnemllQATLinearV2)]
+
+    # Snap all rank_magnitudes to FP16 FIRST (before computing scales)
+    mags_snapped = {'mlp': 0, 'attn': 0, 'total': 0}
+    with torch.no_grad():
+        for name, module in v2_layers:
+            if hasattr(module, 'rank_magnitude') and module.rank_magnitude is not None:
+                module.rank_magnitude.data = module.rank_magnitude.data.to(torch.float16).to(torch.float32)
+                mags_snapped['total'] += 1
+                if 'mlp' in name:
+                    mags_snapped['mlp'] += 1
+                elif 'self_attn' in name:
+                    mags_snapped['attn'] += 1
+
+    if verbose:
+        print(f"  Snapped magnitudes to FP16:")
+        print(f"    MLP:  {mags_snapped['mlp']} layers")
+        print(f"    Attn: {mags_snapped['attn']} layers")
+
+    # --- Step 8c: Tighten Q for all V2 layers using tighten_q.py logic ---
     if verbose:
         print(f"  Tightening Q (recalculating to match scales)...")
 
@@ -1654,11 +1683,9 @@ def tighten_and_measure_ppl(
         'layers_tightened': 0,
         'total_changed': 0,
         'total_params': 0,
-        'avg_mae_delta': 0,
+        'avg_mse_delta': 0,
     }
-    mae_deltas = []
-
-    v2_layers = [(name, m) for name, m in model.named_modules() if isinstance(m, AnemllQATLinearV2)]
+    mse_deltas = []
 
     for layer_idx, (name, module) in enumerate(v2_layers):
         if verbose and (layer_idx % 20 == 0 or layer_idx == len(v2_layers) - 1):
@@ -1688,16 +1715,16 @@ def tighten_and_measure_ppl(
         tighten_stats['layers_tightened'] += 1
         tighten_stats['total_changed'] += qc['num_changed']
         tighten_stats['total_params'] += qc['total']
-        mae_deltas.append(qc['mae_delta'])
+        mse_deltas.append(qc['mse_delta'])
 
-    if mae_deltas:
-        tighten_stats['avg_mae_delta'] = sum(mae_deltas) / len(mae_deltas)
+    if mse_deltas:
+        tighten_stats['avg_mse_delta'] = sum(mse_deltas) / len(mse_deltas)
 
     if verbose:
         pct = 100 * tighten_stats['total_changed'] / max(1, tighten_stats['total_params'])
         print(f"  Tightened {tighten_stats['layers_tightened']} layers")
         print(f"  Q values changed: {tighten_stats['total_changed']:,} / {tighten_stats['total_params']:,} ({pct:.1f}%)")
-        print(f"  Avg MAE delta: {tighten_stats['avg_mae_delta']:+.2e}")
+        print(f"  Avg MSE delta: {tighten_stats['avg_mse_delta']:+.2e}")
 
     results['tighten'] = tighten_stats
 

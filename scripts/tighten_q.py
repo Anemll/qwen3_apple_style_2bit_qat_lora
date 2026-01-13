@@ -247,11 +247,11 @@ def tighten_q_layer(
     num_changed = changed_mask.sum().item()
     total = _Q_old.numel()
 
-    # Reconstruction error
+    # Reconstruction error (MSE - Mean Squared Error)
     W_eff_old = _Q_old.view(W_ref.shape) * S_safe
     W_eff_new = _Q_new.view(W_ref.shape) * S_safe
-    mae_old = (W_ref - W_eff_old).abs().mean().item()
-    mae_new = (W_ref - W_eff_new).abs().mean().item()
+    mse_old = ((W_ref - W_eff_old) ** 2).mean().item()
+    mse_new = ((W_ref - W_eff_new) ** 2).mean().item()
 
     # Saturation metrics
     flat_Q = _Q_new.flatten()
@@ -272,9 +272,9 @@ def tighten_q_layer(
         'total': total,
         'pct_changed': 100 * num_changed / total,
         'num_small_S': num_small,
-        'mae_old': mae_old,
-        'mae_new': mae_new,
-        'mae_delta': mae_new - mae_old,
+        'mse_old': mse_old,
+        'mse_new': mse_new,
+        'mse_delta': mse_new - mse_old,
         'pct_at_lut_min': pct_at_min,
         'pct_at_lut_max': pct_at_max,
         'unique_Q': unique_Q,
@@ -503,26 +503,26 @@ def main():
             qc_results[name] = qc
             processed += 1
 
-            if qc['mae_delta'] > 1e-8:  # MAE got worse
+            if qc['mse_delta'] > 1e-12:  # MSE got worse
                 worse_count += 1
 
             sat_str = f"sat={qc['pct_at_lut_min']:.1f}%/{qc['pct_at_lut_max']:.1f}%"
-            delta_str = f"{qc['mae_delta']:+.6f}" if qc['mae_delta'] != 0 else "0"
+            delta_str = f"{qc['mse_delta']:+.2e}" if qc['mse_delta'] != 0 else "0"
             print(f"  {name}: {qc['pct_changed']:.1f}% changed, "
-                  f"MAE {qc['mae_old']:.6f}->{qc['mae_new']:.6f} ({delta_str}), {sat_str}")
+                  f"MSE {qc['mse_old']:.2e}->{qc['mse_new']:.2e} ({delta_str}), {sat_str}")
 
     # Summary & QC aggregation
     if qc_results:
         total_changed = sum(r['num_changed'] for r in qc_results.values())
         total_params = sum(r['total'] for r in qc_results.values())
-        avg_mae_delta = sum(r['mae_delta'] for r in qc_results.values()) / len(qc_results)
+        avg_mse_delta = sum(r['mse_delta'] for r in qc_results.values()) / len(qc_results)
 
         print(f"\n{'='*60}")
         print("SUMMARY")
         print(f"{'='*60}")
         print(f"Layers tightened: {len(qc_results)}")
         print(f"Total Q changed:  {total_changed:,} / {total_params:,} ({100*total_changed/total_params:.2f}%)")
-        print(f"Avg MAE delta:    {avg_mae_delta:+.6f}")
+        print(f"Avg MSE delta:    {avg_mse_delta:+.2e}")
 
         # Warn if high saturation
         high_sat_layers = [n for n, r in qc_results.items()
@@ -530,9 +530,9 @@ def main():
         if high_sat_layers:
             print(f"\nWARNING: {len(high_sat_layers)} layers have >5% saturation")
 
-        # Abort if >60% of layers got worse MAE
+        # Abort if >60% of layers got worse MSE
         if worse_count > len(qc_results) * 0.6:
-            print(f"\nERROR: {worse_count}/{len(qc_results)} layers have worse MAE!")
+            print(f"\nERROR: {worse_count}/{len(qc_results)} layers have worse MSE!")
             print(f"       Something is wrong. Check W_ref source and scale computation.")
             if not args.force:
                 sys.exit(1)
@@ -541,7 +541,7 @@ def main():
         print("\nNo layers were tightened!")
         total_changed = 0
         total_params = 0
-        avg_mae_delta = 0
+        avg_mse_delta = 0
 
     # Save checkpoint
     if not args.dry_run and args.output != '/dev/null':
@@ -565,7 +565,7 @@ def main():
             'total_changed': total_changed,
             'total_params': total_params,
             'pct_changed': 100 * total_changed / total_params if total_params > 0 else 0,
-            'avg_mae_delta': avg_mae_delta,
+            'avg_mse_delta': avg_mse_delta,
             'worse_count': worse_count,
             'layers': qc_results,
         }

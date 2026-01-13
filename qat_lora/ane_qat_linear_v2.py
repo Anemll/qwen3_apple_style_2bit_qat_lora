@@ -1418,6 +1418,10 @@ def replace_linear_with_anemll_v2(
         print(f"  Converting {total_layers} layers to V2...")
     for idx, (name, module, cfg) in enumerate(layers_to_replace):
         new_modules[name] = AnemllQATLinearV2.from_linear(module, config=cfg, skip_init=skip_init)
+        # Snap rank_magnitude to FP16 (SVD init gives FP32 values)
+        if not skip_init:
+            with torch.no_grad():
+                new_modules[name].rank_magnitude.data = new_modules[name].rank_magnitude.data.to(torch.float16).to(torch.float32)
         # Show progress every 20 layers or at end
         if verbose and (idx % 20 == 0 or idx == total_layers - 1):
             pct = 100 * (idx + 1) / total_layers
