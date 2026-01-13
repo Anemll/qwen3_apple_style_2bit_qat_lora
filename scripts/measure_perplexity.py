@@ -19,6 +19,9 @@ Usage:
     # With LoRA
     python scripts/measure_perplexity.py checkpoint.pt --lora-r 8
 
+    # Use config from a different directory
+    python scripts/measure_perplexity.py output.pt --config runs/original_run/config.json
+
     # Force specific dtype (fp16, bf16, or fp32)
     python scripts/measure_perplexity.py checkpoint.pt --dtype fp16
     python scripts/measure_perplexity.py --baseline --dtype bf16
@@ -657,6 +660,7 @@ def load_checkpoint(
     lora_r: int = 0,
     lora_mlp_only: bool = False,
     model_name: str = "Qwen/Qwen3-0.6B",
+    config_path_override: str = None,
 ):
     """Load V2 QAT checkpoint."""
     checkpoint_path = Path(checkpoint_path)
@@ -684,16 +688,29 @@ def load_checkpoint(
     # Note: lora_mlp_only comes from function parameter (CLI flag or default False)
 
     # Check for config.json or v2_config.json
-    config_dir = checkpoint_path.parent if checkpoint_path.is_file() else checkpoint_path
     config = {}
     config_found = None
-    for config_name in ['config.json', 'v2_config.json']:
-        config_path = config_dir / config_name
-        if config_path.exists():
-            with open(config_path) as f:
+
+    # Use override path if provided
+    if config_path_override:
+        override_path = Path(config_path_override)
+        if override_path.exists():
+            with open(override_path) as f:
                 config = json.load(f)
-            config_found = config_path
-            break
+            config_found = override_path
+        else:
+            print(f"WARNING: Config file not found: {config_path_override}")
+
+    # Otherwise auto-detect from checkpoint directory
+    if not config_found:
+        config_dir = checkpoint_path.parent if checkpoint_path.is_file() else checkpoint_path
+        for config_name in ['config.json', 'v2_config.json']:
+            cfg_path = config_dir / config_name
+            if cfg_path.exists():
+                with open(cfg_path) as f:
+                    config = json.load(f)
+                config_found = cfg_path
+                break
 
     if config_found:
         print(f"Config:     {config_found}")
@@ -950,6 +967,8 @@ def main():
                         help='Run benchmark comparing different batch sizes (1,2,4,8,16)')
     parser.add_argument('--list', action='store_true',
                         help='List all saved perplexity results from results/perplexity.json')
+    parser.add_argument('--config', type=str, default=None,
+                        help='Path to config.json to use (default: auto-detect from checkpoint directory)')
 
     args = parser.parse_args()
 
@@ -1034,6 +1053,7 @@ def main():
             lora_r=args.lora_r,
             lora_mlp_only=args.lora_mlp_only,
             model_name=args.model,
+            config_path_override=args.config,
         )
 
     # Benchmark mode: test multiple batch sizes
