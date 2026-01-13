@@ -1361,8 +1361,16 @@ def replace_linear_with_anemll_v2(
     # Sequential SVD initialization (parallel disabled - GIL + BLAS conflicts make it slower)
     # Each SVD uses full BLAS parallelism internally, so sequential is actually faster
     new_modules = {}
-    for name, module, cfg in layers_to_replace:
+    total_layers = len(layers_to_replace)
+    if verbose and total_layers > 0:
+        print(f"  Converting {total_layers} layers to V2...")
+    for idx, (name, module, cfg) in enumerate(layers_to_replace):
         new_modules[name] = AnemllQATLinearV2.from_linear(module, config=cfg, skip_init=skip_init)
+        # Show progress every 20 layers or at end
+        if verbose and (idx % 20 == 0 or idx == total_layers - 1):
+            pct = 100 * (idx + 1) / total_layers
+            short_name = name.split('.')[-2] + '.' + name.split('.')[-1] if '.' in name else name
+            print(f"    [{idx + 1}/{total_layers}] ({pct:.0f}%) {short_name}", flush=True)
 
     # Build replacement list with parent references
     replacements = []

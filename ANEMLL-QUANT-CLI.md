@@ -546,6 +546,7 @@ V2 is the latest training architecture with improved low-rank scale factorizatio
 | `scripts/snap_and_test_v2.py` | Snap model to FP16 for ANE export |
 | `scripts/convert_v1_to_v2.py` | Convert V1 checkpoint to V2 format |
 | `scripts/test_inference.py` | Test V2 model inference |
+| `scripts/tighten_q.py` | Recalculate _Q buffers after scale training |
 
 ### 10.1 Train V2 from V1 Checkpoint
 
@@ -760,6 +761,138 @@ python scripts/train_v2_simple.py \
     --freeze-mags-mlp \
     --auto-snap-mags --auto-snap-target attn \
     --save-steps 200
+```
+
+### 10.6 Tighten Q Buffers (Post-SVD Initialization)
+
+> **⚠️ CRITICAL: When to Use This Script**
+>
+> `tighten_q.py` should be run **immediately after SVD initialization** (i.e., after `--from-scratch` creates a fresh model with `_init_scales_from_weight()`) — **NOT after training**.
+>
+> **Why?** During training, the effective weights `W_eff = Q × S` evolve away from the baseline weights to minimize loss. Tightening forces `Q × S ≈ W_baseline`, which **undoes the training optimization** and degrades perplexity.
+>
+> | When Applied | Effect on Perplexity |
+> |--------------|---------------------|
+> | After SVD init (before training) | **5539.71 → 48.34** (8.6197 → 3.8782 nats) ✓ |
+> | After training phases | **~32 → 117** (worse!) ✗ |
+
+After SVD initialization (`_init_scales_from_weight()`), the `_Q` buffers may not be optimally aligned with the computed scales. `tighten_q.py` recalculates `_Q` to minimize reconstruction error against the baseline weights.
+
+**Problem:** SVD initialization computes scales via `S = A @ B` from weight SVD, but the initial Q values (snapped to LUT) may have accumulated rounding error from multiple approximations.
+
+**Solution:** Recompute `Q_target = W_ref / S` where:
+- `W_ref` = baseline HuggingFace weights (clean, not polluted by training)
+- `S` = current full scales from `_compute_full_scales()` [out, in]
+
+Then snap `Q_target` to the nearest LUT values.
+
+**Usage (after --from-scratch SVD initialization):**
+```bash
+# Step 1: Create fresh model with SVD initialization
+python scripts/train_v2_simple.py \
+    --from-scratch \
+    --cache-dir caches/alpaca_L128_K128_R1024 \
+    --output-dir runs/q4_scratch \
+    --max-steps 0  # Just initialize, no training
+
+# Step 2: Tighten ALL layers immediately (recommended)
+python scripts/tighten_q.py \
+    --v2-checkpoint runs/q4_scratch/v2_q4a4_r32_fp32_*.pt \
+    --output runs/q4_scratch/tightQ_all.pt \
+    --ref baseline \
+    --scope all \
+    --clamp-q
+# Result: Perplexity improves from ~5539 to ~48 (8.62→3.88 nats)
+
+# Step 3: Continue training from tightened checkpoint
+python scripts/train_v2_simple.py \
+    --v2-checkpoint runs/q4_scratch/tightQ_all.pt \
+    --cache-dir caches/alpaca_L128_K128_R1024 \
+    --output-dir runs/q4_trained \
+    --max-steps 1000
+
+# Dry run - preview changes without saving
+python scripts/tighten_q.py \
+    --v2-checkpoint runs/checkpoint.pt \
+    --output /dev/null \
+    --dry-run \
+    --qc-output qc_preview.json
+```
+
+**Tighten Q CLI Options:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--v2-checkpoint` | Required | Input V2 checkpoint path |
+| `--output` | Required | Output checkpoint path |
+| `--ref` | baseline | W_ref source: `baseline` (recommended) or `checkpoint` |
+| `--scope` | all | Layers to process: `mlp`, `attn`, or `all` |
+| `--layers` | None | Comma-separated layer indices (e.g., `0,1,2`) |
+| `--skip-k-proj` | False | Skip k_proj modules |
+| `--eps` | 1e-4 | Denominator floor for small scales |
+| `--clamp-q` | False | Clamp Q_target to LUT range before snapping |
+| `--chunk-size` | 4096 | Memory-safe chunk size for quantization |
+| `--dry-run` | False | Only compute QC metrics, don't save |
+| `--force` | False | Skip sanity checks and MAE abort |
+| `--qc-output` | None | Path to save QC JSON report |
+| `--model-id` | Qwen/Qwen3-0.6B | Base model for loading baseline weights |
+| `--config` | auto | Config preset (auto-detect from config.json) |
+| `--mlp-lut` | None | Override MLP LUT size |
+| `--mlp-rank` | None | Override MLP scale rank |
+| `--attn-lut` | None | Override attention LUT size |
+| `--attn-rank` | None | Override attention scale rank |
+
+**W_ref Source Options:**
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `--ref baseline` | Load fresh HF weights as W_ref | Default, recommended - avoids polluted weights |
+| `--ref checkpoint` | Use module.weight from checkpoint | Faster, but may fail if weights are polluted |
+
+**QC Metrics Output:**
+
+For each layer, the script reports:
+- `pct_changed`: Percentage of Q values that changed
+- `mae_old` → `mae_new`: Reconstruction error before/after
+- `sat`: Saturation at LUT min/max (warning if >5%)
+
+**Abort Conditions:**
+- **Missing _Q:** If layers have `_Q=None`, abort. Run `freeze_Q` first.
+- **>60% worse MAE:** If most layers get worse reconstruction, abort (use `--force` to override).
+
+**Pipeline Position:**
+
+```
+Stage 0: --from-scratch (SVD initialization)
+    ↓
+>>> tighten_q.py --scope all --ref baseline <<<  (RECOMMENDED - run immediately after SVD)
+    ↓                                             (improves PPL: 5539→48)
+Stage 1: mlp_autosnap
+    ↓
+Stage 2: attn_autosnap
+    ↓
+Stage 3: postfreeze_AB
+    ↓
+Stage 4: L1024 refinement (optional)
+    ↓
+Export / Perplexity Eval
+
+⚠️ DO NOT run tighten_q.py after training stages - it will undo the learned optimizations!
+```
+
+**Example QC Output:**
+```
+Tightening _Q...
+  model.layers.0.mlp.gate_proj: 12.3% changed, MAE 0.001234->0.001198 (-0.000036), sat=0.1%/0.2%
+  model.layers.0.mlp.up_proj: 8.7% changed, MAE 0.001456->0.001423 (-0.000033), sat=0.0%/0.1%
+  ...
+
+============================================================
+SUMMARY
+============================================================
+Layers tightened: 84
+Total Q changed:  1,234,567 / 12,345,678 (10.00%)
+Avg MAE delta:    -0.000028
 ```
 
 ---
