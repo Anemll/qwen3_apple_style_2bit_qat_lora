@@ -2089,6 +2089,7 @@ def train_e2e(
                     batch_size=batch_size, seq_len=warmup_seq_len)
 
         # Run one forward+backward pass to trigger compilation
+        # CRITICAL: Use EXACT same loss path as training (same args) to avoid recompilation
         model.train()
         autocast_device = 'xla'
         print("forward...", end=" ", flush=True)
@@ -2099,6 +2100,8 @@ def train_e2e(
                     no_grad=False,
                     hard_top1_weight=hard_top1_weight,
                     hard_full_weight=hard_full_weight,
+                    sampled_ce_weight=sampled_ce_weight,
+                    sampled_negatives=sampled_negatives,
                 )
         else:
             warmup_loss = compute_kd_loss_batch(
@@ -2106,6 +2109,8 @@ def train_e2e(
                 no_grad=False,
                 hard_top1_weight=hard_top1_weight,
                 hard_full_weight=hard_full_weight,
+                sampled_ce_weight=sampled_ce_weight,
+                sampled_negatives=sampled_negatives,
             )
 
         # Memory debug: after first forward
