@@ -1700,16 +1700,10 @@ def tighten_and_measure_ppl(
             continue
 
         # Force CPU for tighten (TPU/XLA is slow for per-layer ops)
-        # Move module buffers to CPU temporarily
         orig_device = module._Q.device
-        if 'xla' in str(orig_device) or 'tpu' in str(orig_device).lower():
-            module._Q.data = module._Q.data.cpu()
-            if hasattr(module, '_indices') and module._indices is not None:
-                module._indices.data = module._indices.data.cpu()
-            module.lut.data = module.lut.data.cpu()
-            module.scale_A.data = module.scale_A.data.cpu()
-            module.scale_B.data = module.scale_B.data.cpu()
-            module.rank_magnitude.data = module.rank_magnitude.data.cpu()
+        is_xla = 'xla' in str(orig_device).lower() or 'tpu' in str(orig_device).lower()
+        if is_xla:
+            module.to('cpu')
 
         # W_ref stays on CPU (already loaded on CPU)
 
