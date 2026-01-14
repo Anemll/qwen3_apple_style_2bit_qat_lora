@@ -2393,6 +2393,11 @@ def train_e2e(
             if step < 2 and verbose:
                 print(f"  [DEBUG] step={step}, forward done, starting backward...", flush=True)
 
+            # TPU: mark_step before backward (matches warmup pattern)
+            # This executes the forward graph before starting backward
+            if is_tpu and xm is not None:
+                xm.mark_step()
+
             # Backward pass with optional scaler for FP16
             if scaler is not None:
                 scaler.scale(loss).backward()
