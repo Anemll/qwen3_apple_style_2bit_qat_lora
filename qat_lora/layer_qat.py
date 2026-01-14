@@ -2102,6 +2102,7 @@ def train_e2e(
                     hard_full_weight=hard_full_weight,
                     sampled_ce_weight=sampled_ce_weight,
                     sampled_negatives=sampled_negatives,
+                    debug_step=-1,  # Match training path (training uses -1 for step > 0)
                 )
         else:
             warmup_loss = compute_kd_loss_batch(
@@ -2111,7 +2112,12 @@ def train_e2e(
                 hard_full_weight=hard_full_weight,
                 sampled_ce_weight=sampled_ce_weight,
                 sampled_negatives=sampled_negatives,
+                debug_step=-1,  # Match training path
             )
+
+        # Scale loss for gradient accumulation (must match training graph!)
+        if accumulation_steps > 1:
+            warmup_loss = warmup_loss / accumulation_steps
 
         # Memory debug: after first forward
         if _mem_cfg:
@@ -2267,6 +2273,10 @@ def train_e2e(
             else:
                 current_hard_top1 = hard_top1_weight
 
+            # CRITICAL: Never use debug_step >= 0 on TPU - it causes XLA graph breaks
+            # due to .isnan().any() and .item() calls in compute_kd_loss_batch
+            kd_debug_step = -1  # Disabled for XLA compatibility
+
             if use_fp16:
                 with torch.amp.autocast(device_type=autocast_device, dtype=torch.float16):
                     loss = compute_kd_loss_batch(
@@ -2276,7 +2286,7 @@ def train_e2e(
                         hard_full_weight=hard_full_weight,
                         sampled_ce_weight=sampled_ce_weight,
                         sampled_negatives=sampled_negatives,
-                        debug_step=step if step < 1 else -1,  # Debug first step
+                        debug_step=kd_debug_step,
                     )
             elif use_mixed_precision:
                 # Mixed precision: FP32 master weights + BF16 compute
@@ -2288,7 +2298,7 @@ def train_e2e(
                         hard_full_weight=hard_full_weight,
                         sampled_ce_weight=sampled_ce_weight,
                         sampled_negatives=sampled_negatives,
-                        debug_step=step if step < 1 else -1,  # Debug first step
+                        debug_step=kd_debug_step,
                     )
             else:
                 loss = compute_kd_loss_batch(
@@ -2298,7 +2308,7 @@ def train_e2e(
                     hard_full_weight=hard_full_weight,
                     sampled_ce_weight=sampled_ce_weight,
                     sampled_negatives=sampled_negatives,
-                    debug_step=step if step < 1 else -1,  # Debug first step
+                    debug_step=kd_debug_step,
                 )
 
             # Optional anchor KL regularizer (prevents drift from reference checkpoint)
@@ -2391,12 +2401,15 @@ def train_e2e(
 
             # DEBUG: Print after forward pass (no .item() - avoid XLA sync before backward)
             if step < 2 and verbose:
-                print(f"  [DEBUG] step={step}, forward done, starting backward...", flush=True)
+                print(f"  [DEBUG] step={step}, forward done, calling mark_step...", flush=True)
 
             # TPU: mark_step before backward (matches warmup pattern)
             # This executes the forward graph before starting backward
             if is_tpu and xm is not None:
                 xm.mark_step()
+
+            if step < 2 and verbose:
+                print(f"  [DEBUG] step={step}, mark_step done, starting backward...", flush=True)
 
             # Backward pass with optional scaler for FP16
             if scaler is not None:
@@ -2404,8 +2417,12 @@ def train_e2e(
             else:
                 loss.backward()
 
+            if step < 2 and verbose:
+                print(f"  [DEBUG] step={step}, backward done", flush=True)
+
             # LUT gradient check after first backward (verify gradients flow)
-            if step == 0 and train_lut and lut_enabled > 0 and verbose:
+            # DISABLED on TPU: .item() calls cause XLA graph breaks
+            if step == 0 and train_lut and lut_enabled > 0 and verbose and not is_tpu:
                 max_lut_grad = 0.0
                 lut_grad_count = 0
                 for name, param in model.named_parameters():
