@@ -2358,6 +2358,24 @@ def train_e2e(
             else:
                 loss.backward()
 
+            # LUT gradient check after first backward (verify gradients flow)
+            if step == 0 and train_lut and lut_enabled > 0 and verbose:
+                max_lut_grad = 0.0
+                lut_grad_count = 0
+                for name, param in model.named_parameters():
+                    if '_lut_raw_deltas' in name and param.grad is not None:
+                        grad_max = param.grad.abs().max().item()
+                        if grad_max > max_lut_grad:
+                            max_lut_grad = grad_max
+                        lut_grad_count += 1
+                if lut_grad_count > 0:
+                    if max_lut_grad < 1e-10:
+                        print(f"  [LUT GRAD CHECK] WARNING: max|grad|={max_lut_grad:.2e} (~0!) - LUT may not be in forward path")
+                    else:
+                        print(f"  [LUT GRAD CHECK] OK: max|grad|={max_lut_grad:.2e} ({lut_grad_count} params)")
+                else:
+                    print(f"  [LUT GRAD CHECK] WARNING: No _lut_raw_deltas grads found!")
+
             # Optimizer step only every accumulation_steps
             if (step + 1) % accumulation_steps == 0:
                 if scaler is not None:
