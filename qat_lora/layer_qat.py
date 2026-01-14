@@ -1520,7 +1520,7 @@ def train_e2e(
                 project=wandb_project,
                 name=wandb_run_name,
                 config=run_config,
-                resume="allow",  # Allow resuming if run was interrupted (Colab restarts)
+                resume="never",  # Always start fresh - avoids step conflicts on restart
             )
             # Define metrics to use train/step as X-axis
             wandb.define_metric("train/step")
@@ -3610,7 +3610,7 @@ def train_recovery_lora(
                     'sparse_logits_enabled': use_sparse_anchor,
                     'hard_logits_enabled': hard_top1_weight > 0 or hard_full_weight > 0,
                 },
-                resume="allow",  # Allow resuming if run was interrupted
+                resume="never",  # Always start fresh - avoids step conflicts on restart
             )
             # Define metrics to use train/step as X-axis
             wandb.define_metric("train/step")
