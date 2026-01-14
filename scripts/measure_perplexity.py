@@ -951,6 +951,8 @@ def main():
                         help='Base model name (default: Qwen/Qwen3-0.6B)')
     parser.add_argument('--device', choices=['auto', 'mps', 'cuda', 'cpu', 'tpu'], default='auto',
                         help='Device to use (default: auto). TPU requires torch_xla.')
+    parser.add_argument('--xla-cache-dir', type=str, default=None,
+                        help='XLA compilation cache directory (speeds up TPU restarts)')
     parser.add_argument('--dtype', choices=['auto', 'fp16', 'bf16', 'fp32'], default='auto',
                         help='Model dtype (default: auto, uses device default)')
     parser.add_argument('--verbose', action='store_true',
@@ -975,6 +977,21 @@ def main():
     # Handle --list early (doesn't need checkpoint)
     if args.list:
         return print_all_results()
+
+    # XLA persistent compilation cache (speeds up TPU restarts)
+    if args.xla_cache_dir:
+        try:
+            import torch_xla.runtime as xr
+            os.makedirs(args.xla_cache_dir, exist_ok=True)
+            xr.initialize_cache(args.xla_cache_dir, readonly=False)
+            print(f"[XLA] Cache initialized: {args.xla_cache_dir}")
+        except ImportError:
+            # Fallback to environment variable for older torch_xla
+            os.makedirs(args.xla_cache_dir, exist_ok=True)
+            os.environ['XLA_PERSISTENT_CACHE_PATH'] = args.xla_cache_dir
+            print(f"[XLA] Cache (env): {args.xla_cache_dir}")
+        except Exception as e:
+            print(f"[XLA] Cache warning: {e}")
 
     # Validate args
     if not args.baseline and args.checkpoint is None:
