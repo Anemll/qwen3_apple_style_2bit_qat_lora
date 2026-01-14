@@ -2250,6 +2250,10 @@ def train_e2e(
             # Note: TPU/XLA uses 'xla' device type for autocast
             autocast_device = 'xla' if is_tpu else device.type
 
+            # DEBUG: Print before forward pass to diagnose hangs
+            if step < 2 and verbose:
+                print(f"  [DEBUG] step={step}, starting forward pass...", flush=True)
+
             # Calculate current hard_top1 (with optional annealing)
             if hard_top1_end is not None:
                 # Linear decay from hard_top1_weight to hard_top1_end
@@ -2376,6 +2380,10 @@ def train_e2e(
             # Scale loss for gradient accumulation
             if accumulation_steps > 1:
                 loss = loss / accumulation_steps
+
+            # DEBUG: Print after forward pass
+            if step < 2 and verbose:
+                print(f"  [DEBUG] step={step}, forward done, loss={loss.item():.4f}, starting backward...", flush=True)
 
             # Backward pass with optional scaler for FP16
             if scaler is not None:
