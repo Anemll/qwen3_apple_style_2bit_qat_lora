@@ -1522,8 +1522,12 @@ def train_e2e(
                 config=run_config,
                 resume="allow",  # Allow resuming if run was interrupted (Colab restarts)
             )
-            # Define step metric to avoid "step less than current" warnings when resuming
-            wandb.define_metric("*", step_metric="step", step_sync=False)
+            # Define metrics to use train/step as X-axis
+            wandb.define_metric("train/step")
+            wandb.define_metric("train/*", step_metric="train/step")
+            wandb.define_metric("eval/*", step_metric="train/step")
+            wandb.define_metric("tpu/*", step_metric="train/step")
+            wandb.define_metric("auto_snap/*", step_metric="train/step")
             if verbose:
                 print(f"[wandb] Logging to: {wandb_run.url}")
         except ImportError:
@@ -3608,8 +3612,11 @@ def train_recovery_lora(
                 },
                 resume="allow",  # Allow resuming if run was interrupted
             )
-            # Define step metric to avoid "step less than current" warnings when resuming
-            wandb.define_metric("*", step_metric="step", step_sync=False)
+            # Define metrics to use train/step as X-axis
+            wandb.define_metric("train/step")
+            wandb.define_metric("train/*", step_metric="train/step")
+            wandb.define_metric("eval/*", step_metric="train/step")
+            wandb.define_metric("tpu/*", step_metric="train/step")
         except ImportError:
             print("wandb not installed, skipping logging")
             use_wandb = False
