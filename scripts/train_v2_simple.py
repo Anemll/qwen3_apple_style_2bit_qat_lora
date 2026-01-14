@@ -162,9 +162,9 @@ def main():
                         help='Force HF KV cache off during training: sets model.config.use_cache=False. '
                              'Recommended for TPU and/or long seq_len (L>=1024) to avoid HBM OOM.')
     # Quantization config
-    parser.add_argument('--config', type=str, default='q2a4',
+    parser.add_argument('--config', type=str, default=None,
                         choices=['q2a4', 'q4a4', 'q4a4_r32', 'q4_r32', 'q2a2'],
-                        help='Quantization config preset (default: q2a4). q4_r32 is alias for q4a4_r32')
+                        help='Quantization config preset. Auto-detected from checkpoint config.json if not specified.')
     parser.add_argument('--mlp-lut', type=int, default=None, help='Override MLP LUT size (2-bit=4, 4-bit=16)')
     parser.add_argument('--mlp-rank', type=int, default=None, help='Override MLP scale rank')
     parser.add_argument('--attn-lut', type=int, default=None, help='Override Attention LUT size')
@@ -218,6 +218,22 @@ def main():
     parser.add_argument('--mem-debug-step-axis', type=str, default='opt',
                         choices=['micro', 'opt'],
                         help='Step axis for interval filtering: micro (gradient step) or opt (optimizer step, default)')
+
+    # LUT training arguments
+    parser.add_argument('--train-lut', action='store_true',
+                        help='Enable per-tensor LUT training (4-bit LUT16 only)')
+    parser.add_argument('--lut-only', action='store_true',
+                        help='Train only LUT parameters (freeze everything else)')
+    parser.add_argument('--lut-scope', type=str, default='all',
+                        choices=['all', 'mlp', 'attn'],
+                        help='Which layers to train LUTs for (default: all)')
+    parser.add_argument('--lut-max-abs', type=float, default=1.0,
+                        help='Maximum absolute LUT value (default: 1.0, try 2.0 for outliers)')
+    parser.add_argument('--lut-lr', type=float, default=None,
+                        help='Learning rate for LUT parameters (default: same as main LR)')
+    parser.add_argument('--allow-bad-q2idx', action='store_true',
+                        help='Allow _Q→_indices conversion even when error exceeds threshold (dangerous)')
+
     # Sparse logits (L1024+ TPU memory safety)
     parser.add_argument('--no-full-logits', action='store_true',
                         help='Prevent any full-vocab [B,L,V] logits materialization. Forces hard_top1=0, hard_full=0, '
@@ -242,6 +258,29 @@ def main():
     else:
         raise ValueError("Must specify --v1-checkpoint, --v2-checkpoint, or --from-scratch")
     assert os.path.exists(args.cache_dir), f"Cache dir not found: {args.cache_dir}"
+
+    # Auto-detect config from checkpoint directory if not specified
+    if args.config is None:
+        config_detected = False
+        # Try to find config.json in checkpoint directory
+        if args.v2_checkpoint:
+            ckpt_dir = os.path.dirname(args.v2_checkpoint)
+            config_json = os.path.join(ckpt_dir, 'config.json')
+            if os.path.exists(config_json):
+                import json
+                try:
+                    with open(config_json, 'r') as f:
+                        ckpt_config = json.load(f)
+                    if 'config_preset' in ckpt_config:
+                        args.config = ckpt_config['config_preset']
+                        config_detected = True
+                        print(f"[Config] Auto-detected from {config_json}: {args.config}")
+                except Exception as e:
+                    print(f"[Config] Warning: Failed to read {config_json}: {e}")
+        # Fallback to default
+        if not config_detected:
+            args.config = 'q2a4'
+            print(f"[Config] Using default: {args.config}")
 
     # Validate auto-snap config (done early before imports to fail fast)
     if args.auto_snap_mags:
@@ -793,6 +832,13 @@ def main():
         auto_snap_state=auto_snap_state,
         # Memory debug
         mem_debug_config=mem_debug_config,
+        # LUT training
+        train_lut=args.train_lut,
+        lut_only=args.lut_only,
+        lut_scope=args.lut_scope,
+        lut_max_abs=args.lut_max_abs,
+        lut_lr=args.lut_lr,
+        allow_bad_qc=args.allow_bad_q2idx,
     )
 
     print(f"\n  Final loss: {result.get('final_loss', 'N/A')}")

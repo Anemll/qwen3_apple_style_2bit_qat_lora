@@ -289,6 +289,157 @@ def qranklut_fake_quant(
 
 
 # =============================================================================
+# TRAINABLE LUT UTILITIES
+# =============================================================================
+
+def compute_min_delta(lut_max_abs: float) -> float:
+    """Minimum normalized delta to prevent FP16 collapse/duplicates.
+
+    For LUT16: 8 positive values from ε to max_abs.
+    Each delta must be large enough that:
+    1. ε = first delta doesn't snap to 0 in FP16
+    2. Adjacent values don't collide after FP16 snap
+    """
+    # FP16 ULP at scale max_abs
+    exp = math.ceil(math.log2(max(lut_max_abs, 1e-6)))
+    ulp_at_max = 2 ** (exp - 10)
+
+    # Conservative: 2x ULP, minimum 1e-4 for safety
+    return max(2 * ulp_at_max, 1e-4)
+
+
+def snap_to_fp16_ste(x: torch.Tensor) -> torch.Tensor:
+    """Snap to FP16 in forward, pass gradients through in backward."""
+    x_fp16 = x.to(torch.float16).to(x.dtype)
+    return x + (x_fp16 - x).detach()
+
+
+def build_symmetric_lut16(
+    raw_deltas: torch.Tensor,
+    max_abs: float,
+    min_delta: float,
+) -> torch.Tensor:
+    """Build globally increasing symmetric LUT16 using constrained simplex.
+
+    CRITICAL: Uses floor + softmax to guarantee min_delta AFTER normalization.
+    This prevents FP16 collapse to 0 or duplicates.
+
+    Args:
+        raw_deltas: Shape (8,) - learnable (unnormalized logits)
+        max_abs: Maximum absolute value (e.g., 1.0, 2.0)
+        min_delta: Minimum per-value delta (must be FP16-safe)
+
+    Returns:
+        Full LUT of shape (16,) - globally increasing, symmetric, no 0
+        Order: [-max_abs, ..., -ε, +ε, ..., +max_abs]
+    """
+    n_deltas = raw_deltas.shape[0]  # 8
+
+    # Constrained simplex: delta_i = min_delta + (remaining) * softmax(raw)[i]
+    # This guarantees each delta >= min_delta even after normalization
+    remaining = max_abs - n_deltas * min_delta  # Space for learnable distribution
+    weights = F.softmax(raw_deltas, dim=0)       # Sum to 1
+    pos_deltas_norm = min_delta + remaining * weights  # Each >= min_delta, sum = max_abs
+
+    # Positive side: cumsum gives 8 values ending at max_abs
+    positive_lut = torch.cumsum(pos_deltas_norm, dim=0)
+    # positive_lut[0] >= min_delta (never 0 in FP16)
+    # positive_lut[7] = max_abs (exactly)
+
+    # Negative side: mirror in increasing order (from -max_abs to -ε)
+    negative_lut = -positive_lut.flip(0)
+
+    # Full symmetric LUT: globally increasing
+    full_lut = torch.cat([negative_lut, positive_lut])
+
+    return snap_to_fp16_ste(full_lut)
+
+
+def repair_lut_duplicates_symmetric(
+    lut: torch.Tensor,
+    max_abs: float,
+) -> torch.Tensor:
+    """Fix FP16 duplicates while preserving symmetry. CPU-only.
+
+    Strategy: endpoint-first to prevent repair from overshooting.
+    """
+    lut = lut.detach().cpu().clone()
+    half = len(lut) // 2  # 8
+
+    # Extract positive side (indices 8-15)
+    positive = lut[half:].to(torch.float16)
+
+    # STEP 1: Fix endpoint FIRST
+    max_abs_fp16 = torch.tensor(max_abs, dtype=torch.float16)
+    positive[-1] = max_abs_fp16
+
+    # STEP 2: Repair left→right, but never exceed endpoint
+    # Work backwards to compute maximum allowed values
+    max_allowed = torch.zeros_like(positive)
+    max_allowed[-1] = max_abs_fp16
+    for i in range(len(positive) - 2, -1, -1):
+        # Each value must be strictly less than next
+        max_allowed[i] = torch.nextafter(
+            max_allowed[i + 1],
+            torch.tensor(float('-inf'), dtype=torch.float16)
+        )
+
+    # STEP 3: Repair left→right ensuring strictly increasing AND within cap
+    for i in range(len(positive)):
+        if i == 0:
+            # First value: just ensure it's positive and within cap
+            if positive[i] <= 0:
+                positive[i] = torch.tensor(1e-4, dtype=torch.float16)
+            if positive[i] > max_allowed[i]:
+                positive[i] = max_allowed[i]
+        else:
+            # Must be > previous AND <= max_allowed
+            if positive[i] <= positive[i - 1]:
+                positive[i] = torch.nextafter(
+                    positive[i - 1],
+                    torch.tensor(float('inf'), dtype=torch.float16)
+                )
+            if positive[i] > max_allowed[i]:
+                positive[i] = max_allowed[i]
+
+    # STEP 4: Mirror to negative side (in increasing order)
+    negative = -positive.flip(0)
+
+    # Reconstruct full LUT
+    return torch.cat([negative, positive]).to(torch.float32)
+
+
+def compute_nearest_indices(q: torch.Tensor, lut: torch.Tensor) -> torch.Tensor:
+    """Find nearest LUT index for each Q value. CPU-only, chunked."""
+    q_flat = q.flatten()
+    indices = torch.zeros(q_flat.shape[0], dtype=torch.int16)
+
+    chunk_size = 100000
+    for start in range(0, len(q_flat), chunk_size):
+        end = min(start + chunk_size, len(q_flat))
+        chunk = q_flat[start:end]
+        distances = (chunk.unsqueeze(1) - lut.unsqueeze(0)).abs()
+        indices[start:end] = distances.argmin(dim=1).to(torch.int16)
+
+    return indices.view(q.shape)
+
+
+def verify_lut_fp16(lut: torch.Tensor) -> bool:
+    """Verify LUT is valid after FP16 snap."""
+    lut_fp16 = lut.to(torch.float16)
+    # Check no zeros
+    if (lut_fp16 == 0).any():
+        return False
+    # Check strictly increasing
+    if not (lut_fp16[1:] > lut_fp16[:-1]).all():
+        return False
+    # Check unique
+    if len(torch.unique(lut_fp16)) != len(lut_fp16):
+        return False
+    return True
+
+
+# =============================================================================
 # STE-FP16 UTILITIES
 # =============================================================================
 
@@ -434,6 +585,18 @@ class AnemllQATLinearV2(nn.Module):
 
         # Store lut_bits for conversion pipeline
         self.lut_bits = self.config.lut_bits
+
+        # === TRAINABLE LUT: Per-layer trainable LUT for LUT training ===
+        # _lut_raw_deltas: [8] - learnable logits for constrained simplex (LUT16 only)
+        # _lut_max_abs: Maximum absolute LUT value
+        # _lut_min_delta: Minimum normalized delta (post-softmax)
+        # _lut_trainable: Whether LUT training is enabled for this layer
+        # _use_indices: Whether to use _indices for forward (vs _Q)
+        self._lut_raw_deltas: Optional[nn.Parameter] = None
+        self._lut_max_abs: float = 1.0
+        self._lut_min_delta: float = 0.001
+        self._lut_trainable: bool = False
+        self._use_indices: bool = False
 
         # === QRANKLUT: Per-layer LUTs for A_dir/B_dir quantization ===
         # A_lut: [rank_lut_size] - LUT for A_dir quantization
@@ -748,6 +911,150 @@ class AnemllQATLinearV2(nn.Module):
         # Freeze weight (we're training scales only)
         self.weight.requires_grad = False
 
+    # =========================================================================
+    # TRAINABLE LUT METHODS
+    # =========================================================================
+
+    def convert_q_to_indices_cpu(
+        self,
+        max_error_threshold: float = 0.01,
+        allow_bad_qc: bool = False,
+    ) -> bool:
+        """Convert _Q (values) to _indices (int16 LUT indices). CPU-only with QC.
+
+        FAIL-CLOSED by default: returns False if max_error > threshold unless
+        allow_bad_qc=True is explicitly passed.
+
+        Args:
+            max_error_threshold: Maximum allowed reconstruction error
+            allow_bad_qc: If True, proceed even with high error (dangerous)
+
+        Returns:
+            True if conversion succeeded, False if aborted due to QC failure
+        """
+        if self._indices is not None:
+            self._use_indices = True
+            return True  # Already have indices
+
+        if self._Q is None:
+            return True  # Nothing to convert
+
+        # Ensure we're on CPU
+        q_cpu = self._Q.detach().cpu()
+        lut_cpu = self.lut.detach().cpu()
+
+        # Find nearest indices
+        indices = compute_nearest_indices(q_cpu, lut_cpu)
+
+        # Validate range
+        assert (indices >= 0).all() and (indices <= 15).all(), \
+            f"Invalid LUT indices: min={indices.min()}, max={indices.max()}"
+
+        # QC: compute reconstruction error
+        q_reconstructed = lut_cpu[indices.long()]
+        max_error = (q_cpu - q_reconstructed).abs().max().item()
+        mean_error = (q_cpu - q_reconstructed).abs().mean().item()
+
+        print(f"    _Q→_indices QC: max_error={max_error:.6f}, mean_error={mean_error:.6f}")
+
+        if max_error > max_error_threshold:
+            print(f"    ERROR: max error {max_error:.6f} > threshold {max_error_threshold}")
+            print(f"    _Q values are NOT on LUT grid. Model weights will change!")
+            if not allow_bad_qc:
+                print(f"    ABORTING. Use --allow-bad-q2idx to force conversion.")
+                return False  # FAIL-CLOSED
+            else:
+                print(f"    WARNING: Proceeding anyway (--allow-bad-q2idx). Expect loss spike!")
+
+        # Store indices (keep on CPU, will be moved with model.to(device))
+        self._indices = indices.to(self._Q.device)
+        self._use_indices = True
+        return True
+
+    def enable_lut_training(
+        self,
+        max_abs: float = 1.0,
+        allow_bad_qc: bool = False,
+    ) -> bool:
+        """Enable trainable LUT for this layer. Must be called on CPU.
+
+        Args:
+            max_abs: Maximum absolute LUT value (e.g., 1.0, 2.0)
+            allow_bad_qc: Allow _Q→_indices conversion even with high error
+
+        Returns:
+            True if LUT training enabled, False if failed (QC or unsupported)
+        """
+        if self._lut_trainable:
+            return True  # Already enabled
+
+        lut = self.lut
+        if lut is None:
+            return False
+
+        lut_size = lut.shape[0]
+        if lut_size != 16:
+            print(f"  Skipping LUT training for lut_size={lut_size} (only 16 supported)")
+            return False
+
+        # Convert _Q to _indices with QC check (CPU-only, FAIL-CLOSED)
+        if not self.convert_q_to_indices_cpu(allow_bad_qc=allow_bad_qc):
+            return False
+
+        self._lut_max_abs = max_abs
+        self._lut_min_delta = compute_min_delta(max_abs)
+
+        # Initialize from current positive LUT values
+        # Current LUT is globally increasing: [-max, ..., -ε, +ε, ..., +max]
+        # Positive half is indices 8-15 (8 values from +ε to +max)
+        with torch.no_grad():
+            lut_cpu = lut.detach().cpu()
+            half_size = lut_size // 2  # 8
+
+            # Get positive values
+            positive_vals = lut_cpu[half_size:]  # [+ε, ..., +max]
+
+            # Compute 8 deltas: first value, then differences
+            deltas = torch.zeros(half_size)
+            deltas[0] = positive_vals[0].abs()  # First positive value (ε)
+            deltas[1:] = positive_vals[1:] - positive_vals[:-1]
+
+            # Clamp to min_delta floor
+            deltas = deltas.clamp(min=self._lut_min_delta)
+
+            # Compute raw logits that would produce these deltas via constrained simplex
+            # delta_i = min_delta + remaining * softmax(raw)[i]
+            # So: softmax(raw)[i] = (delta_i - min_delta) / remaining
+            remaining = max_abs - half_size * self._lut_min_delta
+            if remaining <= 0:
+                # Edge case: min_delta too large, use uniform
+                raw = torch.zeros(half_size)
+            else:
+                weights = (deltas - self._lut_min_delta) / remaining
+                weights = weights.clamp(min=1e-6)  # Avoid log(0)
+                # Invert softmax: raw = log(weights) + const (const cancels in softmax)
+                raw = torch.log(weights)
+
+            self._lut_raw_deltas = nn.Parameter(raw.to(lut.device))
+
+        self._lut_trainable = True
+        return True
+
+    def get_lut(self) -> torch.Tensor:
+        """Get current LUT (trainable or frozen). Device-consistent.
+
+        If LUT training is enabled, builds LUT from trainable parameters.
+        Otherwise returns the frozen LUT buffer.
+        """
+        if self._lut_trainable and self._lut_raw_deltas is not None:
+            return build_symmetric_lut16(
+                self._lut_raw_deltas,
+                self._lut_max_abs,
+                self._lut_min_delta,
+            )
+        else:
+            return self.lut
+
     @torch.no_grad()
     def init_rank_lut(self, verbose: bool = False):
         """Initialize qranklut with k-means clustering from current A_dir/B_dir.
@@ -933,8 +1240,17 @@ class AnemllQATLinearV2(nn.Module):
         # Get normalized scales
         A_dir, B_dir, g = self._get_normalized_scales()
 
-        # Get Q (frozen buffer or compute on-the-fly)
-        if self._Q is not None:
+        # Get Q: either via trainable LUT lookup, frozen buffer, or on-the-fly
+        if self._lut_trainable and self._use_indices and self._indices is not None:
+            # Trainable LUT mode: use get_lut() with indices lookup
+            # This allows gradients to flow through the LUT
+            lut = self.get_lut()
+            Q = lut[self._indices.long()]
+        elif self._use_indices and self._indices is not None:
+            # Frozen indices with frozen LUT
+            Q = self.lut[self._indices.long()]
+        elif self._Q is not None:
+            # Frozen Q buffer (pre-computed lut[indices])
             Q = self._Q
         else:
             # Fallback: compute Q on the fly (for backward compat / testing)
@@ -1480,6 +1796,76 @@ def freeze_Q_all(model: nn.Module, verbose: bool = False) -> int:
             count += 1
             if verbose:
                 print(f'  [freeze_Q] {name}')
+    return count
+
+
+def enable_lut_training_all(
+    model: nn.Module,
+    scope: str = 'all',
+    max_abs: float = 1.0,
+    allow_bad_qc: bool = False,
+    verbose: bool = True,
+) -> int:
+    """Enable LUT training for all V2 layers matching scope. Must be called on CPU.
+
+    Args:
+        model: The model containing AnemllQATLinearV2 layers
+        scope: Which layers to enable LUT training for:
+            - 'all': All layers
+            - 'mlp': Only MLP layers (name contains 'mlp')
+            - 'attn': Only attention layers (name contains 'self_attn')
+        max_abs: Maximum absolute LUT value (default 1.0, try 2.0 for outliers)
+        allow_bad_qc: If True, proceed with _Q→_indices conversion even when
+            error exceeds threshold. Default False (fail-closed).
+        verbose: Print progress messages
+
+    Returns:
+        Number of layers with LUT training enabled
+    """
+    count = 0
+    failed = 0
+    skipped = 0
+
+    for name, module in model.named_modules():
+        if not isinstance(module, AnemllQATLinearV2):
+            continue
+
+        # Check scope
+        if scope == 'mlp' and 'mlp' not in name:
+            continue
+        if scope == 'attn' and 'self_attn' not in name:
+            continue
+
+        # Only enable for LUT16 (4-bit)
+        if module.lut is None:
+            if verbose:
+                print(f"  Skipping {name}: no LUT")
+            skipped += 1
+            continue
+
+        if module.lut.shape[0] != 16:
+            if verbose:
+                print(f"  Skipping {name}: lut_size={module.lut.shape[0]} (only 16 supported)")
+            skipped += 1
+            continue
+
+        if verbose:
+            print(f"  Enabling LUT training: {name}")
+
+        if module.enable_lut_training(max_abs=max_abs, allow_bad_qc=allow_bad_qc):
+            count += 1
+        else:
+            failed += 1
+            if verbose:
+                print(f"    FAILED: {name}")
+
+    if verbose:
+        print(f"  LUT training enabled: {count} layers")
+        if failed > 0:
+            print(f"  WARNING: {failed} layers failed LUT training enable (QC failures)")
+        if skipped > 0:
+            print(f"  Skipped: {skipped} layers (non-LUT16)")
+
     return count
 
 

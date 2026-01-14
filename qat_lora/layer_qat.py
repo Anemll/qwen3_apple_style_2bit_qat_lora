@@ -1182,6 +1182,56 @@ def train_all_layers(
     return layer_results
 
 
+def prepare_lut_for_save(model: nn.Module, verbose: bool = True) -> int:
+    """Repair trainable LUTs and update lut buffers before saving.
+
+    For each layer with trainable LUT:
+    1. Build current LUT from raw_deltas
+    2. Apply symmetry-preserving repair (fixes FP16 duplicates)
+    3. Update the lut buffer with repaired values
+
+    This ensures the saved lut buffer is valid FP16 after loading.
+
+    Args:
+        model: Model with AnemllQATLinearV2 layers
+        verbose: Print repair info
+
+    Returns:
+        Number of layers repaired
+    """
+    from .ane_qat_linear_v2 import (
+        AnemllQATLinearV2,
+        build_symmetric_lut16,
+        repair_lut_duplicates_symmetric,
+    )
+
+    repaired = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, AnemllQATLinearV2):
+            continue
+        if not module._lut_trainable:
+            continue
+
+        with torch.no_grad():
+            # Build current LUT from raw_deltas
+            trained_lut = module.get_lut().detach().cpu()
+
+            # Apply symmetry-preserving repair
+            repaired_lut = repair_lut_duplicates_symmetric(
+                trained_lut,
+                module._lut_max_abs,
+            )
+
+            # Update the lut buffer
+            module.lut.data.copy_(repaired_lut.to(module.lut.device))
+
+        repaired += 1
+        if verbose:
+            print(f"  [LUT repair] {name}")
+
+    return repaired
+
+
 def save_checkpoint(
     model: nn.Module,
     save_dir: str,
@@ -1216,6 +1266,9 @@ def save_checkpoint(
             snapped_mode = getattr(m, 'snapped_mode', None)
             if snapped_mode is not None:
                 break
+
+    # Repair trainable LUTs before saving (ensures valid FP16 after load)
+    lut_repaired = prepare_lut_for_save(model, verbose=verbose)
 
     # Save state dict
     state_path = os.path.join(save_dir, name)
@@ -1398,6 +1451,13 @@ def train_e2e(
     sampled_ce_weight: float = 0.0,
     sampled_negatives: int = 64,
     no_full_logits: bool = False,
+    # LUT training (per-tensor trainable LUTs)
+    train_lut: bool = False,
+    lut_only: bool = False,
+    lut_scope: str = 'all',
+    lut_max_abs: float = 1.0,
+    lut_lr: Optional[float] = None,
+    allow_bad_qc: bool = False,
 ) -> dict:
     """End-to-end KD-QAT training (all layers unfrozen).
 
@@ -1537,6 +1597,28 @@ def train_e2e(
             print(f"[wandb] Warning: Failed to initialize wandb: {e}")
             use_wandb = False
 
+    # Enable LUT training (must be done on CPU before device transfer)
+    # NOTE: Model should already be on CPU when train_e2e is called if train_lut=True
+    lut_enabled = 0
+    if train_lut:
+        from .ane_qat_linear_v2 import enable_lut_training_all
+        if verbose:
+            print(f"\n=== Enabling LUT Training ===")
+            print(f"  Scope: {lut_scope}")
+            print(f"  Max abs: {lut_max_abs}")
+            print(f"  Allow bad QC: {allow_bad_qc}")
+        lut_enabled = enable_lut_training_all(
+            model,
+            scope=lut_scope,
+            max_abs=lut_max_abs,
+            allow_bad_qc=allow_bad_qc,
+            verbose=verbose,
+        )
+        if lut_enabled == 0:
+            print("  WARNING: No layers had LUT training enabled!")
+        if use_wandb and wandb_run is not None:
+            wandb.define_metric("lut/*", step_metric="train/step")
+
     # Set trainable parameters
     # Validate mutually exclusive flags
     if train_mlp_only and train_attn_only:
@@ -1548,8 +1630,23 @@ def train_e2e(
     mags_snapped = 0
     scales_snapped = 0
     norms_trained = 0
+    lut_trainable = 0
     for p in model.parameters():
         p.requires_grad = False
+
+    # Handle lut_only mode: only enable LUT params, skip normal training
+    if lut_only and train_lut:
+        for name, param in model.named_parameters():
+            if '_lut_raw_deltas' in name:
+                param.requires_grad = True
+                trainable += param.numel()
+                lut_trainable += 1
+        if verbose:
+            print(f"  LUT-only mode: {lut_trainable} LUT params trainable ({trainable:,} elements)")
+        # Skip normal trainable param setup
+        train_weights = False
+        train_scales = False
+        train_norms_only = False
 
     # Projection names for selective training
     attn_proj_names = ('q_proj', 'k_proj', 'v_proj', 'o_proj')
@@ -1700,18 +1797,45 @@ def train_e2e(
         if verbose:
             print(f"Dropout: {dropout}")
 
-    # Optimizer
-    params = [p for p in model.parameters() if p.requires_grad]
-    if not params:
-        raise ValueError("No trainable parameters! Check train_weights/train_scales flags.")
-    optimizer = AdamW(params, lr=lr, weight_decay=weight_decay)
+    # Optimizer (with optional separate LUT LR)
+    if train_lut and lut_lr is not None:
+        # Separate param groups for LUT and non-LUT params
+        lut_params = []
+        other_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if '_lut_raw_deltas' in name:
+                lut_params.append(param)
+            else:
+                other_params.append(param)
+
+        if not lut_params and not other_params:
+            raise ValueError("No trainable parameters! Check train_weights/train_scales/train_lut flags.")
+
+        param_groups = []
+        if other_params:
+            param_groups.append({'params': other_params, 'lr': lr})
+        if lut_params:
+            param_groups.append({'params': lut_params, 'lr': lut_lr})
+            if verbose:
+                print(f"LUT LR: {lut_lr} ({len(lut_params)} params)")
+
+        optimizer = AdamW(param_groups, weight_decay=weight_decay)
+        num_params = len(lut_params) + len(other_params)
+    else:
+        params = [p for p in model.parameters() if p.requires_grad]
+        if not params:
+            raise ValueError("No trainable parameters! Check train_weights/train_scales flags.")
+        optimizer = AdamW(params, lr=lr, weight_decay=weight_decay)
+        num_params = len(params)
     if verbose and weight_decay > 0:
         print(f"Weight decay: {weight_decay}")
 
     # Memory debug: after optimizer init
     if _mem_cfg:
         mem_log(_mem_cfg, 'after_optimizer_init', micro_step=0, opt_step=0, phase='init',
-                extra={'num_params': len(params), 'lr': lr, 'weight_decay': weight_decay})
+                extra={'num_params': num_params, 'lr': lr, 'weight_decay': weight_decay})
 
     # LR Scheduler (cosine with warmup)
     scheduler = None
@@ -2395,6 +2519,10 @@ def train_e2e(
                             # Log first failure for debugging
                             if optimizer_step == log_interval:
                                 print(f"  [TPU memory] get_memory_info failed: {e}")
+                    # Add LUT metrics if LUT training enabled
+                    if train_lut and lut_enabled > 0:
+                        lut_metrics = compute_lut_metrics(model)
+                        log_dict.update(lut_metrics)
                     wandb.log(log_dict, step=optimizer_step)
                 last_log_time = time.time()
                 loss_history.append(avg_loss)
@@ -4145,3 +4273,83 @@ def train_recovery_lora(
         'time_sec': elapsed,
         'loss_history': loss_history,
     }
+
+
+# ==============================================================================
+# LUT METRICS (for trainable LUT monitoring)
+# ==============================================================================
+
+@torch.no_grad()
+def compute_lut_metrics(model: nn.Module) -> Dict[str, float]:
+    """Compute LUT metrics from CPU copies. Safe during TPU training.
+
+    Builds LUT from CPU copies of raw_deltas parameters (no XLA sync).
+    All metrics are computed in FP16 space to match ANE hardware behavior.
+
+    Args:
+        model: Model containing AnemllQATLinearV2 layers with trainable LUTs
+
+    Returns:
+        Dictionary with metrics:
+            - lut/num_trainable: Number of layers with trainable LUTs
+            - lut/avg_max_abs: Average max absolute value across LUTs
+            - lut/avg_min_abs: Average min absolute value (should be small positive, not 0)
+            - lut/total_unique_fp16: Total unique FP16 values across all LUTs
+            - lut/total_duplicates: Count of FP16 duplicates (should be 0)
+            - lut/all_monotonic: 1.0 if all LUTs are strictly increasing, else 0.0
+    """
+    from .ane_qat_linear_v2 import AnemllQATLinearV2, build_symmetric_lut16
+
+    metrics = {
+        'lut/num_trainable': 0,
+        'lut/avg_max_abs': 0.0,
+        'lut/avg_min_abs': 0.0,
+        'lut/total_unique_fp16': 0,
+        'lut/total_duplicates': 0,
+        'lut/all_monotonic': 1.0,
+    }
+
+    lut_layers = []
+    for name, module in model.named_modules():
+        if isinstance(module, AnemllQATLinearV2) and module._lut_trainable:
+            lut_layers.append((name, module))
+
+    if not lut_layers:
+        return metrics
+
+    metrics['lut/num_trainable'] = len(lut_layers)
+
+    max_abs_sum = 0.0
+    min_abs_sum = 0.0
+    all_monotonic = True
+
+    for name, module in lut_layers:
+        # Build LUT from CPU copy of params (no device sync)
+        raw_deltas_cpu = module._lut_raw_deltas.detach().cpu()
+        lut_cpu = build_symmetric_lut16(
+            raw_deltas_cpu,
+            module._lut_max_abs,
+            module._lut_min_delta,
+        )
+
+        # Convert to FP16 for hardware-accurate metrics
+        lut_fp16 = lut_cpu.to(torch.float16).to(torch.float32)
+
+        max_abs_sum += lut_fp16.abs().max().item()
+        min_abs_sum += lut_fp16.abs().min().item()
+
+        # Check uniqueness in FP16
+        unique_count = len(torch.unique(lut_fp16.half()))
+        metrics['lut/total_unique_fp16'] += unique_count
+        metrics['lut/total_duplicates'] += (len(lut_fp16) - unique_count)
+
+        # Check strict monotonicity in FP16
+        lut_fp16_actual = lut_cpu.to(torch.float16)
+        if not (lut_fp16_actual[1:] > lut_fp16_actual[:-1]).all():
+            all_monotonic = False
+
+    metrics['lut/avg_max_abs'] = max_abs_sum / len(lut_layers)
+    metrics['lut/avg_min_abs'] = min_abs_sum / len(lut_layers)
+    metrics['lut/all_monotonic'] = 1.0 if all_monotonic else 0.0
+
+    return metrics
