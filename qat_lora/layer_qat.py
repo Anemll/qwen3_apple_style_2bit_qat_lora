@@ -2537,7 +2537,7 @@ def train_e2e(
                                 'auto_snap/frozen_count': frozen_count,
                                 'auto_snap/lr_before': lr_before,
                                 'auto_snap/lr_after': optimizer.param_groups[0]['lr'],
-                            }, step=step)
+                            }, step=optimizer_step)
 
                         # Memory debug: after autosnap freeze (optimizer rebuild may trigger recompile)
                         if _mem_cfg:
@@ -2590,7 +2590,7 @@ def train_e2e(
             'summary/best_loss': best_loss,
             'summary/improvement': initial_loss - final_loss,
             'summary/time_sec': elapsed,
-        }, step=step)
+        }, step=optimizer_step)
 
     # Update best if final is better (skip if no eval)
     if eval_samples and eval_samples > 0 and final_loss < best_loss:

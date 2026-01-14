@@ -1699,9 +1699,19 @@ def tighten_and_measure_ppl(
         if module._Q is None:
             continue
 
-        # Move W_ref to the same device as the module
-        module_device = module._Q.device
-        W_ref = W_ref.to(module_device)
+        # Force CPU for tighten (TPU/XLA is slow for per-layer ops)
+        # Move module buffers to CPU temporarily
+        orig_device = module._Q.device
+        if 'xla' in str(orig_device) or 'tpu' in str(orig_device).lower():
+            module._Q.data = module._Q.data.cpu()
+            if hasattr(module, '_indices') and module._indices is not None:
+                module._indices.data = module._indices.data.cpu()
+            module.lut.data = module.lut.data.cpu()
+            module.scale_A.data = module.scale_A.data.cpu()
+            module.scale_B.data = module.scale_B.data.cpu()
+            module.rank_magnitude.data = module.rank_magnitude.data.cpu()
+
+        # W_ref stays on CPU (already loaded on CPU)
 
         # Use tighten_q_layer from tighten_q.py (includes clamp_q=True, updates _indices)
         qc = tighten_q_layer(
@@ -1716,6 +1726,8 @@ def tighten_and_measure_ppl(
         tighten_stats['total_changed'] += qc['num_changed']
         tighten_stats['total_params'] += qc['total']
         mse_deltas.append(qc['mse_delta'])
+
+    # Model stays on CPU after tightening (fine for saving, training script moves to device)
 
     if mse_deltas:
         tighten_stats['avg_mse_delta'] = sum(mse_deltas) / len(mse_deltas)
