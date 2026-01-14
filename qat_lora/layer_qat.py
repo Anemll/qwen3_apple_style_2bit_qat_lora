@@ -2271,6 +2271,7 @@ def train_e2e(
                         hard_full_weight=hard_full_weight,
                         sampled_ce_weight=sampled_ce_weight,
                         sampled_negatives=sampled_negatives,
+                        debug_step=step if step < 1 else -1,  # Debug first step
                     )
             elif use_mixed_precision:
                 # Mixed precision: FP32 master weights + BF16 compute
@@ -2282,6 +2283,7 @@ def train_e2e(
                         hard_full_weight=hard_full_weight,
                         sampled_ce_weight=sampled_ce_weight,
                         sampled_negatives=sampled_negatives,
+                        debug_step=step if step < 1 else -1,  # Debug first step
                     )
             else:
                 loss = compute_kd_loss_batch(
@@ -2291,6 +2293,7 @@ def train_e2e(
                     hard_full_weight=hard_full_weight,
                     sampled_ce_weight=sampled_ce_weight,
                     sampled_negatives=sampled_negatives,
+                    debug_step=step if step < 1 else -1,  # Debug first step
                 )
 
             # Optional anchor KL regularizer (prevents drift from reference checkpoint)

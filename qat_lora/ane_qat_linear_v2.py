@@ -575,7 +575,8 @@ class AnemllQATLinearV2(nn.Module):
 
         # Frozen Q buffer (computed once by freeze_Q())
         self.register_buffer("_Q", None)
-        self.register_buffer("_indices", None)
+        # _indices buffer for LUT training (must be persistent for checkpoint save/load)
+        self.register_buffer("_indices", None, persistent=True)
 
         # Cached full weights for inference
         self.register_buffer("_cached_weight_q", None)
@@ -991,6 +992,14 @@ class AnemllQATLinearV2(nn.Module):
         lut = self.lut
         if lut is None:
             return False
+
+        # HARD CHECK: Must be on CPU (index conversion is CPU-only)
+        if self._Q is not None and self._Q.device.type != 'cpu':
+            raise RuntimeError(
+                f"enable_lut_training() must be called BEFORE model.to(device). "
+                f"_Q is on {self._Q.device}, expected CPU. "
+                f"Move enable_lut_training_all() call before model.to(device)."
+            )
 
         lut_size = lut.shape[0]
         if lut_size != 16:
@@ -1865,6 +1874,15 @@ def enable_lut_training_all(
             print(f"  WARNING: {failed} layers failed LUT training enable (QC failures)")
         if skipped > 0:
             print(f"  Skipped: {skipped} layers (non-LUT16)")
+
+        # Smoke test: print _indices info from first enabled layer
+        if count > 0:
+            for m in model.modules():
+                if isinstance(m, AnemllQATLinearV2) and m._lut_trainable and m._indices is not None:
+                    idx = m._indices
+                    print(f"  [Smoke test] _indices: device={idx.device}, dtype={idx.dtype}, "
+                          f"shape={tuple(idx.shape)}, range=[{idx.min().item()}, {idx.max().item()}]")
+                    break
 
     return count
 

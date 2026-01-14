@@ -504,6 +504,14 @@ def main():
         v2_model.to(device=device, dtype=train_dtype)
         print(f"done ({time.time()-t0:.1f}s)")
 
+        # Verify _indices moved to device (if LUT training enabled)
+        if args.train_lut:
+            from qat_lora.ane_qat_linear_v2 import AnemllQATLinearV2
+            for m in v2_model.modules():
+                if isinstance(m, AnemllQATLinearV2) and m._lut_trainable and m._indices is not None:
+                    print(f"  [Post-transfer] _indices on {m._indices.device} (expected {device})")
+                    break
+
     elif args.from_scratch:
         # Train V2 from scratch (no V1)
         print("\n[1/2] Creating V2 model from scratch...")

@@ -28,3 +28,4 @@ caches/
 docs/SR-008B-terminal.md
 results/perplexity.json
 tmp/
+lut_output/training_log.csv
