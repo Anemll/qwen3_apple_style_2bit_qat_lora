@@ -154,6 +154,30 @@ def main():
     print(f"  Only in ckpt2: {len(only_in_2)}")
     print(f"  Common:        {len(common_keys)}")
 
+    # LUT-specific analysis
+    lut_keys1 = {k for k in keys1 if 'lut' in k.lower()}
+    lut_keys2 = {k for k in keys2 if 'lut' in k.lower()}
+    common_lut = lut_keys1 & lut_keys2
+    lut_only_1 = lut_keys1 - lut_keys2
+    lut_only_2 = lut_keys2 - lut_keys1
+
+    print(f"\nLUT analysis:")
+    print(f"  LUTs in ckpt1: {len(lut_keys1)}")
+    print(f"  LUTs in ckpt2: {len(lut_keys2)}")
+    print(f"  Common LUTs:   {len(common_lut)}")
+    if lut_only_1:
+        print(f"  Only in ckpt1: {len(lut_only_1)}")
+        for k in sorted(lut_only_1)[:3]:
+            print(f"    {k}")
+        if len(lut_only_1) > 3:
+            print(f"    ... and {len(lut_only_1) - 3} more")
+    if lut_only_2:
+        print(f"  Only in ckpt2: {len(lut_only_2)}")
+        for k in sorted(lut_only_2)[:3]:
+            print(f"    {k}")
+        if len(lut_only_2) > 3:
+            print(f"    ... and {len(lut_only_2) - 3} more")
+
     if only_in_1 and args.verbose:
         print(f"\n  Keys only in ckpt1:")
         for k in sorted(only_in_1)[:5]:
@@ -202,6 +226,18 @@ def main():
     print(f"Close match:     {len(close_match):4d} keys (max_diff < {args.threshold})")
     print(f"Different:       {len(different):4d} keys")
     print(f"Shape mismatch:  {len(shape_mismatch):4d} keys")
+
+    # LUT-specific comparison for common LUTs
+    if common_lut:
+        lut_exact = [k for k in exact_match if 'lut' in k.lower()]
+        lut_diff = [(k, d, m) for k, d, m in differences if 'lut' in k.lower()]
+        print(f"\nLUT comparison ({len(common_lut)} common):")
+        print(f"  Exact match:   {len(lut_exact)}")
+        print(f"  Different:     {len(lut_diff)}")
+        if lut_diff:
+            print(f"  Top LUT differences:")
+            for k, max_d, mean_d in sorted(lut_diff, key=lambda x: x[1], reverse=True)[:5]:
+                print(f"    {max_d:.6e}  {k}")
 
     # Overall verdict
     if len(different) == 0 and len(shape_mismatch) == 0:
