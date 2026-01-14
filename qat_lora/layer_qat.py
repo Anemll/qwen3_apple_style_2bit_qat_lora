@@ -2389,9 +2389,9 @@ def train_e2e(
             if accumulation_steps > 1:
                 loss = loss / accumulation_steps
 
-            # DEBUG: Print after forward pass
+            # DEBUG: Print after forward pass (no .item() - avoid XLA sync before backward)
             if step < 2 and verbose:
-                print(f"  [DEBUG] step={step}, forward done, loss={loss.item():.4f}, starting backward...", flush=True)
+                print(f"  [DEBUG] step={step}, forward done, starting backward...", flush=True)
 
             # Backward pass with optional scaler for FP16
             if scaler is not None:
