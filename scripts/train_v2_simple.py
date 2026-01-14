@@ -485,6 +485,20 @@ def main():
             print("  (No _Q in checkpoint, running freeze_Q)")
             freeze_Q_all(v2_model)
 
+        # Enable LUT training BEFORE moving to device (requires CPU operations)
+        if args.train_lut:
+            from qat_lora.ane_qat_linear_v2 import enable_lut_training_all
+            print(f"\n  Enabling LUT training (scope={args.lut_scope}, max_abs={args.lut_max_abs})...")
+            lut_enabled = enable_lut_training_all(
+                v2_model,
+                scope=args.lut_scope,
+                max_abs=args.lut_max_abs,
+                allow_bad_qc=args.allow_bad_q2idx,
+                verbose=True,
+            )
+            if lut_enabled == 0:
+                print("  WARNING: No layers had LUT training enabled!")
+
         t0 = time.time()
         print(f"  Moving to {device_type.upper()} ({args.dtype})...", end=" ", flush=True)
         v2_model.to(device=device, dtype=train_dtype)
@@ -534,6 +548,20 @@ def main():
 
         # Freeze Q BEFORE moving to device (avoids XLA compilations on TPU)
         freeze_Q_all(v2_model)
+
+        # Enable LUT training BEFORE moving to device (requires CPU operations)
+        if args.train_lut:
+            from qat_lora.ane_qat_linear_v2 import enable_lut_training_all
+            print(f"\n  Enabling LUT training (scope={args.lut_scope}, max_abs={args.lut_max_abs})...")
+            lut_enabled = enable_lut_training_all(
+                v2_model,
+                scope=args.lut_scope,
+                max_abs=args.lut_max_abs,
+                allow_bad_qc=args.allow_bad_q2idx,
+                verbose=True,
+            )
+            if lut_enabled == 0:
+                print("  WARNING: No layers had LUT training enabled!")
 
         t0 = time.time()
         print(f"  Moving to {device_type.upper()} ({args.dtype})...", end=" ", flush=True)
@@ -642,6 +670,20 @@ def main():
 
         # Freeze Q BEFORE moving to device (avoids XLA compilations on TPU)
         freeze_Q_all(v2_model)
+
+        # Enable LUT training BEFORE moving to device (requires CPU operations)
+        if args.train_lut:
+            from qat_lora.ane_qat_linear_v2 import enable_lut_training_all
+            print(f"\n  Enabling LUT training (scope={args.lut_scope}, max_abs={args.lut_max_abs})...")
+            lut_enabled = enable_lut_training_all(
+                v2_model,
+                scope=args.lut_scope,
+                max_abs=args.lut_max_abs,
+                allow_bad_qc=args.allow_bad_q2idx,
+                verbose=True,
+            )
+            if lut_enabled == 0:
+                print("  WARNING: No layers had LUT training enabled!")
 
         print(f"  Moving to {device_type.upper()} ({args.dtype})...", end=" ", flush=True)
         v2_model.to(device=device, dtype=train_dtype)

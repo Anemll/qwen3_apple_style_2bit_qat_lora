@@ -1598,24 +1598,45 @@ def train_e2e(
             use_wandb = False
 
     # Enable LUT training (must be done on CPU before device transfer)
-    # NOTE: Model should already be on CPU when train_e2e is called if train_lut=True
+    # NOTE: For TPU, enable_lut_training_all should be called BEFORE model.to(device)
+    #       in the caller (e.g., train_v2_simple.py) to avoid XLA hangs
     lut_enabled = 0
     if train_lut:
-        from .ane_qat_linear_v2 import enable_lut_training_all
-        if verbose:
-            print(f"\n=== Enabling LUT Training ===")
-            print(f"  Scope: {lut_scope}")
-            print(f"  Max abs: {lut_max_abs}")
-            print(f"  Allow bad QC: {allow_bad_qc}")
-        lut_enabled = enable_lut_training_all(
-            model,
-            scope=lut_scope,
-            max_abs=lut_max_abs,
-            allow_bad_qc=allow_bad_qc,
-            verbose=verbose,
-        )
-        if lut_enabled == 0:
-            print("  WARNING: No layers had LUT training enabled!")
+        from .ane_qat_linear_v2 import AnemllQATLinearV2
+        # Check if LUT training already enabled (called before device transfer)
+        for m in model.modules():
+            if isinstance(m, AnemllQATLinearV2) and m._lut_trainable:
+                lut_enabled += 1
+
+        if lut_enabled > 0:
+            # Already enabled (good - was done on CPU before device transfer)
+            if verbose:
+                print(f"\n=== LUT Training (pre-enabled) ===")
+                print(f"  {lut_enabled} layers ready")
+        else:
+            # Not enabled yet - try to enable (only works on CPU)
+            model_device = next(model.parameters()).device
+            if model_device.type != 'cpu':
+                raise RuntimeError(
+                    f"LUT training must be enabled on CPU before moving model to {model_device}. "
+                    f"Call enable_lut_training_all() before model.to(device)."
+                )
+            from .ane_qat_linear_v2 import enable_lut_training_all
+            if verbose:
+                print(f"\n=== Enabling LUT Training ===")
+                print(f"  Scope: {lut_scope}")
+                print(f"  Max abs: {lut_max_abs}")
+                print(f"  Allow bad QC: {allow_bad_qc}")
+            lut_enabled = enable_lut_training_all(
+                model,
+                scope=lut_scope,
+                max_abs=lut_max_abs,
+                allow_bad_qc=allow_bad_qc,
+                verbose=verbose,
+            )
+            if lut_enabled == 0:
+                print("  WARNING: No layers had LUT training enabled!")
+
         if use_wandb and wandb_run is not None:
             wandb.define_metric("lut/*", step_metric="train/step")
 
