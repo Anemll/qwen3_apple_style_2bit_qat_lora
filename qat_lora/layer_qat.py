@@ -2016,7 +2016,9 @@ def train_e2e(
     model.train()
     step = 0
     total_loss = 0.0
-    best_loss = initial_loss
+    # When eval is disabled, initial_loss=0.0 which breaks best tracking
+    # Use inf so first training loss becomes the baseline
+    best_loss = initial_loss if initial_loss > 0 else float('inf')
     best_state = None
     loss_history = []
     seq_len = None  # Will be set from first batch
@@ -2215,6 +2217,8 @@ def train_e2e(
 
                 # Show that training is starting
                 print(f"\nTraining:", flush=True)
+                # DEBUG: Show checkpoint save settings
+                print(f"  [CHECKPOINT CONFIG] save_steps={save_steps}, save_dir={save_dir!r}, accumulation_steps={accumulation_steps}", flush=True)
 
             # Track optimizer step timing (for debugging XLA compilation)
             # Reset timer at start of each optimizer step (not each micro-batch)
@@ -2591,6 +2595,9 @@ def train_e2e(
 
             # Periodic checkpoint saving (every save_steps optimizer steps)
             save_interval = save_steps * accumulation_steps if save_steps > 0 else 0
+            # DEBUG: Check checkpoint save conditions at potential save points
+            if save_interval > 0 and step % save_interval == 0 and step > 0:
+                print(f"  [CHECKPOINT DEBUG] step={step}, save_interval={save_interval}, save_dir={save_dir!r}, all conditions met={bool(save_dir)}")
             if save_interval > 0 and save_dir and step % save_interval == 0 and step > 0:
                 os.makedirs(save_dir, exist_ok=True)
                 ckpt_path = os.path.join(save_dir, f"checkpoint_step{optimizer_step}.pt")
@@ -2793,7 +2800,11 @@ def train_e2e(
     del optimizer
     if scheduler is not None:
         del scheduler
-    del params
+    # params may not exist if using separate param groups (LUT LR)
+    try:
+        del params
+    except NameError:
+        pass  # params wasn't defined (using param_groups instead)
     for p in model.parameters():
         if p.grad is not None:
             p.grad = None
