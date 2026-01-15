@@ -6,6 +6,7 @@ Checks for:
 1. Non-finite values (NaN/Inf) in parameters
 2. Extreme magnitudes that could cause fp16 overflow
 3. Scale/magnitude issues that cause long-context NaN
+4. LUT training stats (_lut_raw_deltas): count, rebuild, FP16-validate, diff vs stored
 
 Usage:
     python scripts/check_checkpoint.py checkpoint.pt
@@ -14,10 +15,117 @@ Usage:
 """
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
 import torch
+
+
+# =============================================================================
+# LUT Training Analysis Helpers
+# =============================================================================
+
+def _lut_prefix_from_raw_key(k: str) -> str:
+    """Extract layer prefix from _lut_raw_deltas key."""
+    return k[: -len("._lut_raw_deltas")]
+
+
+def _compute_min_delta_fp16(max_abs: float) -> float:
+    """Conservative FP16-safe minimum delta to avoid 0/duplicates."""
+    max_abs = float(max(max_abs, 1e-6))
+    exp = math.ceil(math.log2(max_abs))
+    ulp_at_max = 2 ** (exp - 10)  # FP16 mantissa ~10 bits
+    return max(2.0 * ulp_at_max, 1e-4)
+
+
+@torch.no_grad()
+def _build_lut16_from_raw_deltas(raw: torch.Tensor, max_abs: float) -> torch.Tensor:
+    """Rebuild LUT16 from _lut_raw_deltas (same logic as ane_qat_linear_v2.py)."""
+    raw = raw.float().cpu()
+    max_abs = float(max_abs)
+    min_delta = _compute_min_delta_fp16(max_abs)
+    remaining = max_abs - 8.0 * min_delta
+    w = torch.softmax(raw, dim=0)
+
+    if remaining <= 0:
+        deltas = torch.full((8,), max_abs / 8.0, dtype=torch.float32)
+    else:
+        deltas = min_delta + remaining * w
+
+    positive = torch.cumsum(deltas, dim=0)
+    negative = -positive.flip(0)
+    return torch.cat([negative, positive], dim=0)
+
+
+@torch.no_grad()
+def _lut16_fp16_qc(lut: torch.Tensor) -> dict:
+    """Quality check: validate LUT is FP16-safe (unique, strictly increasing, no zero)."""
+    lut_fp16 = lut.to(torch.float16)
+    return {
+        "unique_fp16": int(torch.unique(lut_fp16).numel()),
+        "has_zero": bool((lut_fp16 == 0).any().item()),
+        "strict_inc": bool((lut_fp16[1:] > lut_fp16[:-1]).all().item()),
+        "min_abs": float(lut_fp16.abs().min().item()),
+        "max_abs": float(lut_fp16.abs().max().item()),
+    }
+
+
+@torch.no_grad()
+def summarize_lut_raw_deltas(sd: dict, top_n: int = 5) -> None:
+    """Summarize _lut_raw_deltas tensors: count, rebuild, validate, diff vs stored."""
+    raw_keys = [k for k in sd.keys() if k.endswith("._lut_raw_deltas")]
+    if not raw_keys:
+        return
+
+    print()
+    print("=" * 60)
+    print("LUT TRAINING STATS (_lut_raw_deltas)")
+    print("=" * 60)
+    print(f"Found _lut_raw_deltas tensors: {len(raw_keys)}")
+
+    rows = []
+    diffs = []
+
+    for k in sorted(raw_keys):
+        prefix = _lut_prefix_from_raw_key(k)
+        raw = sd[k]
+        lut_key = f"{prefix}.lut"
+        stored_lut = sd.get(lut_key, None)
+
+        # Infer max_abs from stored lut if present, else default 1.0
+        if stored_lut is not None and stored_lut.numel() == 16:
+            max_abs = float(stored_lut.abs().max().item())
+        else:
+            max_abs = 1.0
+
+        rebuilt = _build_lut16_from_raw_deltas(raw, max_abs=max_abs)
+        qc = _lut16_fp16_qc(rebuilt)
+
+        d = None
+        if stored_lut is not None and stored_lut.numel() == 16:
+            d = float((stored_lut.float().cpu() - rebuilt).abs().max().item())
+            diffs.append((d, prefix, qc))
+
+        rows.append((prefix, max_abs, float(raw.abs().max().item()), qc))
+
+    # Count FP16-valid LUTs
+    ok = [r for r in rows if (r[3]["unique_fp16"] == 16 and (not r[3]["has_zero"]) and r[3]["strict_inc"])]
+    print(f"FP16-valid rebuilt LUTs: {len(ok)}/{len(rows)} (unique=16, strict inc, no zero)")
+
+    if diffs:
+        diffs.sort(key=lambda x: x[0], reverse=True)
+        max_diff = diffs[0][0]
+        avg_diff = sum(d for d, _, _ in diffs) / len(diffs)
+        print(f"Max |stored_lut - rebuilt|: {max_diff:.6f}")
+        print(f"Avg |stored_lut - rebuilt|: {avg_diff:.6f}")
+        print()
+        print("Top LUT mismatches:")
+        for d, prefix, qc in diffs[:top_n]:
+            print(f"  {prefix}: diff={d:.6f}, max_abs={qc['max_abs']:.3f}, "
+                  f"min_abs={qc['min_abs']:.6f}, unique_fp16={qc['unique_fp16']}")
+    else:
+        print("No per-layer '.lut' buffers found (cannot diff stored vs rebuilt).")
 
 
 def check_checkpoint(checkpoint_path: str, top_n: int = 20, verbose: bool = False):
@@ -156,6 +264,9 @@ def check_checkpoint(checkpoint_path: str, top_n: int = 20, verbose: bool = Fals
     print(f"Total parameters:   {stats['total_params']:,}")
     print(f"Finite tensors:     {stats['finite_tensors']:,}")
     print(f"Non-finite tensors: {stats['non_finite_tensors']:,}")
+
+    # LUT training stats (if any _lut_raw_deltas present)
+    summarize_lut_raw_deltas(sd, top_n=top_n)
 
     # Diagnosis
     print(f"\n{'-'*60}")
