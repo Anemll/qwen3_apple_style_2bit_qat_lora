@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import json
+import math
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from pathlib import Path
@@ -135,9 +136,9 @@ def load_model(args):
         if args.config in CONFIG_PRESETS:
             preset = CONFIG_PRESETS[args.config]
             print(f"Using config preset: {args.config}")
-            # Preset overrides config.json values
-            config['mlp_lut_bits'] = preset['mlp_lut']
-            config['attn_lut_bits'] = preset['attn_lut']
+            # Preset stores LUT sizes (4 or 16), convert to bits (2 or 4)
+            config['mlp_lut_bits'] = int(math.log2(preset['mlp_lut']))
+            config['attn_lut_bits'] = int(math.log2(preset['attn_lut']))
             config['mlp_scale_rank'] = preset['mlp_rank']
             config['attn_scale_rank'] = preset['attn_rank']
             config['version'] = 'v2'  # Presets are V2
