@@ -63,28 +63,69 @@ Training Commands:
 import argparse
 import fnmatch
 import os
+import platform
 import shutil
 import subprocess
 from pathlib import Path
 from datetime import datetime
 
 
-# Default paths for runs
-DEFAULT_GDRIVE_RUNS = "/content/drive/MyDrive/qwen3_runs"
-DEFAULT_LOCAL_RUNS = "runs"
+def detect_platform():
+    """Detect if running on Colab or macOS and return platform info."""
+    system = platform.system()
+    if system == "Darwin":
+        return "macos"
+    elif os.path.exists("/content/drive"):
+        return "colab"
+    else:
+        return "linux"
 
-# Default paths for caches
-DEFAULT_GDRIVE_CACHES = "/content/drive/MyDrive/qwen3_caches"
+
+def find_gdrive_macos():
+    """Find Google Drive mount point on macOS."""
+    cloud_storage = Path.home() / "Library" / "CloudStorage"
+    if not cloud_storage.exists():
+        return None
+
+    # Find Google Drive folder
+    for item in cloud_storage.iterdir():
+        if item.name.startswith("GoogleDrive"):
+            # Google Drive folder found, look for "My Drive"
+            my_drive = item / "My Drive"
+            if my_drive.exists():
+                return str(my_drive)
+    return None
+
+
+def get_default_gdrive_base():
+    """Get the default Google Drive base path based on platform."""
+    plat = detect_platform()
+    if plat == "macos":
+        gdrive_root = find_gdrive_macos()
+        if gdrive_root:
+            return gdrive_root
+        # Fallback
+        return str(Path.home() / "Library" / "CloudStorage" / "GoogleDrive" / "My Drive")
+    else:
+        # Colab or Linux
+        return "/content/drive/MyDrive"
+
+
+# Default paths (dynamically set based on platform)
+DEFAULT_LOCAL_RUNS = "runs"
 DEFAULT_LOCAL_CACHES = "caches"
 
 
 def get_paths(is_cache: bool = False):
     """Get Google Drive and local base paths based on mode."""
+    gdrive_root = get_default_gdrive_base()
     if is_cache:
-        gdrive = os.environ.get("GDRIVE_CACHES", DEFAULT_GDRIVE_CACHES)
+        default_gdrive = os.path.join(gdrive_root, "qwen3_caches")
+        gdrive = os.environ.get("GDRIVE_CACHES", default_gdrive)
         local = DEFAULT_LOCAL_CACHES
     else:
-        gdrive = os.environ.get("GDRIVE_BASE", DEFAULT_GDRIVE_RUNS)
+        default_gdrive = os.path.join(gdrive_root, "qwen3_runs")
+        gdrive = os.environ.get("GDRIVE_BASE", default_gdrive)
         local = DEFAULT_LOCAL_RUNS
     return gdrive, local
 
@@ -96,17 +137,32 @@ def get_gdrive_base(is_cache: bool = False):
 
 
 def ensure_drive_mounted(is_cache: bool = False):
-    """Check if Google Drive is mounted (Colab-specific)."""
+    """Check if Google Drive is accessible."""
+    plat = detect_platform()
     gdrive_base = get_gdrive_base(is_cache)
-    if not os.path.exists("/content/drive"):
-        print("ERROR: Google Drive not mounted!")
-        print("Run this in Colab first:")
-        print("  from google.colab import drive")
-        print("  drive.mount('/content/drive')")
-        return False
-    if not os.path.exists(os.path.dirname(gdrive_base)):
-        print(f"ERROR: Drive path not found: {os.path.dirname(gdrive_base)}")
-        return False
+
+    if plat == "macos":
+        gdrive_root = find_gdrive_macos()
+        if gdrive_root is None:
+            print("ERROR: Google Drive not found on macOS!")
+            print("Check that Google Drive is installed and syncing at:")
+            print("  ~/Library/CloudStorage/GoogleDrive-<your-email>/")
+            return False
+        print(f"[macOS] Using Google Drive at: {gdrive_root}")
+    elif plat == "colab":
+        if not os.path.exists("/content/drive"):
+            print("ERROR: Google Drive not mounted!")
+            print("Run this in Colab first:")
+            print("  from google.colab import drive")
+            print("  drive.mount('/content/drive')")
+            return False
+    else:
+        # Linux - check if path exists
+        gdrive_root = get_default_gdrive_base()
+        if not os.path.exists(gdrive_root):
+            print(f"ERROR: Google Drive path not found: {gdrive_root}")
+            return False
+
     return True
 
 
