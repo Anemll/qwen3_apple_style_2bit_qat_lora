@@ -8,6 +8,10 @@ Usage:
     python scripts/test_inference.py checkpoint.pt --prompt "What is 2+2?"
     python scripts/test_inference.py checkpoint.pt --interactive
 
+    # Use config preset (q4_r32, q2a4, q4a4, q2a2)
+    python scripts/test_inference.py checkpoint.pt --config q4_r32
+    python scripts/test_inference.py checkpoint.pt --config q2a4
+
     # With LoRA adapter (recovery LoRA on top of quantized model)
     # Option A: Separate LoRA file
     python scripts/test_inference.py checkpoint.pt --lora lora_adapter.pt
@@ -26,6 +30,15 @@ import sys
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Quantization config presets (same as measure_perplexity.py, train_v2_simple.py)
+CONFIG_PRESETS = {
+    'q2a4': {'mlp_lut': 4, 'mlp_rank': 32, 'attn_lut': 16, 'attn_rank': 8},   # 2-bit MLP, 4-bit Attn
+    'q4a4': {'mlp_lut': 16, 'mlp_rank': 4, 'attn_lut': 16, 'attn_rank': 4},    # 4-bit both, rank=4
+    'q4a4_r32': {'mlp_lut': 16, 'mlp_rank': 32, 'attn_lut': 16, 'attn_rank': 32},  # 4-bit both, rank=32
+    'q4_r32': {'mlp_lut': 16, 'mlp_rank': 32, 'attn_lut': 16, 'attn_rank': 32},  # Alias for q4a4_r32
+    'q2a2': {'mlp_lut': 4, 'mlp_rank': 32, 'attn_lut': 4, 'attn_rank': 32},    # 2-bit both
+}
 
 
 def parse_args():
@@ -55,6 +68,8 @@ def parse_args():
                         help='Print full prompt template for debugging')
 
     # Quantization config (overrides config.json if specified)
+    parser.add_argument('--config', type=str, default=None,
+                        help='Quantization config preset (q4_r32, q2a4, q4a4, q2a2) or path to config.json')
     parser.add_argument('--lut-bits', type=int, default=None,
                         help='LUT bits for MLP (auto-detect from config.json)')
     parser.add_argument('--attn-lut-bits', type=int, default=None,
@@ -114,6 +129,26 @@ def load_model(args):
 
     # Load config.json to get params
     config = load_config(args.checkpoint)
+
+    # Apply config preset if specified (overrides config.json)
+    if args.config:
+        if args.config in CONFIG_PRESETS:
+            preset = CONFIG_PRESETS[args.config]
+            print(f"Using config preset: {args.config}")
+            # Preset overrides config.json values
+            config['mlp_lut_bits'] = preset['mlp_lut']
+            config['attn_lut_bits'] = preset['attn_lut']
+            config['mlp_scale_rank'] = preset['mlp_rank']
+            config['attn_scale_rank'] = preset['attn_rank']
+            config['version'] = 'v2'  # Presets are V2
+        elif Path(args.config).exists():
+            # Load from file path
+            with open(args.config) as f:
+                file_config = json.load(f)
+            config.update(file_config)
+            print(f"Loaded config from: {args.config}")
+        else:
+            print(f"Warning: Unknown config '{args.config}'. Available presets: {list(CONFIG_PRESETS.keys())}")
 
     # Determine version (V1 or V2)
     version = args.version or config.get('version', 'v1')

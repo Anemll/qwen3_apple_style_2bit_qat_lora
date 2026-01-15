@@ -19,6 +19,10 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+# Import repair function from ane_qat_linear_v2
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from qat_lora.ane_qat_linear_v2 import repair_lut_duplicates_symmetric, verify_lut_fp16
+
 
 def build_symmetric_lut16(raw_deltas: torch.Tensor, max_abs: float, min_delta: float) -> torch.Tensor:
     """Build symmetric 16-value LUT from raw delta logits.
@@ -103,6 +107,7 @@ def bake_lut_checkpoint(
         'baked': 0,
         'skipped': 0,
         'errors': 0,
+        'q_refreshed': 0,
         'layers': [],
     }
 
@@ -136,28 +141,54 @@ def bake_lut_checkpoint(
 
         min_delta = compute_min_delta(max_abs)
 
-        # Build the learned LUT
+        # Build the learned LUT from raw deltas
         learned_lut = build_symmetric_lut16(raw_deltas, max_abs, min_delta)
 
-        # Compute difference for stats
+        # CRITICAL: Apply FP16 snap + repair to get the exact LUT that will be used at inference
+        # This ensures _Q == lut[_indices] in the saved checkpoint
+        baked_lut = repair_lut_duplicates_symmetric(learned_lut, max_abs)
+
+        # Validate the repaired LUT
+        if not verify_lut_fp16(baked_lut):
+            print(f"  WARNING: {delta_key} LUT failed FP16 validation after repair")
+            stats['errors'] += 1
+
+        # Compute difference for stats (vs old stored LUT)
         old_lut = state_dict[lut_key]
-        diff = (learned_lut - old_lut).abs().max().item()
+        diff = (baked_lut - old_lut).abs().max().item()
 
         if verbose:
             layer_name = delta_key.replace('._lut_raw_deltas', '')
             print(f"\n  {layer_name}")
             print(f"    max_abs={max_abs:.4f}, max_diff={diff:.6f}")
-            print(f"    {'idx':>3}  {'old':>10}  {'new':>10}  {'diff':>10}")
+            print(f"    {'idx':>3}  {'old':>10}  {'baked':>10}  {'diff':>10}")
             print(f"    {'-'*3}  {'-'*10}  {'-'*10}  {'-'*10}")
             for i in range(len(old_lut)):
                 o = old_lut[i].item()
-                n = learned_lut[i].item()
+                n = baked_lut[i].item()
                 d = n - o
                 flag = "*" if abs(d) > 0.001 else " "
                 print(f"    {i:3d}  {o:10.6f}  {n:10.6f}  {d:+10.6f} {flag}")
 
-        # Update the .lut buffer
-        state_dict[lut_key] = learned_lut.to(old_lut.dtype)
+        # Update the .lut buffer with the REPAIRED LUT
+        state_dict[lut_key] = baked_lut.to(old_lut.dtype)
+
+        # CRITICAL: Compute _Q from the SAME repaired LUT that we just saved
+        # This guarantees _Q == lut[_indices] in the saved checkpoint
+        indices_key = base_key + '_indices'
+        q_key = base_key + '_Q'
+        if indices_key in state_dict:
+            indices = state_dict[indices_key]
+            Q_new = baked_lut[indices.long()]
+            # Match dtype of existing _Q or use LUT dtype
+            if q_key in state_dict:
+                Q_new = Q_new.to(state_dict[q_key].dtype)
+            else:
+                Q_new = Q_new.to(old_lut.dtype)
+            state_dict[q_key] = Q_new
+            stats['q_refreshed'] += 1
+            if verbose:
+                print(f"    _Q refreshed from baked_lut[_indices]")
 
         # Remove _lut_raw_deltas (no longer needed)
         del state_dict[delta_key]
@@ -180,7 +211,10 @@ def bake_lut_checkpoint(
     print("RESULTS")
     print(f"{'-'*60}")
     print(f"LUTs baked:   {stats['baked']}")
+    print(f"_Q refreshed: {stats['q_refreshed']}")
     print(f"Skipped:      {stats['skipped']}")
+    if stats['errors'] > 0:
+        print(f"Errors:       {stats['errors']} (LUT validation failed)")
 
     if stats['layers']:
         max_diff = max(l['max_diff'] for l in stats['layers'])
