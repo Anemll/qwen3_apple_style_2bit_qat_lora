@@ -246,6 +246,10 @@ def main():
                              'Ignored if cache already has rand_idx/rand_logits.')
     args = parser.parse_args()
 
+    # --upload-all implies --upload (UX fix: don't require both flags)
+    if args.upload_all:
+        args.upload = True
+
     # Validate inputs - need v1, v2 checkpoint, or from-scratch
     if args.anchor_ckpt:
         assert os.path.exists(args.anchor_ckpt), f"Anchor checkpoint not found: {args.anchor_ckpt}"
