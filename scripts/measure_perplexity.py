@@ -19,8 +19,16 @@ Usage:
     # With LoRA
     python scripts/measure_perplexity.py checkpoint.pt --lora-r 8
 
-    # Use config from a different directory
+    # Use config preset (q4_r32, q2a4, q4a4, q2a2)
+    python scripts/measure_perplexity.py checkpoint.pt --config q4_r32
+    python scripts/measure_perplexity.py checkpoint.pt --config q2a4
+
+    # Use config from a different directory (file path)
     python scripts/measure_perplexity.py output.pt --config runs/original_run/config.json
+
+    # Force specific device (cpu, tpu, mps, cuda)
+    python scripts/measure_perplexity.py checkpoint.pt --device cpu
+    python scripts/measure_perplexity.py checkpoint.pt --device tpu --dtype bf16
 
     # Force specific dtype (fp16, bf16, or fp32)
     python scripts/measure_perplexity.py checkpoint.pt --dtype fp16
@@ -29,6 +37,9 @@ Usage:
     # Batch processing (faster on GPU/TPU)
     python scripts/measure_perplexity.py checkpoint.pt --batch-size 8 --seq-len 512
     python scripts/measure_perplexity.py --baseline --batch-size 4
+
+    # TPU with batch processing
+    python scripts/measure_perplexity.py checkpoint.pt --device tpu --batch-size 8 --seq-len 512
 
     # Benchmark different batch sizes
     python scripts/measure_perplexity.py --baseline --benchmark
@@ -54,6 +65,15 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+# Quantization config presets (same as train_v2_simple.py)
+CONFIG_PRESETS = {
+    'q2a4': {'mlp_lut': 4, 'mlp_rank': 32, 'attn_lut': 16, 'attn_rank': 8},   # 2-bit MLP, 4-bit Attn
+    'q4a4': {'mlp_lut': 16, 'mlp_rank': 4, 'attn_lut': 16, 'attn_rank': 4},    # 4-bit both, rank=4
+    'q4a4_r32': {'mlp_lut': 16, 'mlp_rank': 32, 'attn_lut': 16, 'attn_rank': 32},  # 4-bit both, rank=32
+    'q4_r32': {'mlp_lut': 16, 'mlp_rank': 32, 'attn_lut': 16, 'attn_rank': 32},  # Alias for q4a4_r32
+    'q2a2': {'mlp_lut': 4, 'mlp_rank': 32, 'attn_lut': 4, 'attn_rank': 32},    # 2-bit both
+}
+
 
 def parse_dtype(dtype_arg: str) -> torch.dtype:
     """Parse dtype string to torch.dtype."""
@@ -66,10 +86,14 @@ def parse_dtype(dtype_arg: str) -> torch.dtype:
 
 
 def get_device(device_arg: str = 'auto', dtype_arg: str = 'auto'):
-    """Get device and dtype based on availability and user preference."""
+    """Get device and dtype based on availability and user preference.
+
+    Default dtype is fp16 for all devices (matches checkpoint format).
+    """
     # First determine device
     device = None
-    default_dtype = None
+    # Default to fp16 for all devices (matches typical checkpoint format)
+    default_dtype = torch.float16
 
     # Debug: show what we're looking for
     print(f"[Device] Requested: {device_arg}")
@@ -78,24 +102,20 @@ def get_device(device_arg: str = 'auto', dtype_arg: str = 'auto'):
         try:
             import torch_xla.core.xla_model as xm
             device = xm.xla_device()
-            default_dtype = torch.bfloat16
             print(f"[Device] TPU found: {device}")
         except ImportError as e:
             print(f"[Device] torch_xla not installed: {e}")
             print("Warning: torch_xla not installed, falling back to CPU")
             device = torch.device('cpu')
-            default_dtype = torch.float32
         except Exception as e:
             print(f"[Device] TPU error: {e}")
             device = torch.device('cpu')
-            default_dtype = torch.float32
     elif device_arg == 'auto':
         # TPU > MPS > CUDA > CPU
         print("[Device] Auto-detecting: trying TPU...")
         try:
             import torch_xla.core.xla_model as xm
             device = xm.xla_device()
-            default_dtype = torch.bfloat16
             print(f"[Device] TPU found: {device}")
         except ImportError as e:
             print(f"[Device] torch_xla not available: {e}")
@@ -105,24 +125,18 @@ def get_device(device_arg: str = 'auto', dtype_arg: str = 'auto'):
             if torch.backends.mps.is_available():
                 print("[Device] MPS available")
                 device = torch.device('mps')
-                default_dtype = torch.float32
             elif torch.cuda.is_available():
                 print("[Device] CUDA available")
                 device = torch.device('cuda')
-                default_dtype = torch.bfloat16
             else:
                 print("[Device] Falling back to CPU")
                 device = torch.device('cpu')
-                default_dtype = torch.float32
     elif device_arg == 'mps':
         device = torch.device('mps')
-        default_dtype = torch.float32
     elif device_arg == 'cuda':
         device = torch.device('cuda')
-        default_dtype = torch.bfloat16
     else:
         device = torch.device('cpu')
-        default_dtype = torch.float32
 
     # Apply dtype override if specified
     if dtype_arg != 'auto':
@@ -690,69 +704,85 @@ def load_checkpoint(
     # Check for config.json or v2_config.json
     config = {}
     config_found = None
+    config_preset_used = None
 
-    # Use override path if provided
-    if config_path_override:
-        override_path = Path(config_path_override)
-        if override_path.exists():
-            with open(override_path) as f:
-                config = json.load(f)
-            config_found = override_path
-        else:
-            print(f"WARNING: Config file not found: {config_path_override}")
-
-    # Otherwise auto-detect from checkpoint directory
-    if not config_found:
-        config_dir = checkpoint_path.parent if checkpoint_path.is_file() else checkpoint_path
-        for config_name in ['config.json', 'v2_config.json']:
-            cfg_path = config_dir / config_name
-            if cfg_path.exists():
-                with open(cfg_path) as f:
-                    config = json.load(f)
-                config_found = cfg_path
-                break
-
-    if config_found:
-        print(f"Config:     {config_found}")
-        # Support both naming conventions: lut_bits/mlp_lut_bits, scale_rank/mlp_scale_rank
-        lut_bits = config.get('lut_bits') or config.get('mlp_lut_bits') or 4
-        attn_lut_bits = config.get('attn_lut_bits') or lut_bits
-        scale_rank = config.get('scale_rank') or config.get('mlp_scale_rank') or 32
-        attn_scale_rank = config.get('attn_scale_rank') or scale_rank
-        print(f"  MLP:      Q{lut_bits} (LUT{2**lut_bits}), rank={scale_rank}")
-        print(f"  Attn:     Q{attn_lut_bits} (LUT{2**attn_lut_bits}), rank={attn_scale_rank}")
-
-        # Auto-detect LoRA from config if not explicitly set via --lora-r
-        # lora_r: None = auto-detect, 0 = explicitly disabled, >0 = explicitly enabled
-        # Support both naming conventions: lora_r/lora_alpha/lora_mlp_only and recovery_r/recovery_alpha/mlp_only
-        config_lora_r = config.get('lora_r') or config.get('recovery_r') or 0
-        if config_lora_r > 0:
-            config_lora_alpha = config.get('lora_alpha') or config.get('recovery_alpha') or config_lora_r
-            config_lora_mlp_only = config.get('lora_mlp_only') or config.get('mlp_only') or False
-
-            if lora_r is None:
-                # Auto-set from config
-                lora_r = config_lora_r
-                # Only use config's mlp_only if not explicitly set via CLI
-                if not lora_mlp_only:
-                    lora_mlp_only = config_lora_mlp_only
-                GREEN = "\033[92m"
-                RESET = "\033[0m"
-                mlp_only_str = ", mlp_only=True" if lora_mlp_only else ""
-                print(f"  LoRA:     {GREEN}r={lora_r} (auto-detected from config){RESET}, alpha={config_lora_alpha}{mlp_only_str}")
-            elif lora_r == 0:
-                # User explicitly disabled LoRA
-                YELLOW = "\033[93m"
-                RESET = "\033[0m"
-                print(f"  LoRA:     {YELLOW}DISABLED (--lora-r 0 overrides config r={config_lora_r}){RESET}")
-            else:
-                # User explicitly specified a rank
-                mlp_only_str = ", mlp_only=True" if lora_mlp_only else ""
-                print(f"  LoRA:     r={lora_r} (CLI), config has r={config_lora_r}{mlp_only_str}")
+    # Check if config_path_override is a preset name (e.g., 'q4_r32', 'q2a4')
+    if config_path_override and config_path_override in CONFIG_PRESETS:
+        preset = CONFIG_PRESETS[config_path_override]
+        # Convert preset format to config format
+        # Preset uses lut_size (4/16), we need to convert to bits (2/4)
+        import math as _math
+        lut_bits = int(_math.log2(preset['mlp_lut']))
+        attn_lut_bits = int(_math.log2(preset['attn_lut']))
+        scale_rank = preset['mlp_rank']
+        attn_scale_rank = preset['attn_rank']
+        config_preset_used = config_path_override
+        print(f"Config:     --config {config_path_override} (preset)")
+        print(f"  MLP:      Q{lut_bits} (LUT{preset['mlp_lut']}), rank={scale_rank}")
+        print(f"  Attn:     Q{attn_lut_bits} (LUT{preset['attn_lut']}), rank={attn_scale_rank}")
     else:
-        print(f"Config:     (not found, using defaults)")
-        print(f"  MLP:      Q{lut_bits} (LUT{2**lut_bits}), rank={scale_rank}")
-        print(f"  Attn:     Q{attn_lut_bits} (LUT{2**attn_lut_bits}), rank={attn_scale_rank}")
+        # Use override path if provided (not a preset name)
+        if config_path_override:
+            override_path = Path(config_path_override)
+            if override_path.exists():
+                with open(override_path) as f:
+                    config = json.load(f)
+                config_found = override_path
+            else:
+                print(f"WARNING: Config file not found: {config_path_override}")
+
+        # Otherwise auto-detect from checkpoint directory
+        if not config_found:
+            config_dir = checkpoint_path.parent if checkpoint_path.is_file() else checkpoint_path
+            for config_name in ['config.json', 'v2_config.json']:
+                cfg_path = config_dir / config_name
+                if cfg_path.exists():
+                    with open(cfg_path) as f:
+                        config = json.load(f)
+                    config_found = cfg_path
+                    break
+
+        if config_found:
+            print(f"Config:     {config_found}")
+            # Support both naming conventions: lut_bits/mlp_lut_bits, scale_rank/mlp_scale_rank
+            lut_bits = config.get('lut_bits') or config.get('mlp_lut_bits') or 4
+            attn_lut_bits = config.get('attn_lut_bits') or lut_bits
+            scale_rank = config.get('scale_rank') or config.get('mlp_scale_rank') or 32
+            attn_scale_rank = config.get('attn_scale_rank') or scale_rank
+            print(f"  MLP:      Q{lut_bits} (LUT{2**lut_bits}), rank={scale_rank}")
+            print(f"  Attn:     Q{attn_lut_bits} (LUT{2**attn_lut_bits}), rank={attn_scale_rank}")
+
+            # Auto-detect LoRA from config if not explicitly set via --lora-r
+            # lora_r: None = auto-detect, 0 = explicitly disabled, >0 = explicitly enabled
+            # Support both naming conventions: lora_r/lora_alpha/lora_mlp_only and recovery_r/recovery_alpha/mlp_only
+            config_lora_r = config.get('lora_r') or config.get('recovery_r') or 0
+            if config_lora_r > 0:
+                config_lora_alpha = config.get('lora_alpha') or config.get('recovery_alpha') or config_lora_r
+                config_lora_mlp_only = config.get('lora_mlp_only') or config.get('mlp_only') or False
+
+                if lora_r is None:
+                    # Auto-set from config
+                    lora_r = config_lora_r
+                    # Only use config's mlp_only if not explicitly set via CLI
+                    if not lora_mlp_only:
+                        lora_mlp_only = config_lora_mlp_only
+                    GREEN = "\033[92m"
+                    RESET = "\033[0m"
+                    mlp_only_str = ", mlp_only=True" if lora_mlp_only else ""
+                    print(f"  LoRA:     {GREEN}r={lora_r} (auto-detected from config){RESET}, alpha={config_lora_alpha}{mlp_only_str}")
+                elif lora_r == 0:
+                    # User explicitly disabled LoRA
+                    YELLOW = "\033[93m"
+                    RESET = "\033[0m"
+                    print(f"  LoRA:     {YELLOW}DISABLED (--lora-r 0 overrides config r={config_lora_r}){RESET}")
+                else:
+                    # User explicitly specified a rank
+                    mlp_only_str = ", mlp_only=True" if lora_mlp_only else ""
+                    print(f"  LoRA:     r={lora_r} (CLI), config has r={config_lora_r}{mlp_only_str}")
+        else:
+            print(f"Config:     (not found, using defaults)")
+            print(f"  MLP:      Q{lut_bits} (LUT{2**lut_bits}), rank={scale_rank}")
+            print(f"  Attn:     Q{attn_lut_bits} (LUT{2**attn_lut_bits}), rank={attn_scale_rank}")
 
     # Load base model
     print(f"Loading base model: {model_name}")
@@ -954,7 +984,7 @@ def main():
     parser.add_argument('--xla-cache-dir', type=str, default=None,
                         help='XLA compilation cache directory (speeds up TPU restarts)')
     parser.add_argument('--dtype', choices=['auto', 'fp16', 'bf16', 'fp32'], default='auto',
-                        help='Model dtype (default: auto, uses device default)')
+                        help='Model dtype (default: fp16 for all devices)')
     parser.add_argument('--verbose', action='store_true',
                         help='Show per-chunk perplexity')
     parser.add_argument('--baseline', action='store_true',
@@ -970,7 +1000,8 @@ def main():
     parser.add_argument('--list', action='store_true',
                         help='List all saved perplexity results from results/perplexity.json')
     parser.add_argument('--config', type=str, default=None,
-                        help='Path to config.json to use (default: auto-detect from checkpoint directory)')
+                        help='Quantization config preset (q4_r32, q2a4, q4a4, q2a2) or path to config.json. '
+                             'Default: auto-detect from checkpoint directory.')
 
     args = parser.parse_args()
 
