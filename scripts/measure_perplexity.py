@@ -838,6 +838,7 @@ def load_checkpoint(
         attn_config=attn_config,
         quantize_attn=True,
         verbose=False,
+        skip_init=True,  # Skip SVD init since we load checkpoint immediately after
     )
 
     # Load checkpoint
