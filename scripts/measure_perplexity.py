@@ -138,6 +138,18 @@ def get_device(device_arg: str = 'auto', dtype_arg: str = 'auto'):
     else:
         device = torch.device('cpu')
 
+    # Print CPU capability info when CPU backend is selected
+    if device == torch.device('cpu'):
+        try:
+            # Get CPU capability from PyTorch config
+            config_str = torch.__config__.show()
+            for line in config_str.split('\n'):
+                if 'CPU capability' in line:
+                    print(f"[Device] {line.strip()}")
+                    break
+        except Exception:
+            pass
+
     # Apply dtype override if specified
     if dtype_arg != 'auto':
         dtype = parse_dtype(dtype_arg)
