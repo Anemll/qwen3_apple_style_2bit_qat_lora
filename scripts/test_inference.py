@@ -257,8 +257,9 @@ def load_model(args):
     missing_other = [k for k in missing if '_scales_baked_flag' not in k]
 
     unexpected_Q = [k for k in unexpected if '._Q' in k]
+    unexpected_indices = [k for k in unexpected if '._indices' in k]
     unexpected_lora = [k for k in unexpected if 'lora_' in k]
-    unexpected_other = [k for k in unexpected if '._Q' not in k and 'lora_' not in k]
+    unexpected_other = [k for k in unexpected if '._Q' not in k and '._indices' not in k and 'lora_' not in k]
 
     # Print summary with explanations
     print(f"  Load results:")
@@ -272,6 +273,8 @@ def load_model(args):
             print(f"      ... and {len(missing_other) - 5} more")
     if unexpected_Q:
         print(f"    Unexpected: {len(unexpected_Q)} _Q buffers (OK: will load manually)")
+    if unexpected_indices:
+        print(f"    Unexpected: {len(unexpected_indices)} _indices buffers (OK: will load manually)")
     if unexpected_lora:
         print(f"    Unexpected: {len(unexpected_lora)} LoRA keys (OK: will load after LoRA enabled)")
     if unexpected_other:
@@ -308,6 +311,26 @@ def load_model(args):
             print(f"  Loaded {q_loaded} _Q buffers (manual registration)")
         if baked_detected > 0:
             print(f"  Detected {baked_detected} layers with baked scales (FP16 snap)")
+
+        # CRITICAL: Also load _indices buffers and enable indices-path for forward()
+        # Without this, forward() uses stale _Q instead of lut[_indices]
+        indices_loaded = 0
+        for name, m in model.named_modules():
+            if type(m).__name__ == 'AnemllQATLinearV2':
+                idx_key = f"{name}._indices"
+                if idx_key in state_dict:
+                    idx = state_dict[idx_key]
+                    if m._indices is None:
+                        m.register_buffer("_indices", idx)
+                    else:
+                        m._indices = idx
+                    # CRITICAL: Set _use_indices so forward() uses lut[_indices] not stale _Q
+                    m._use_indices = True
+                    indices_loaded += 1
+
+        if indices_loaded > 0:
+            print(f"  Loaded {indices_loaded} _indices buffers (manual registration)")
+            print(f"  _use_indices=True for {indices_loaded} layers (forward uses lut[_indices])")
 
     # Load LoRA adapter
     # Priority: 1) --lora flag, 2) embedded in checkpoint, 3) none
