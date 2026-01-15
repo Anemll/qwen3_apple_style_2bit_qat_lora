@@ -643,6 +643,7 @@ def main():
             attn_config=v2_attn_config,
             quantize_attn=True,
             quantize_lm_head=False,
+            skip_init=True,  # Skip SVD, V1->V2 conversion overwrites anyway
         )
 
         # Convert V1 -> V2 (simple norm-based conversion)

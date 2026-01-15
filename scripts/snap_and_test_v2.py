@@ -176,6 +176,7 @@ def main():
         quantize_attn=True,
         quantize_lm_head=False,
         verbose=False,
+        skip_init=True,  # Skip SVD since we load checkpoint immediately after
     )
     print(f"  Replaced {count} layers")
 

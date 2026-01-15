@@ -171,6 +171,7 @@ def load_model(args):
             attn_config=attn_config,
             quantize_attn=True,
             verbose=False,
+            skip_init=True,  # Skip SVD since we load checkpoint immediately after
         )
     else:
         # V1: Original implementation

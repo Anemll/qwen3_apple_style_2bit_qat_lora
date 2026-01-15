@@ -215,6 +215,7 @@ def main():
         v2_model,
         config=v2_config,
         attn_config=v2_attn_config,
+        skip_init=True,  # Skip SVD, V1->V2 conversion overwrites anyway
     )
 
     # Convert V1 to V2
