@@ -828,6 +828,131 @@ Pre-tokenized format is fastest (skips tokenization) and recommended for large-s
 
 ---
 
+## 16. Checkpoint Utilities
+
+### 16.1 Bake LUT (`bake_lut.py`)
+
+After LUT training, learned values are stored in `_lut_raw_deltas` but the `.lut` buffer remains unchanged. This script bakes the deltas into the LUT and syncs `_Q` for proper inference.
+
+```bash
+# Bake to new file
+python scripts/bake_lut.py source.pt dest.pt
+
+# Bake in place (overwrites original)
+python scripts/bake_lut.py source.pt --inplace
+
+# Verbose output (shows per-layer diffs)
+python scripts/bake_lut.py source.pt dest.pt --verbose
+```
+
+| Argument | Description |
+|----------|-------------|
+| `source` | Input checkpoint with `_lut_raw_deltas` |
+| `dest` | Output checkpoint path (optional with `--inplace`) |
+| `--inplace` | Overwrite input checkpoint |
+| `--verbose`, `-v` | Show per-layer LUT changes |
+
+**What it does:**
+1. Builds learned LUT from `_lut_raw_deltas`
+2. Applies FP16 snap + repair (`repair_lut_duplicates_symmetric`)
+3. Validates LUT is FP16-safe (`verify_lut_fp16`)
+4. Saves repaired LUT to `.lut` buffer
+5. Computes `_Q = repaired_lut[_indices]` for consistency
+6. Removes `_lut_raw_deltas` (no longer needed)
+
+### 16.2 Sync _Q (`sync_q_checkpoint.py`)
+
+Recomputes `_Q = lut[_indices]` for all layers in a checkpoint. Use when `_Q` has become stale (e.g., after manual LUT modifications).
+
+```bash
+# Dry run (shows what would change, no save)
+python scripts/sync_q_checkpoint.py checkpoint.pt
+
+# Fix in place
+python scripts/sync_q_checkpoint.py checkpoint.pt --inplace
+
+# Save to new file
+python scripts/sync_q_checkpoint.py checkpoint.pt -o fixed.pt
+
+# Verbose (per-layer diffs)
+python scripts/sync_q_checkpoint.py checkpoint.pt --verbose
+```
+
+| Argument | Description |
+|----------|-------------|
+| `checkpoint` | Input checkpoint file |
+| `-o`, `--output` | Output checkpoint path |
+| `--inplace` | Overwrite input checkpoint |
+| `-v`, `--verbose` | Show per-layer details |
+
+**Output example:**
+```
+Found: 196 _indices, 196 _Q, 196 .lut
+
+Layers synced: 196
+Max diff:      0.000000
+All layers already consistent (diff <= 1e-3)
+```
+
+### 16.3 Measure Perplexity (`measure_perplexity.py`)
+
+Evaluate perplexity of V2 checkpoints or baseline models on WikiText-2/103.
+
+```bash
+# Baseline (original FP model)
+python scripts/measure_perplexity.py --baseline
+python scripts/measure_perplexity.py --baseline --model Qwen/Qwen3-0.6B
+
+# QAT checkpoint
+python scripts/measure_perplexity.py checkpoint.pt
+python scripts/measure_perplexity.py checkpoint.pt --config q2a4
+
+# Use KD cache as eval data
+python scripts/measure_perplexity.py checkpoint.pt --cache-dir caches/alpaca_L128
+
+# Fast screening (first N chunks only)
+python scripts/measure_perplexity.py checkpoint.pt --max-chunks 20
+
+# Batched mode (faster on GPU/TPU)
+python scripts/measure_perplexity.py checkpoint.pt --batch-size 8 --seq-len 512
+
+# With LoRA adapters
+python scripts/measure_perplexity.py checkpoint.pt --lora-r 8 --lora-mlp-only
+
+# Force device/dtype
+python scripts/measure_perplexity.py checkpoint.pt --device cpu --dtype fp32
+python scripts/measure_perplexity.py checkpoint.pt --device tpu --dtype bf16
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `checkpoint` | — | V2 checkpoint path (optional with `--baseline`) |
+| `--baseline` | — | Evaluate original FP model (no checkpoint) |
+| `--model` | `Qwen/Qwen3-0.6B` | Base model name |
+| `--config` | — | Config preset: `q2a4`, `q4a4`, `q4_r32`, `q2a2` |
+| `--dataset` | `wikitext2` | Dataset: `wikitext2` or `wikitext103` |
+| `--cache-dir` | — | Use KD cache as evaluation data |
+| `--text-file` | — | Use custom text file |
+| `--max-length` | 1024 | Sequence length for sliding window |
+| `--stride` | 512 | Stride for sliding window |
+| `--max-chunks` | — | Limit to first N chunks (fast screening) |
+| `--batch-size` | 0 | Batch size (0 = sliding window mode) |
+| `--seq-len` | 512 | Sequence length for batched mode |
+| `--lora-r` | — | Enable LoRA with specified rank |
+| `--lora-mlp-only` | — | Apply LoRA to MLP layers only |
+| `--device` | `auto` | Device: `auto`, `mps`, `cuda`, `cpu`, `tpu` |
+| `--dtype` | `auto` | Dtype: `auto`, `fp16`, `bf16`, `fp32` |
+| `--verbose` | — | Show detailed output |
+| `--benchmark` | — | Benchmark different batch sizes |
+
+**Processing modes:**
+- **Sliding window** (default): Overlapping chunks with stride, accurate PPL
+- **Batched** (`--batch-size N`): Parallel processing, faster on GPU/TPU
+
+**Fast screening:** Use `--max-chunks 20` for quick ~30s evaluation vs ~3min full run.
+
+---
+
 ## References
 
 - See [CMD_TRAIN.md](CMD_TRAIN.md) for training commands

@@ -465,8 +465,9 @@ def main():
         print_mem("after V2 replace")
 
     # Load QAT checkpoint
+    # prefer_indices=False: use _Q directly for training continuation (original training path)
     print(f"\nLoading V2 checkpoint: {args.v2_checkpoint}")
-    load_v2_checkpoint(model, args.v2_checkpoint, device=device, verbose=True)
+    load_v2_checkpoint(model, args.v2_checkpoint, device=device, verbose=True, prefer_indices=False)
     if args.debug:
         print_mem("after checkpoint load")
 

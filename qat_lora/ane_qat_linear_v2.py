@@ -1808,6 +1808,86 @@ def freeze_Q_all(model: nn.Module, verbose: bool = False) -> int:
     return count
 
 
+@torch.no_grad()
+def sync_q_from_indices(
+    module,  # AnemllQATLinearV2
+    fp16: bool = True,
+    prefer_trainable_lut: bool = True,
+) -> bool:
+    """Refresh _Q buffer from lut[_indices] to ensure consistency.
+
+    This is the canonical way to ensure _Q reflects the current LUT and indices.
+    Call this after changing LUT or indices to make utilities that read _Q
+    see the updated quantization.
+
+    Args:
+        module: AnemllQATLinearV2 module
+        fp16: If True, store _Q in FP16 (matches FP16-snapped behavior)
+        prefer_trainable_lut: If True, use get_lut() which handles trainable LUT case
+
+    Returns:
+        True if sync succeeded, False if _indices not available
+    """
+    if module._indices is None:
+        return False
+
+    # Get current LUT
+    if prefer_trainable_lut and hasattr(module, 'get_lut'):
+        lut = module.get_lut()
+    else:
+        lut = module.lut
+
+    # Compute Q from lut[indices]
+    Q_new = lut[module._indices.long()]
+
+    # Convert to target dtype
+    target_dtype = torch.float16 if fp16 else lut.dtype
+    Q_new = Q_new.to(target_dtype)
+
+    # Update or create _Q buffer
+    if module._Q is not None:
+        module._Q.copy_(Q_new)
+    else:
+        module.register_buffer("_Q", Q_new)
+
+    return True
+
+
+def sync_q_from_indices_all(
+    model: nn.Module,
+    fp16: bool = True,
+    prefer_trainable_lut: bool = True,
+    verbose: bool = False,
+) -> int:
+    """Sync _Q from lut[_indices] for all V2 layers.
+
+    Call this after baking LUTs or before saving checkpoints to ensure
+    _Q is consistent with LUT and indices.
+
+    Returns:
+        Number of layers synced
+    """
+    count = 0
+    skipped = 0
+    for name, module in model.named_modules():
+        if isinstance(module, AnemllQATLinearV2):
+            if sync_q_from_indices(module, fp16=fp16, prefer_trainable_lut=prefer_trainable_lut):
+                count += 1
+                if verbose:
+                    print(f'  [sync_q] {name}')
+            else:
+                skipped += 1
+                if verbose:
+                    print(f'  [sync_q] {name}: skipped (no _indices)')
+
+    if verbose and count > 0:
+        print(f'  Synced _Q for {count} layers')
+        if skipped > 0:
+            print(f'  Skipped {skipped} layers (no _indices)')
+
+    return count
+
+
 def enable_lut_training_all(
     model: nn.Module,
     scope: str = 'all',
@@ -2123,6 +2203,7 @@ def load_v2_checkpoint(
     checkpoint_path: str,
     device: Optional[torch.device] = None,
     verbose: bool = True,
+    prefer_indices: bool = True,
 ) -> dict:
     """Load a V2 checkpoint with proper handling of _Q and _indices buffers.
 
@@ -2134,6 +2215,11 @@ def load_v2_checkpoint(
         checkpoint_path: Path to the checkpoint file
         device: Device to load to (default: CPU)
         verbose: Print loading statistics
+        prefer_indices: If True, set _use_indices=True when _indices are loaded.
+                       This makes forward() use lut[_indices] instead of _Q directly,
+                       so that any changes to .lut take effect. Set to True for
+                       inference/evaluation, False for training continuation where
+                       you want the original training path.
 
     Returns:
         Dictionary with loading statistics
@@ -2167,6 +2253,11 @@ def load_v2_checkpoint(
         if indices_key in state_dict:
             indices_tensor = state_dict[indices_key]
             module.register_buffer("_indices", indices_tensor.to(device))
+            # Set _use_indices based on prefer_indices parameter
+            # True: forward() uses lut[_indices] (inference - LUT changes take effect)
+            # False: forward() uses _Q directly (training continuation - original path)
+            if prefer_indices:
+                module._use_indices = True
             indices_loaded += 1
 
     # Now load the rest of the state dict
@@ -2194,6 +2285,9 @@ def load_v2_checkpoint(
         print(f"  V2 layers: {stats['v2_layers']}")
         print(f"  _Q loaded: {stats['q_loaded']}")
         print(f"  _indices loaded: {stats['indices_loaded']}")
+        if indices_loaded > 0:
+            mode = "lut[_indices]" if prefer_indices else "_Q direct"
+            print(f"  _use_indices: {prefer_indices} ({mode})")
         print(f"  Missing keys: {stats['missing_keys']}")
         if stats['missing_keys_expected'] > 0:
             print(f"  Missing (expected, new buffers): {stats['missing_keys_expected']}")

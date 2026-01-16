@@ -17,6 +17,8 @@ from .ane_qat_linear_v2 import (
     AnemllQuantConfigV2,
     replace_linear_with_anemll_v2,
     freeze_Q_all,
+    sync_q_from_indices,      # Sync _Q from lut[_indices] for single module
+    sync_q_from_indices_all,  # Sync _Q from lut[_indices] for all V2 layers
     freeze_model_for_inference_v2,
     unfreeze_model_for_training_v2,
     set_factored_inference_v2,
@@ -61,6 +63,8 @@ __all__ = [
     'AnemllQuantConfigV2',
     'replace_linear_with_anemll_v2',
     'freeze_Q_all',
+    'sync_q_from_indices',
+    'sync_q_from_indices_all',
     'freeze_model_for_inference_v2',
     'unfreeze_model_for_training_v2',
     'set_factored_inference_v2',

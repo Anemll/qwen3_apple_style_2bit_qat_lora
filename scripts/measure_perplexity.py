@@ -425,6 +425,7 @@ def compute_perplexity_batched(
     dtype: torch.dtype,
     batch_size: int = 4,
     seq_len: int = 512,
+    max_chunks: int = None,
     verbose: bool = False,
 ):
     """
@@ -441,6 +442,7 @@ def compute_perplexity_batched(
         dtype: Target dtype
         batch_size: Number of sequences per batch
         seq_len: Fixed sequence length for each chunk
+        max_chunks: If set, limit to first N chunks (for fast screening)
         verbose: Print per-batch stats
 
     Returns:
@@ -452,7 +454,7 @@ def compute_perplexity_batched(
     # Check if TPU
     is_tpu = 'xla' in str(device)
     if is_tpu:
-        import torch_xla.core.xla_model as xm
+        import torch_xla
         print(f"  [TPU] First batch will trigger XLA compilation (~1-5 min)...")
 
     # Split into fixed-length chunks (discard remainder)
@@ -462,6 +464,10 @@ def compute_perplexity_batched(
         print(f"Warning: input ({total_tokens} tokens) shorter than seq_len ({seq_len})")
         seq_len = total_tokens
         num_chunks = 1
+
+    # Limit chunks if max_chunks specified (for fast screening)
+    if max_chunks is not None and max_chunks < num_chunks:
+        num_chunks = max_chunks
 
     # Reshape to [num_chunks, seq_len]
     usable_tokens = num_chunks * seq_len
@@ -514,9 +520,9 @@ def compute_perplexity_batched(
 
         batch_tokens = B * L_minus_1
 
-        # TPU: mark_step BEFORE .item() to flush graph
+        # TPU: sync BEFORE .item() to flush graph
         if is_tpu:
-            xm.mark_step()
+            torch_xla.sync()
 
         # Now safe to call .item()
         loss_val = loss.item()
@@ -566,6 +572,7 @@ def compute_perplexity(
     dtype: torch.dtype,
     stride: int = 512,
     max_length: int = 1024,
+    max_chunks: int = None,
     verbose: bool = False,
 ):
     """
@@ -578,6 +585,7 @@ def compute_perplexity(
         dtype: Target dtype
         stride: Sliding window stride
         max_length: Context window size
+        max_chunks: If set, stop after evaluating this many chunks (for fast screening)
         verbose: Print per-chunk stats
 
     Returns:
@@ -589,11 +597,12 @@ def compute_perplexity(
     # Check if TPU
     is_tpu = 'xla' in str(device)
     if is_tpu:
-        import torch_xla.core.xla_model as xm
+        import torch_xla
         print(f"  [TPU] First chunk will trigger XLA compilation (~1-5 min)...")
 
     # Calculate number of chunks
-    num_chunks = max(1, (seq_len - 1) // stride)
+    total_chunks = max(1, (seq_len - 1) // stride)
+    num_chunks = min(total_chunks, max_chunks) if max_chunks else total_chunks
 
     nlls = []
     total_tokens = 0
@@ -603,6 +612,10 @@ def compute_perplexity(
     chunk_num = 0
     for i in range(0, seq_len - 1, stride):
         chunk_num += 1
+
+        # Early exit for fast screening
+        if max_chunks is not None and chunk_num > max_chunks:
+            break
         begin = max(i + stride - max_length, 0)
         end = min(i + stride, seq_len)
 
@@ -638,11 +651,11 @@ def compute_perplexity(
             reduction='sum'
         )
 
-        # TPU: mark_step BEFORE .item() to flush graph, avoiding recompilation
+        # TPU: sync BEFORE .item() to flush graph, avoiding recompilation
         if is_tpu:
-            xm.mark_step()
+            torch_xla.sync()
 
-        # Now safe to call .item() after mark_step
+        # Now safe to call .item() after sync
         loss_val = loss.item()
         nlls.append(loss_val)
         total_tokens += trg_len
@@ -873,17 +886,32 @@ def load_checkpoint(
     expected_missing = [k for k in missing if '_scales_baked_flag' in k]
     real_missing = [k for k in missing if '_scales_baked_flag' not in k]
 
-    # Handle _Q buffers manually if in state_dict but not loaded
+    # Handle _Q and _indices buffers manually if in state_dict but not loaded
     q_loaded = 0
+    indices_loaded = 0
     for name, module in model.named_modules():
         if isinstance(module, AnemllQATLinearV2):
+            # Load _Q buffer
             q_key = f"{name}._Q"
             if q_key in state_dict and module._Q is None:
                 module.register_buffer('_Q', state_dict[q_key])
                 q_loaded += 1
 
-    if q_loaded > 0:
-        print(f"  Loaded {q_loaded} _Q buffers (manual)")
+            # Load _indices buffer
+            indices_key = f"{name}._indices"
+            if indices_key in state_dict and module._indices is None:
+                module.register_buffer('_indices', state_dict[indices_key])
+                indices_loaded += 1
+
+            # CRITICAL: Set _use_indices so forward() uses lut[_indices] instead of _Q
+            # Without this, changing .lut has NO effect on forward() output!
+            if module._indices is not None:
+                module._use_indices = True
+
+    if q_loaded > 0 or indices_loaded > 0:
+        print(f"  Loaded {q_loaded} _Q, {indices_loaded} _indices buffers (manual)")
+        if indices_loaded > 0:
+            print(f"  _use_indices=True for {indices_loaded} layers (forward uses lut[_indices])")
 
     # Handle LoRA if present in checkpoint and lora_r is set (auto-detected or explicit >0)
     # lora_r: None = config had no LoRA, 0 = user explicitly disabled, >0 = enabled
@@ -1010,6 +1038,8 @@ def main():
                         help='Sequence length for batched mode (default: 512)')
     parser.add_argument('--benchmark', action='store_true',
                         help='Run benchmark comparing different batch sizes (1,2,4,8,16)')
+    parser.add_argument('--max-chunks', type=int, default=None,
+                        help='Limit evaluation to first N chunks (for fast screening)')
     parser.add_argument('--list', action='store_true',
                         help='List all saved perplexity results from results/perplexity.json')
     parser.add_argument('--config', type=str, default=None,
@@ -1098,6 +1128,9 @@ def main():
         print(f"Context:    {args.max_length} tokens")
         print(f"Stride:     {args.stride} tokens")
 
+    if args.max_chunks:
+        print(f"Max chunks: {args.max_chunks} (fast screening)")
+
     # Load model
     print()
     if args.baseline:
@@ -1165,7 +1198,8 @@ def main():
 
     # Compute perplexity (batched or sliding window)
     if args.batch_size > 0:
-        print(f"\nComputing perplexity (batched, B={args.batch_size}, L={args.seq_len})...")
+        max_chunks_str = f", max_chunks={args.max_chunks}" if args.max_chunks else ""
+        print(f"\nComputing perplexity (batched, B={args.batch_size}, L={args.seq_len}{max_chunks_str})...")
         result = compute_perplexity_batched(
             model=model,
             input_ids=input_ids,
@@ -1173,10 +1207,12 @@ def main():
             dtype=dtype,
             batch_size=args.batch_size,
             seq_len=args.seq_len,
+            max_chunks=args.max_chunks,
             verbose=args.verbose,
         )
     else:
-        print("\nComputing perplexity (sliding window)...")
+        max_chunks_str = f", max_chunks={args.max_chunks}" if args.max_chunks else ""
+        print(f"\nComputing perplexity (sliding window{max_chunks_str})...")
         result = compute_perplexity(
             model=model,
             input_ids=input_ids,
@@ -1184,6 +1220,7 @@ def main():
             dtype=dtype,
             stride=args.stride,
             max_length=args.max_length,
+            max_chunks=args.max_chunks,
             verbose=args.verbose,
         )
 

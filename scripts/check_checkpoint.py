@@ -72,6 +72,80 @@ def _lut16_fp16_qc(lut: torch.Tensor) -> dict:
 
 
 @torch.no_grad()
+def check_q_indices_consistency(sd: dict, top_n: int = 5) -> dict:
+    """Check if _Q == lut[_indices] for all layers that have both.
+
+    This is a critical QC check. If _Q and lut[_indices] differ, utilities
+    that read _Q directly will see stale quantization values.
+
+    Returns:
+        Dict with 'consistent', 'mismatches' (list), 'max_diff', 'checked'
+    """
+    # Find all layers that have both _Q and _indices
+    q_keys = [k for k in sd.keys() if k.endswith('._Q')]
+    mismatches = []
+    checked = 0
+
+    for q_key in sorted(q_keys):
+        # Derive related keys
+        base = q_key[:-3]  # Remove '._Q'
+        indices_key = f"{base}._indices"
+        lut_key = f"{base}.lut"
+
+        if indices_key not in sd or lut_key not in sd:
+            continue
+
+        checked += 1
+        Q = sd[q_key].float()
+        indices = sd[indices_key].long()
+        lut = sd[lut_key].float()
+
+        # Compute what _Q should be
+        Q_expected = lut[indices]
+
+        # Check difference
+        diff = (Q - Q_expected).abs().max().item()
+        if diff > 1e-3:  # FP16-ish tolerance
+            mismatches.append({
+                'layer': base,
+                'max_diff': diff,
+                'mean_diff': (Q - Q_expected).abs().mean().item(),
+            })
+
+    result = {
+        'checked': checked,
+        'consistent': len(mismatches) == 0,
+        'mismatches': mismatches,
+        'max_diff': max((m['max_diff'] for m in mismatches), default=0),
+    }
+
+    if checked == 0:
+        return result
+
+    print()
+    print("=" * 60)
+    print("Q-INDICES CONSISTENCY CHECK")
+    print("=" * 60)
+    print(f"Layers with _Q + _indices + lut: {checked}")
+
+    if mismatches:
+        print(f"\n⚠️  {len(mismatches)} layers have _Q != lut[_indices]:")
+        print(f"   Max difference: {result['max_diff']:.6f}")
+        print()
+        for m in sorted(mismatches, key=lambda x: -x['max_diff'])[:top_n]:
+            print(f"  {m['layer']}: max_diff={m['max_diff']:.6f}, mean_diff={m['mean_diff']:.6f}")
+        if len(mismatches) > top_n:
+            print(f"  ... and {len(mismatches) - top_n} more")
+        print()
+        print("   This means utilities reading _Q will see STALE values!")
+        print("   Fix: Run sync_q_from_indices_all() or re-bake the checkpoint.")
+    else:
+        print(f"\n✅ All layers have _Q == lut[_indices] (within tolerance)")
+
+    return result
+
+
+@torch.no_grad()
 def summarize_lut_raw_deltas(sd: dict, top_n: int = 5) -> None:
     """Summarize _lut_raw_deltas tensors: count, rebuild, validate, diff vs stored."""
     raw_keys = [k for k in sd.keys() if k.endswith("._lut_raw_deltas")]
@@ -268,6 +342,9 @@ def check_checkpoint(checkpoint_path: str, top_n: int = 20, verbose: bool = Fals
     # LUT training stats (if any _lut_raw_deltas present)
     summarize_lut_raw_deltas(sd, top_n=top_n)
 
+    # Q-indices consistency check
+    q_consistency = check_q_indices_consistency(sd, top_n=top_n)
+
     # Diagnosis
     print(f"\n{'-'*60}")
     print("DIAGNOSIS")
@@ -306,6 +383,14 @@ def check_checkpoint(checkpoint_path: str, top_n: int = 20, verbose: bool = Fals
         print("   numerical instability at long context lengths.")
         print("\n   Consider constraining scales/magnitudes during training.")
         return 0
+
+    # Check Q-indices consistency
+    if q_consistency.get('checked', 0) > 0 and not q_consistency.get('consistent', True):
+        print(f"\n⚠️  WARNING: _Q and lut[_indices] are inconsistent!")
+        print(f"   {len(q_consistency['mismatches'])} layers have stale _Q values.")
+        print("   Utilities reading _Q directly will see outdated quantization.")
+        print("\n   Fix: Run sync_q_from_indices_all() or re-bake the checkpoint.")
+        return 0  # Not critical, but worth noting
 
     print("\n✅ Checkpoint looks healthy!")
     print("   If you still see NaN during evaluation, check:")
