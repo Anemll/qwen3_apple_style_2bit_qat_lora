@@ -10,6 +10,7 @@ Usage:
     python scripts/bake_lut.py source.pt dest.pt
     python scripts/bake_lut.py source.pt dest.pt --verbose
     python scripts/bake_lut.py source.pt --inplace  # Overwrites original
+    python scripts/bake_lut.py source.pt dest.pt -b runs/myrun  # Both in same folder
 """
 
 import argparse
@@ -236,6 +237,8 @@ def main():
     parser.add_argument('source', help='Input checkpoint with _lut_raw_deltas')
     parser.add_argument('dest', nargs='?', default=None,
                         help='Output checkpoint path (optional if --inplace)')
+    parser.add_argument('-b', '--base-dir', metavar='FOLDER',
+                        help='Base folder for both input and output files')
     parser.add_argument('--inplace', action='store_true',
                         help='Overwrite input checkpoint')
     parser.add_argument('--verbose', '-v', action='store_true',
@@ -243,18 +246,27 @@ def main():
 
     args = parser.parse_args()
 
-    if not Path(args.source).exists():
-        print(f"Error: Checkpoint not found: {args.source}")
+    # Apply base directory if specified
+    source = args.source
+    dest = args.dest
+    if args.base_dir:
+        base = Path(args.base_dir)
+        source = str(base / args.source)
+        if dest:
+            dest = str(base / dest)
+
+    if not Path(source).exists():
+        print(f"Error: Checkpoint not found: {source}")
         return 1
 
-    if not args.dest and not args.inplace:
+    if not dest and not args.inplace:
         print("Error: Must specify dest or --inplace")
         return 1
 
     try:
         stats = bake_lut_checkpoint(
-            args.source,
-            args.dest,
+            source,
+            dest,
             args.inplace,
             args.verbose,
         )

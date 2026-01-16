@@ -553,6 +553,8 @@ def parse_args():
     )
 
     parser.add_argument('checkpoint', help='Input V2 checkpoint path')
+    parser.add_argument('-b', '--base-dir', metavar='FOLDER',
+                        help='Base folder for checkpoint and output paths')
     parser.add_argument('--output-dir', '-o', required=True,
                         help='Output directory for checkpoint variants')
     parser.add_argument('--config', default=None,
@@ -574,7 +576,15 @@ def parse_args():
     parser.add_argument('--chunk-size', type=int, default=8192,
                         help='Chunk size for quantization (default: 8192)')
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Apply base directory if specified
+    if args.base_dir:
+        base = Path(args.base_dir)
+        args.checkpoint = str(base / args.checkpoint)
+        args.output_dir = str(base / args.output_dir)
+
+    return args
 
 
 def main():

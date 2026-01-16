@@ -383,6 +383,8 @@ def parse_args():
     )
 
     parser.add_argument('checkpoint', help='V2 checkpoint path (.pt file)')
+    parser.add_argument('-b', '--base-dir', metavar='FOLDER',
+                        help='Base folder for checkpoint and output paths')
     parser.add_argument('--config', default=None,
                         help='Config preset (q2a4, q4a4, etc.) or path to config.json')
     parser.add_argument('--scope', choices=['mlp', 'attn', 'all'], default='all',
@@ -396,7 +398,16 @@ def parse_args():
     parser.add_argument('--eps', type=float, default=1e-4,
                         help='Epsilon for safe division (default: 1e-4)')
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Apply base directory if specified
+    if args.base_dir:
+        base = Path(args.base_dir)
+        args.checkpoint = str(base / args.checkpoint)
+        if args.output:
+            args.output = str(base / args.output)
+
+    return args
 
 
 def main():

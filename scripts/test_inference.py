@@ -45,6 +45,8 @@ CONFIG_PRESETS = {
 def parse_args():
     parser = argparse.ArgumentParser(description='Test QAT model inference')
     parser.add_argument('checkpoint', type=str, help='Path to checkpoint .pt file or directory')
+    parser.add_argument('-b', '--base-dir', metavar='FOLDER',
+                        help='Base folder for checkpoint path')
     parser.add_argument('--model-id', type=str, default='Qwen/Qwen3-0.6B',
                         help='Base model ID (default: Qwen/Qwen3-0.6B)')
     parser.add_argument('--prompt', type=str, default=None,
@@ -578,6 +580,10 @@ def run_interactive(model, tokenizer, device, args):
 
 def main():
     args = parse_args()
+
+    # Apply base directory if specified
+    if args.base_dir:
+        args.checkpoint = str(Path(args.base_dir) / args.checkpoint)
 
     # Check checkpoint exists
     checkpoint_path = Path(args.checkpoint)

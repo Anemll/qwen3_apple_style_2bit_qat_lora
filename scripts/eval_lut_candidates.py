@@ -127,6 +127,8 @@ def parse_args():
     )
 
     parser.add_argument('candidates_dir', help='Directory containing candidate checkpoints')
+    parser.add_argument('-b', '--base-dir', metavar='FOLDER',
+                        help='Base folder for candidates_dir and output paths')
     parser.add_argument('--max-chunks', type=int, default=20,
                         help='Chunks for fast PPL screening (default: 20)')
     parser.add_argument('--full-ppl', action='store_true',
@@ -148,7 +150,16 @@ def parse_args():
     parser.add_argument('--output', '-o', default=None,
                         help='Output results JSON path')
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Apply base directory if specified
+    if args.base_dir:
+        base = Path(args.base_dir)
+        args.candidates_dir = str(base / args.candidates_dir)
+        if args.output:
+            args.output = str(base / args.output)
+
+    return args
 
 
 def main():

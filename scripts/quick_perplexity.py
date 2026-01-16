@@ -560,8 +560,14 @@ def main():
                         help='Print per-chunk stats')
     parser.add_argument('--compare', action='store_true',
                         help='Also run full PPL from measure_perplexity.py')
+    parser.add_argument('-b', '--base-dir', metavar='FOLDER',
+                        help='Base folder for checkpoint path')
 
     args = parser.parse_args()
+
+    # Apply base directory if specified
+    if args.base_dir and args.checkpoint:
+        args.checkpoint = str(Path(args.base_dir) / args.checkpoint)
 
     # Validate args
     if not args.baseline and not args.hf and args.checkpoint is None:

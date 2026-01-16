@@ -178,6 +178,8 @@ def main():
         epilog=__doc__
     )
     parser.add_argument('checkpoint', help='Input checkpoint file')
+    parser.add_argument('-b', '--base-dir', metavar='FOLDER',
+                        help='Base folder for checkpoint and output paths')
     parser.add_argument('-o', '--output', default=None,
                         help='Output checkpoint path')
     parser.add_argument('--inplace', action='store_true',
@@ -186,6 +188,13 @@ def main():
                         help='Show per-layer details')
 
     args = parser.parse_args()
+
+    # Apply base directory if specified
+    if args.base_dir:
+        base = Path(args.base_dir)
+        args.checkpoint = str(base / args.checkpoint)
+        if args.output:
+            args.output = str(base / args.output)
 
     if not Path(args.checkpoint).exists():
         print(f"Error: Checkpoint not found: {args.checkpoint}")

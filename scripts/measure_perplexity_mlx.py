@@ -516,12 +516,18 @@ def main():
                         help="List all saved perplexity results")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Verbose output")
+    parser.add_argument("-b", "--base-dir", metavar="FOLDER",
+                        help="Base folder for model path")
 
     args = parser.parse_args()
 
     # Handle --list
     if args.list:
         return print_all_results()
+
+    # Apply base directory if specified
+    if args.base_dir and args.model:
+        args.model = str(Path(args.base_dir) / args.model)
 
     # Require model for measurement
     if args.model is None:

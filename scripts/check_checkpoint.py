@@ -405,12 +405,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('checkpoint', help='Path to checkpoint file (.pt)')
+    parser.add_argument('-b', '--base-dir', metavar='FOLDER',
+                        help='Base folder for checkpoint path')
     parser.add_argument('--top', type=int, default=20,
                         help='Show top N magnitudes (default: 20)')
     parser.add_argument('--verbose', action='store_true',
                         help='Show all tensors, not just suspects')
 
     args = parser.parse_args()
+
+    # Apply base directory if specified
+    if args.base_dir:
+        args.checkpoint = str(Path(args.base_dir) / args.checkpoint)
 
     if not Path(args.checkpoint).exists():
         print(f"Error: Checkpoint not found: {args.checkpoint}")

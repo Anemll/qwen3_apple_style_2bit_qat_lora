@@ -1045,12 +1045,18 @@ def main():
     parser.add_argument('--config', type=str, default=None,
                         help='Quantization config preset (q4_r32, q2a4, q4a4, q2a2) or path to config.json. '
                              'Default: auto-detect from checkpoint directory.')
+    parser.add_argument('-b', '--base-dir', metavar='FOLDER',
+                        help='Base folder for checkpoint path')
 
     args = parser.parse_args()
 
     # Handle --list early (doesn't need checkpoint)
     if args.list:
         return print_all_results()
+
+    # Apply base directory if specified
+    if args.base_dir and args.checkpoint:
+        args.checkpoint = str(Path(args.base_dir) / args.checkpoint)
 
     # XLA persistent compilation cache (speeds up TPU restarts)
     if args.xla_cache_dir:
