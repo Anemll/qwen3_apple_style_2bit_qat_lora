@@ -370,6 +370,12 @@ def main():
         print("\nError: run_name or -b/--base-dir is required")
         return 1
 
+    # Strip runs/ prefix if present (like gdrive_sync.py)
+    if run_name.startswith("runs/"):
+        run_name = run_name[5:]
+    if run_name.startswith("runs\\"):
+        run_name = run_name[5:]
+
     # Setup paths
     local_dir = Path(args.local_root) / run_name
     local_dir.mkdir(parents=True, exist_ok=True)
