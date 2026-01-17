@@ -22,10 +22,17 @@ Usage:
 
     # With specific device
     python scripts/eval_lut_candidates.py ./lut_candidates/ --device mps --dtype fp16
+
+    # TPU mode (uses XLA cache to avoid recompilation between candidates)
+    python scripts/eval_lut_candidates.py ./lut_candidates/ --tpu --dtype bf16 --batch-size 8
+
+    # TPU with custom XLA cache directory
+    python scripts/eval_lut_candidates.py ./lut_candidates/ --tpu --xla-cache-dir /tmp/my_cache
 """
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -69,14 +76,18 @@ def run_perplexity(
     dtype: str = 'auto',
     batch_size: int = 0,
     seq_len: int = 512,
+    use_tpu: bool = False,
+    xla_cache_dir: Optional[str] = None,
 ) -> Dict:
     """Run measure_perplexity.py and parse results."""
+    # Build command
+    actual_device = 'tpu' if use_tpu else device
     cmd = [
         sys.executable,
         str(REPO_DIR / 'scripts' / 'measure_perplexity.py'),
         checkpoint_path,
         '--model', model_id,
-        '--device', device,
+        '--device', actual_device,
         '--dtype', dtype,
     ]
 
@@ -90,8 +101,17 @@ def run_perplexity(
         cmd.extend(['--batch-size', str(batch_size)])
         cmd.extend(['--seq-len', str(seq_len)])
 
+    # TPU: Use XLA cache to avoid recompilation between candidates
+    if xla_cache_dir:
+        cmd.extend(['--xla-cache-dir', xla_cache_dir])
+
+    # Build environment with TPU settings if needed
+    env = os.environ.copy()
+    if use_tpu:
+        env['PJRT_DEVICE'] = 'TPU'
+
     # Run and capture output
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
 
     # Parse perplexity from output
     ppl = None
@@ -147,10 +167,19 @@ def parse_args():
                         help='Batch size for PPL (0=sliding window)')
     parser.add_argument('--seq-len', type=int, default=512,
                         help='Sequence length for batched mode')
+    parser.add_argument('--tpu', action='store_true',
+                        help='Use TPU device (sets PJRT_DEVICE=TPU)')
+    parser.add_argument('--xla-cache-dir', type=str, default=None,
+                        help='XLA persistent cache dir (avoids recompilation between candidates)')
     parser.add_argument('--output', '-o', default=None,
                         help='Output results JSON path')
 
     args = parser.parse_args()
+
+    # TPU auto-setup: create default XLA cache if --tpu and no cache dir specified
+    if args.tpu and not args.xla_cache_dir:
+        args.xla_cache_dir = '/tmp/xla_cache_eval_lut'
+        print(f"[TPU] Using default XLA cache: {args.xla_cache_dir}")
 
     # Apply base directory if specified
     if args.base_dir:
@@ -172,6 +201,8 @@ def main():
     print(f"Max chunks:     {args.max_chunks}")
     print(f"Full PPL:       {args.full_ppl}")
     print(f"Top K:          {args.top_k}")
+    if args.tpu:
+        print(f"TPU mode:       ON (XLA cache: {args.xla_cache_dir})")
     print()
 
     candidates_dir = Path(args.candidates_dir)
@@ -230,6 +261,8 @@ def main():
             dtype=args.dtype,
             batch_size=args.batch_size,
             seq_len=args.seq_len,
+            use_tpu=args.tpu,
+            xla_cache_dir=args.xla_cache_dir,
         )
 
         if ppl_result['perplexity'] is not None:
@@ -277,6 +310,8 @@ def main():
                 dtype=args.dtype,
                 batch_size=args.batch_size,
                 seq_len=args.seq_len,
+                use_tpu=args.tpu,
+                xla_cache_dir=args.xla_cache_dir,
             )
 
             if ppl_result['perplexity'] is not None:
