@@ -6,6 +6,7 @@ Features:
 - Idempotent: uses ppl_state.json to skip already-processed steps
 - Prefetch: downloads next checkpoint while baking/evaluating current
 - Atomic state updates: safe to interrupt and resume
+- --best: process best_state_dict.pt with md5-based deduplication
 
 Usage:
     # Basic - process all checkpoints in a run
@@ -29,14 +30,19 @@ Usage:
     # View summary only
     python scripts/pipeline_bake_ppl.py srLUT-004b --summary
 
+    # Process best_state_dict.pt (force download, md5 dedup)
+    python scripts/pipeline_bake_ppl.py srLUT-004b --best --config q4_r32 --device tpu
+
     # macOS (auto-detects Google Drive location)
     python scripts/pipeline_bake_ppl.py srLUT-004b
 
 State file: runs/<run-name>/ppl_state.json
 Baked files: runs/<run-name>/baked_step{N}.pt
+Best baked files: runs/<run-name>/baked_best_{md5_short}.pt
 """
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -309,6 +315,177 @@ def get_baked_name(step: int) -> str:
     return f"baked_step{step}.pt"
 
 
+def compute_md5(file_path: Path, chunk_size: int = 8192) -> str:
+    """Compute MD5 hash of a file."""
+    md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(chunk_size):
+            md5.update(chunk)
+    return md5.hexdigest()
+
+
+def force_download_best(run_name: str, local_dir: Path, timeout: int = 600) -> Optional[Path]:
+    """Force re-download best_state_dict.pt from Google Drive."""
+    best_name = "best_state_dict.pt"
+    local_best = local_dir / best_name
+
+    # Remove existing file to force fresh download
+    if local_best.exists():
+        local_best.unlink()
+        print(f"  [download] Removed existing {best_name}")
+
+    print(f"  [download] Downloading {best_name}...")
+    cmd = [
+        sys.executable, str(REPO_ROOT / "scripts" / "gdrive_sync.py"),
+        "down", run_name, "--only", best_name
+    ]
+
+    try:
+        result = subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"  [error] Download failed: {result.stderr[-500:] if result.stderr else 'unknown'}")
+            return None
+    except subprocess.TimeoutExpired:
+        print(f"  [error] Download timed out")
+        return None
+
+    if not local_best.exists():
+        print(f"  [error] Download claimed success but file missing")
+        return None
+
+    print(f"  [download] Done: {local_best.stat().st_size / 1e6:.1f} MB")
+    return local_best
+
+
+def process_best_checkpoint(
+    run_name: str,
+    local_dir: Path,
+    state: dict,
+    state_path: Path,
+    config: str,
+    dtype: str,
+    device: str,
+    max_chunks: Optional[int] = None,
+    local_only: bool = False,
+) -> bool:
+    """Process best_state_dict.pt with md5-based deduplication.
+
+    Returns True if processed successfully, False otherwise.
+    """
+    print("\n" + "=" * 70)
+    print("PROCESSING: best_state_dict.pt")
+    print("=" * 70)
+
+    best_name = "best_state_dict.pt"
+    local_best = local_dir / best_name
+
+    # 1) Download (force re-download unless local-only)
+    if not local_only:
+        local_best = force_download_best(run_name, local_dir)
+        if local_best is None:
+            print("  [error] Failed to download best_state_dict.pt")
+            return False
+    else:
+        if not local_best.exists():
+            print(f"  [error] {best_name} not found locally")
+            return False
+        print(f"  [local] Using existing {best_name} ({local_best.stat().st_size / 1e6:.1f} MB)")
+
+    # 2) Compute MD5
+    print("  [md5] Computing hash...")
+    md5_full = compute_md5(local_best)
+    md5_short = md5_full[-5:]  # Last 5 characters
+    print(f"  [md5] {md5_full} (short: {md5_short})")
+
+    # 3) Check if this MD5 already processed
+    best_entries = state.setdefault("best_entries", {})
+    if md5_short in best_entries:
+        entry = best_entries[md5_short]
+        if entry.get("ppl_ok"):
+            ppl = entry.get("ppl", "?")
+            baked_name = entry.get("baked_name", "?")
+            print(f"  [skip] MD5 {md5_short} already processed: PPL={ppl}, baked={baked_name}")
+            return True
+
+    # 4) Bake
+    baked_tmp = local_dir / "baked_best.pt"
+    baked_final = local_dir / f"baked_best_{md5_short}.pt"
+
+    print(f"  [bake] {best_name} → baked_best_{md5_short}.pt...")
+    cmd = [
+        sys.executable, str(REPO_ROOT / "scripts" / "bake_lut.py"),
+        str(local_best), str(baked_tmp)
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  [error] Bake failed:\n{result.stderr[-1000:] if result.stderr else 'unknown'}")
+        return False
+
+    if not baked_tmp.exists():
+        print(f"  [error] Bake failed to create output")
+        return False
+
+    # Rename to include md5 suffix
+    if baked_final.exists():
+        baked_final.unlink()
+    baked_tmp.rename(baked_final)
+    print(f"  [bake] Done: {baked_final.name} ({baked_final.stat().st_size / 1e6:.1f} MB)")
+
+    # Update state after bake
+    best_entries[md5_short] = {
+        "md5_full": md5_full,
+        "md5_short": md5_short,
+        "source": best_name,
+        "baked_name": baked_final.name,
+        "baked_path": str(baked_final),
+        "bake_ok": True,
+        "bake_time": datetime.now().isoformat(),
+    }
+    atomic_write_json(state_path, state)
+
+    # 5) Wait for device and run perplexity
+    wait_for_device(device)
+
+    print(f"  [ppl] Running perplexity on {baked_final.name}...")
+    try:
+        ppl, xe, tokens, elapsed, _ = run_ppl(
+            baked_final, config, dtype, device, max_chunks
+        )
+    except Exception as e:
+        print(f"  [error] Perplexity failed: {e}")
+        return False
+
+    # Update state after PPL
+    best_entries[md5_short].update({
+        "ppl_ok": True,
+        "ppl": ppl,
+        "xe": xe,
+        "tokens": tokens,
+        "ppl_seconds": round(elapsed, 1),
+        "ppl_time": datetime.now().isoformat(),
+    })
+    atomic_write_json(state_path, state)
+
+    print(f"  [done] PPL={ppl:.2f}, XE={xe:.4f}, time={elapsed:.1f}s")
+    print(f"  [done] Saved as: {baked_final.name}")
+
+    # 6) Print summary of all best entries
+    print("\n" + "-" * 50)
+    print("BEST CHECKPOINTS SUMMARY")
+    print("-" * 50)
+    print(f"{'MD5':>8} | {'PPL':>10} | {'Baked File'}")
+    print("-" * 50)
+    for md5_key, entry in sorted(best_entries.items(), key=lambda x: x[1].get("ppl", 999)):
+        ppl_val = entry.get("ppl")
+        ppl_str = f"{ppl_val:.2f}" if ppl_val else "-"
+        baked = entry.get("baked_name", "-")
+        print(f"{md5_key:>8} | {ppl_str:>10} | {baked}")
+    print("-" * 50)
+
+    return True
+
+
 def ensure_download(run_name: str, local_dir: Path, step: int, timeout: int = 600) -> Path:
     """Download checkpoint if not present (blocking)."""
     ckpt_name = get_checkpoint_name(step)
@@ -536,6 +713,8 @@ def main():
                         help="Print summary from state file and exit")
     parser.add_argument("--clean-checkpoints", action="store_true",
                         help="Delete raw checkpoints after successful bake+ppl")
+    parser.add_argument("--best", action="store_true",
+                        help="Process best_state_dict.pt (force download, md5 dedup, bake, ppl)")
 
     args = parser.parse_args()
 
@@ -574,6 +753,26 @@ def main():
     if args.summary:
         print_summary(state)
         return 0
+
+    # Handle --best: process best_state_dict.pt and exit
+    if args.best:
+        success = process_best_checkpoint(
+            run_name=run_name,
+            local_dir=local_dir,
+            state=state,
+            state_path=state_path,
+            config=args.config,
+            dtype=args.dtype,
+            device=args.device,
+            max_chunks=args.max_chunks,
+            local_only=args.local_only,
+        )
+        # Sync state to Google Drive
+        if not args.local_only:
+            print("\n[sync] Syncing ppl_state.json to Google Drive...")
+            if sync_state_to_gdrive(run_name):
+                print("[sync] Done")
+        return 0 if success else 1
 
     # Determine drive root
     if args.drive_root:
