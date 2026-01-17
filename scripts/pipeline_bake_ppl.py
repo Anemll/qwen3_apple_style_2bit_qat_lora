@@ -236,41 +236,46 @@ def run_ppl(
     print(f"  [ppl] Running perplexity on {baked_path.name}...")
     start = time.time()
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Combine stdout and stderr, and stream output to console
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # Combine stderr into stdout
+        text=True,
+    )
     elapsed = time.time() - start
-
-    if result.returncode != 0:
-        print(f"  [error] Perplexity failed:\n{result.stderr[-1000:]}")
-        raise RuntimeError(f"Perplexity failed for {baked_path}")
 
     out = result.stdout
 
-    # Parse from stdout
+    # Print output for visibility (in case of issues)
+    print(out)
+
+    if result.returncode != 0:
+        print(f"  [error] Perplexity failed (rc={result.returncode})")
+        raise RuntimeError(f"Perplexity failed for {baked_path}")
+
+    # Parse results using regex for robustness
     ppl = None
     xe = None
     tokens = None
 
-    for line in out.splitlines():
-        line = line.strip()
-        if line.startswith("Perplexity:"):
-            try:
-                ppl = float(line.split()[-1])
-            except (ValueError, IndexError):
-                pass
-        elif line.startswith("Cross-entropy:"):
-            try:
-                xe = float(line.split()[1])
-            except (ValueError, IndexError):
-                pass
-        elif line.startswith("Tokens:"):
-            try:
-                tokens = int(line.split()[1].replace(",", ""))
-            except (ValueError, IndexError):
-                pass
+    # Match "Perplexity:" followed by whitespace and a number
+    ppl_match = re.search(r'Perplexity:\s+([\d.]+)', out)
+    if ppl_match:
+        ppl = float(ppl_match.group(1))
+
+    # Match "Cross-entropy:" followed by whitespace and a number
+    xe_match = re.search(r'Cross-entropy:\s+([\d.]+)', out)
+    if xe_match:
+        xe = float(xe_match.group(1))
+
+    # Match "Tokens:" followed by whitespace and a number (with optional commas)
+    tokens_match = re.search(r'Tokens:\s+([\d,]+)', out)
+    if tokens_match:
+        tokens = int(tokens_match.group(1).replace(",", ""))
 
     if ppl is None:
         print(f"  [warn] Could not parse perplexity from output")
-        print(out[-2000:])
         raise RuntimeError("Could not parse perplexity from output")
 
     return ppl, xe or 0.0, tokens or 0, elapsed, out

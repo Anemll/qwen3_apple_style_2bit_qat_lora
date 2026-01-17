@@ -285,7 +285,7 @@ def get_dir_size(path: str) -> str:
     return f"{total:.1f} TB"
 
 
-def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cache: bool = False, exclude: list = None, only: list = None):
+def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cache: bool = False, exclude: list = None, only: list = None, size_only: bool = False):
     """
     Sync local run/cache to Google Drive.
 
@@ -296,6 +296,7 @@ def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cac
         is_cache: If True, sync as cache (recursive); if False, sync as run (flat)
         exclude: List of glob patterns to exclude (e.g., ['checkpoint_step*', '*.tmp'])
         only: List of glob patterns to include (e.g., ['*1200*', 'best*']). If set, only matching files are synced.
+        size_only: If True, only compare by file size (ignore mtime). Useful for write-once files like checkpoints.
     """
     if not ensure_drive_mounted(is_cache):
         return False
@@ -391,19 +392,32 @@ def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cac
         gdrive_file = os.path.join(gdrive_path, rel_path)
 
         if rel_path not in gdrive_files:
-            to_copy.append((rel_path, "new"))
-        elif os.path.getmtime(local_file) > os.path.getmtime(gdrive_file):
-            to_copy.append((rel_path, "modified"))
+            to_copy.append((rel_path, "new", None))
+        else:
+            local_mtime = os.path.getmtime(local_file)
+            gdrive_mtime = os.path.getmtime(gdrive_files[rel_path])
+            local_size = os.path.getsize(local_file)
+            gdrive_size = os.path.getsize(gdrive_files[rel_path])
+
+            # Determine reason for modification
+            if local_size != gdrive_size:
+                reason = f"size: {gdrive_size/1e6:.1f}MB → {local_size/1e6:.1f}MB"
+                to_copy.append((rel_path, "modified", reason))
+            elif not size_only and local_mtime > gdrive_mtime:
+                time_diff = local_mtime - gdrive_mtime
+                reason = f"mtime: +{time_diff:.0f}s newer"
+                to_copy.append((rel_path, "modified", reason))
 
     if not to_copy:
         print("\nNo files to sync (Drive is up to date)")
         return True
 
     print(f"\nFiles to sync: {len(to_copy)}")
-    for f, status in to_copy:
+    for f, status, reason in to_copy:
         size = os.path.getsize(local_files[f])
         size_str = f"{size / 1024 / 1024:.1f} MB" if size > 1024*1024 else f"{size / 1024:.1f} KB"
-        print(f"  [{status:8}] {f:<50} {size_str}")
+        reason_str = f" ({reason})" if reason else ""
+        print(f"  [{status:8}] {f:<50} {size_str}{reason_str}")
 
     if dry_run:
         print("\n[DRY RUN] No files copied")
@@ -414,7 +428,7 @@ def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cac
 
     # Copy files
     print("\nCopying...")
-    for rel_path, status in to_copy:
+    for rel_path, status, reason in to_copy:
         src = local_files[rel_path]
         dst = os.path.join(gdrive_path, rel_path)
         # Create subdirectories if needed (for caches)
@@ -427,7 +441,7 @@ def sync_up(local_path: str, run_name: str = None, dry_run: bool = False, is_cac
     return True
 
 
-def sync_down(run_name: str, local_path: str = None, dry_run: bool = False, is_cache: bool = False, only: list = None, exclude: list = None):
+def sync_down(run_name: str, local_path: str = None, dry_run: bool = False, is_cache: bool = False, only: list = None, exclude: list = None, size_only: bool = False):
     """
     Sync run/cache from Google Drive to local.
 
@@ -438,6 +452,7 @@ def sync_down(run_name: str, local_path: str = None, dry_run: bool = False, is_c
         is_cache: If True, sync as cache (recursive); if False, sync as run (flat)
         only: List of glob patterns to include (e.g., ['*1200*', 'best*']). If set, only matching files are synced.
         exclude: List of glob patterns to exclude (e.g., ['checkpoint_step*', '*.tmp'])
+        size_only: If True, only compare by file size (ignore mtime). Useful for write-once files like checkpoints.
     """
     if not ensure_drive_mounted(is_cache):
         return False
@@ -532,19 +547,32 @@ def sync_down(run_name: str, local_path: str = None, dry_run: bool = False, is_c
         local_file = os.path.join(local_path, rel_path)
 
         if rel_path not in local_files:
-            to_copy.append((rel_path, "new"))
-        elif os.path.getmtime(gdrive_file) > os.path.getmtime(local_file):
-            to_copy.append((rel_path, "modified"))
+            to_copy.append((rel_path, "new", None))
+        else:
+            gdrive_mtime = os.path.getmtime(gdrive_file)
+            local_mtime = os.path.getmtime(local_files[rel_path])
+            gdrive_size = os.path.getsize(gdrive_file)
+            local_size = os.path.getsize(local_files[rel_path])
+
+            # Determine reason for modification
+            if gdrive_size != local_size:
+                reason = f"size: {local_size/1e6:.1f}MB → {gdrive_size/1e6:.1f}MB"
+                to_copy.append((rel_path, "modified", reason))
+            elif not size_only and gdrive_mtime > local_mtime:
+                time_diff = gdrive_mtime - local_mtime
+                reason = f"mtime: +{time_diff:.0f}s newer"
+                to_copy.append((rel_path, "modified", reason))
 
     if not to_copy:
         print("\nNo files to sync (Local is up to date)")
         return True
 
     print(f"\nFiles to sync: {len(to_copy)}")
-    for rel_path, status in to_copy:
+    for rel_path, status, reason in to_copy:
         size = os.path.getsize(gdrive_files[rel_path])
         size_str = f"{size / 1024 / 1024:.1f} MB" if size > 1024*1024 else f"{size / 1024:.1f} KB"
-        print(f"  [{status:8}] {rel_path:<50} {size_str}")
+        reason_str = f" ({reason})" if reason else ""
+        print(f"  [{status:8}] {rel_path:<50} {size_str}{reason_str}")
 
     if dry_run:
         print("\n[DRY RUN] No files copied")
@@ -555,7 +583,7 @@ def sync_down(run_name: str, local_path: str = None, dry_run: bool = False, is_c
 
     # Copy files
     print("\nCopying...")
-    for rel_path, status in to_copy:
+    for rel_path, status, reason in to_copy:
         src = gdrive_files[rel_path]
         dst = os.path.join(local_path, rel_path)
         # Create subdirectories if needed (for caches)
@@ -820,6 +848,8 @@ Environment:
                           help='Glob pattern to exclude (can be used multiple times, e.g., --exclude "checkpoint_step*")')
     up_parser.add_argument('--only', action='append', default=[],
                           help='Only sync files matching pattern (can be used multiple times, e.g., --only "*1200*")')
+    up_parser.add_argument('--size-only', action='store_true',
+                          help='Compare by size only (skip mtime check). Useful for checkpoints that are write-once.')
 
     # down (sync drive -> local)
     down_parser = subparsers.add_parser('down', help='Sync run/cache from Google Drive to local')
@@ -832,6 +862,8 @@ Environment:
                           help='Only sync files matching pattern (can be used multiple times, e.g., --only "*1200*")')
     down_parser.add_argument('--exclude', action='append', default=[],
                           help='Glob pattern to exclude (can be used multiple times, e.g., --exclude "checkpoint_step*")')
+    down_parser.add_argument('--size-only', action='store_true',
+                          help='Compare by size only (skip mtime check). Useful for checkpoints that are write-once.')
 
     # status
     status_parser = subparsers.add_parser('status', help='Show sync status')
@@ -850,7 +882,7 @@ Environment:
         # Auto-detect cache from path prefix (cache/, caches/)
         _, _, detected_cache = parse_path_with_type(args.local_path)
         is_cache = args.cache or detected_cache
-        sync_up(args.local_path, args.name, args.dry_run, is_cache, args.exclude, args.only)
+        sync_up(args.local_path, args.name, args.dry_run, is_cache, args.exclude, args.only, args.size_only)
     elif args.command == 'down':
         # Parse flexible path format with auto-detection of cache vs run
         # Supports: "SR-011_name", "runs/SR-011_name", "cache/alpaca_L128", "caches/alpaca_L128/shard_*.pt"
@@ -860,7 +892,7 @@ Environment:
         only_patterns = list(args.only)  # Copy to avoid modifying original
         if path_pattern:
             only_patterns.append(path_pattern)
-        sync_down(name, args.local, args.dry_run, is_cache, only_patterns if only_patterns else None, args.exclude if args.exclude else None)
+        sync_down(name, args.local, args.dry_run, is_cache, only_patterns if only_patterns else None, args.exclude if args.exclude else None, args.size_only)
     elif args.command == 'status':
         # Auto-detect cache from path prefix
         _, _, detected_cache = parse_path_with_type(args.local_path)
