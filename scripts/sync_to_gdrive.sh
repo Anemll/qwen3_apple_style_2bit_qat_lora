@@ -21,7 +21,7 @@
 #   !echo "Sync started, PID: $(pgrep -f sync_to_gdrive)"
 # ==============================================================================
 
-set -e
+# Don't use set -e, handle errors gracefully
 
 # Arguments
 LOCAL_DIR="${1:?Usage: $0 LOCAL_DIR GDRIVE_DIR [INTERVAL_SECONDS]}"
@@ -55,73 +55,39 @@ sync_files() {
     local count=0
     local errors=0
 
-    # Find all .pt files modified in the last INTERVAL*2 seconds (with some buffer)
-    # Or files that haven't been synced yet
-    while IFS= read -r -d '' file; do
-        if [[ -f "$file" ]]; then
-            filename=$(basename "$file")
-            rel_path="${file#$LOCAL_DIR/}"
-            dest_dir="$GDRIVE_DIR/$(dirname "$rel_path")"
-            dest_file="$GDRIVE_DIR/$rel_path"
+    # Sync .pt and .json files using rsync if available, otherwise cp
+    for ext in "*.pt" "*.json"; do
+        while IFS= read -r -d '' file; do
+            if [[ -f "$file" ]]; then
+                rel_path="${file#$LOCAL_DIR/}"
+                dest_dir="$GDRIVE_DIR/$(dirname "$rel_path")"
+                dest_file="$GDRIVE_DIR/$rel_path"
 
-            # Get file modification time
-            local_mtime=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null)
-
-            # Check if we need to sync (file is new or modified)
-            need_sync=0
-            if [[ ! -f "$dest_file" ]]; then
-                need_sync=1
-            else
-                dest_mtime=$(stat -c %Y "$dest_file" 2>/dev/null || stat -f %m "$dest_file" 2>/dev/null)
-                if [[ "$local_mtime" -gt "$dest_mtime" ]]; then
+                # Check if we need to sync (file is new or modified)
+                need_sync=0
+                if [[ ! -f "$dest_file" ]]; then
                     need_sync=1
-                fi
-            fi
-
-            if [[ "$need_sync" -eq 1 ]]; then
-                mkdir -p "$dest_dir"
-                if cp "$file" "$dest_file" 2>/dev/null; then
-                    echo -e "${GREEN}[SYNC]${NC} $rel_path ($(du -h "$file" | cut -f1))"
-                    ((count++))
                 else
-                    echo -e "${RED}[ERROR]${NC} Failed to copy $rel_path"
-                    ((errors++))
+                    # Compare using test -nt (newer than)
+                    if [[ "$file" -nt "$dest_file" ]]; then
+                        need_sync=1
+                    fi
+                fi
+
+                if [[ "$need_sync" -eq 1 ]]; then
+                    mkdir -p "$dest_dir" 2>/dev/null || true
+                    if cp "$file" "$dest_file" 2>/dev/null; then
+                        size=$(du -h "$file" 2>/dev/null | cut -f1 || echo "?")
+                        echo -e "${GREEN}[SYNC]${NC} $rel_path ($size)"
+                        count=$((count + 1))
+                    else
+                        echo -e "${RED}[ERROR]${NC} Failed to copy $rel_path"
+                        errors=$((errors + 1))
+                    fi
                 fi
             fi
-        fi
-    done < <(find "$LOCAL_DIR" -name "*.pt" -print0 2>/dev/null)
-
-    # Also sync JSON files (candidates_summary.json, eval_results.json, etc.)
-    while IFS= read -r -d '' file; do
-        if [[ -f "$file" ]]; then
-            rel_path="${file#$LOCAL_DIR/}"
-            dest_dir="$GDRIVE_DIR/$(dirname "$rel_path")"
-            dest_file="$GDRIVE_DIR/$rel_path"
-
-            local_mtime=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null)
-
-            need_sync=0
-            if [[ ! -f "$dest_file" ]]; then
-                need_sync=1
-            else
-                dest_mtime=$(stat -c %Y "$dest_file" 2>/dev/null || stat -f %m "$dest_file" 2>/dev/null)
-                if [[ "$local_mtime" -gt "$dest_mtime" ]]; then
-                    need_sync=1
-                fi
-            fi
-
-            if [[ "$need_sync" -eq 1 ]]; then
-                mkdir -p "$dest_dir"
-                if cp "$file" "$dest_file" 2>/dev/null; then
-                    echo -e "${GREEN}[SYNC]${NC} $rel_path"
-                    ((count++))
-                else
-                    echo -e "${RED}[ERROR]${NC} Failed to copy $rel_path"
-                    ((errors++))
-                fi
-            fi
-        fi
-    done < <(find "$LOCAL_DIR" -name "*.json" -print0 2>/dev/null)
+        done < <(find "$LOCAL_DIR" -name "$ext" -print0 2>/dev/null)
+    done
 
     if [[ "$count" -gt 0 ]]; then
         echo -e "${GREEN}[$(date '+%H:%M:%S')]${NC} Synced $count files"
