@@ -98,6 +98,36 @@ def is_done(state: dict, step: int) -> bool:
 
 def is_baked(state: dict, step: int) -> bool:
     """Check if step is already baked."""
+
+
+def load_ppl_cache() -> dict:
+    """Load the perplexity results cache from results/perplexity.json."""
+    cache_path = REPO_ROOT / "results" / "perplexity.json"
+    if cache_path.exists():
+        try:
+            return json.loads(cache_path.read_text())
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def get_cached_ppl(run_name: str, step: int, ppl_cache: dict) -> Optional[dict]:
+    """Check if perplexity result exists in cache. Returns dict with ppl, xe, tokens or None."""
+    # Key format: run_name/baked_step{N}.pt
+    key = f"{run_name}/baked_step{step}.pt"
+    if key in ppl_cache:
+        entry = ppl_cache[key]
+        if "perplexity" in entry:
+            return {
+                "ppl": entry["perplexity"],
+                "xe": entry.get("cross_entropy", 0.0),
+                "tokens": entry.get("tokens", 0),
+            }
+    return None
+
+
+def is_baked(state: dict, step: int) -> bool:
+    """Check if step is already baked (legacy, kept for compatibility)."""
     e = state["entries"].get(str(step))
     return bool(e and e.get("bake_ok"))
 
@@ -443,10 +473,16 @@ def main():
     print(f"Steps to process: {steps[:10]}{'...' if len(steps) > 10 else ''}")
     print()
 
+    # Load perplexity cache (results/perplexity.json)
+    ppl_cache = load_ppl_cache()
+    if ppl_cache:
+        print(f"[cache] Loaded {len(ppl_cache)} entries from results/perplexity.json")
+
     # Pipeline loop
     prefetch_proc = None
     processed = 0
     skipped = 0
+    cached = 0
 
     for i, step in enumerate(steps):
         print(f"\n[{i+1}/{len(steps)}] Step {step}")
@@ -493,10 +529,20 @@ def main():
             })
             atomic_write_json(state_path, state)
 
-            # 4) Perplexity
-            ppl, xe, tokens, elapsed, _ = run_ppl(
-                baked_path, args.config, args.dtype, args.device, args.max_chunks
-            )
+            # 4) Perplexity - check cache first
+            cached_result = get_cached_ppl(run_name, step, ppl_cache)
+            if cached_result:
+                ppl = cached_result["ppl"]
+                xe = cached_result["xe"]
+                tokens = cached_result["tokens"]
+                elapsed = 0.0
+                print(f"  [cache] Found in results/perplexity.json: PPL={ppl:.2f}")
+                cached += 1
+            else:
+                ppl, xe, tokens, elapsed, _ = run_ppl(
+                    baked_path, args.config, args.dtype, args.device, args.max_chunks
+                )
+                processed += 1
 
             # Update state after PPL
             state["entries"][str(step)].update({
@@ -510,7 +556,6 @@ def main():
             atomic_write_json(state_path, state)
 
             print(f"  [done] PPL={ppl:.2f}, XE={xe:.4f}, time={elapsed:.1f}s")
-            processed += 1
 
             # 5) Optionally clean up raw checkpoint
             if args.clean_checkpoints and ckpt_path.exists():
@@ -536,7 +581,7 @@ def main():
 
     # Final summary
     print(f"\n{'=' * 70}")
-    print(f"COMPLETE: processed={processed}, skipped={skipped}")
+    print(f"COMPLETE: processed={processed}, cached={cached}, skipped={skipped}")
     print(f"State saved to: {state_path}")
 
     print_summary(state)
