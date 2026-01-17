@@ -111,9 +111,25 @@ def load_ppl_cache() -> dict:
     return {}
 
 
-def get_cached_ppl(run_name: str, step: int, ppl_cache: dict) -> Optional[dict]:
-    """Check if perplexity result exists in cache. Returns dict with ppl, xe, tokens or None."""
-    # Key format: run_name/baked_step{N}.pt
+def get_cached_ppl(run_name: str, step: int, ppl_cache: dict, state: dict) -> Optional[dict]:
+    """Check if perplexity result exists in cache. Returns dict with ppl, xe, tokens or None.
+
+    Checks in order:
+    1. Per-run ppl_state.json (already loaded as 'state')
+    2. Global results/perplexity.json (passed as 'ppl_cache')
+    """
+    # First check per-run state (highest priority - synced with GDrive)
+    step_str = str(step)
+    if step_str in state.get("entries", {}):
+        entry = state["entries"][step_str]
+        if entry.get("ppl_ok") and entry.get("ppl") is not None:
+            return {
+                "ppl": entry["ppl"],
+                "xe": entry.get("xe", 0.0),
+                "tokens": entry.get("tokens", 0),
+            }
+
+    # Fall back to global cache
     key = f"{run_name}/baked_step{step}.pt"
     if key in ppl_cache:
         entry = ppl_cache[key]
@@ -124,6 +140,36 @@ def get_cached_ppl(run_name: str, step: int, ppl_cache: dict) -> Optional[dict]:
                 "tokens": entry.get("tokens", 0),
             }
     return None
+
+
+def sync_state_from_gdrive(run_name: str) -> bool:
+    """Try to sync ppl_state.json from Google Drive."""
+    state_file = "ppl_state.json"
+    cmd = [
+        sys.executable, str(REPO_ROOT / "scripts" / "gdrive_sync.py"),
+        "down", run_name, "--only", state_file
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            return True
+    except (subprocess.TimeoutExpired, Exception):
+        pass
+    return False
+
+
+def sync_state_to_gdrive(run_name: str) -> bool:
+    """Sync ppl_state.json to Google Drive."""
+    state_file = "ppl_state.json"
+    cmd = [
+        sys.executable, str(REPO_ROOT / "scripts" / "gdrive_sync.py"),
+        "up", f"runs/{run_name}", "--only", state_file, "--size-only"
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, Exception):
+        return False
 
 
 def is_baked(state: dict, step: int) -> bool:
@@ -415,6 +461,14 @@ def main():
     local_dir = Path(args.local_root) / run_name
     local_dir.mkdir(parents=True, exist_ok=True)
 
+    # Try to sync ppl_state.json from Google Drive first (get latest results)
+    if not args.local_only:
+        print(f"[sync] Checking for ppl_state.json on Google Drive...")
+        if sync_state_from_gdrive(run_name):
+            print(f"[sync] Downloaded ppl_state.json from Google Drive")
+        else:
+            print(f"[sync] No ppl_state.json on Google Drive (or sync failed)")
+
     state_path = local_dir / "ppl_state.json"
     state = load_state(state_path)
     state["run"] = run_name
@@ -529,8 +583,8 @@ def main():
             })
             atomic_write_json(state_path, state)
 
-            # 4) Perplexity - check cache first
-            cached_result = get_cached_ppl(run_name, step, ppl_cache)
+            # 4) Perplexity - check cache first (per-run state has priority)
+            cached_result = get_cached_ppl(run_name, step, ppl_cache, state)
             if cached_result:
                 ppl = cached_result["ppl"]
                 xe = cached_result["xe"]
@@ -555,6 +609,10 @@ def main():
             })
             atomic_write_json(state_path, state)
 
+            # Sync state to Google Drive (backup results)
+            if not args.local_only:
+                sync_state_to_gdrive(run_name)
+
             print(f"  [done] PPL={ppl:.2f}, XE={xe:.4f}, time={elapsed:.1f}s")
 
             # 5) Optionally clean up raw checkpoint
@@ -578,6 +636,12 @@ def main():
     if prefetch_proc is not None:
         print("\nWaiting for background prefetch to complete...")
         prefetch_proc.wait()
+
+    # Final sync to Google Drive
+    if not args.local_only:
+        print("\n[sync] Final sync of ppl_state.json to Google Drive...")
+        if sync_state_to_gdrive(run_name):
+            print("[sync] Done")
 
     # Final summary
     print(f"\n{'=' * 70}")
