@@ -205,6 +205,7 @@ def generate_lut_family_D(
     S: torch.Tensor,
     max_abs: float,
     eps: float = 1e-4,
+    max_samples: int = 10_000_000,
 ) -> Tuple[str, torch.Tensor]:
     """Family D: Quantile LUT from layer's own |Q_eff|.
 
@@ -217,6 +218,7 @@ def generate_lut_family_D(
         S: Scale matrix [out, in] - used to mask small-scale entries
         max_abs: Maximum absolute value for LUT
         eps: Threshold for small scales
+        max_samples: Maximum samples for quantile computation (avoids OOM)
     """
     # Mask out entries where S is too small (division artifacts)
     S_flat = S.flatten().abs()
@@ -229,6 +231,12 @@ def generate_lut_family_D(
         # Fallback: not enough valid entries, use all
         print(f"    WARNING: Only {Q_valid.numel()} valid Q_eff entries (S >= {eps}), using all")
         Q_valid = Q_flat
+
+    # Sample if tensor is too large (torch.quantile has limits)
+    # Use strided sampling (works on TPU, avoids randperm issues)
+    if Q_valid.numel() > max_samples:
+        stride = Q_valid.numel() // max_samples
+        Q_valid = Q_valid[::stride][:max_samples]
 
     half = lut_size // 2
 
