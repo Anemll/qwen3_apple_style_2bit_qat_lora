@@ -826,6 +826,15 @@ def main():
     if ppl_cache:
         print(f"[cache] Loaded {len(ppl_cache)} entries from results/perplexity.json")
 
+    # Wait for device before starting pipeline (TPU is exclusive)
+    print(f"\n[device] Checking if {args.device} is available...")
+    if is_device_busy(args.device):
+        print(f"[device] Device busy, waiting for it to be free...")
+        wait_for_device(args.device)
+        print(f"[device] Device is now free, starting pipeline")
+    else:
+        print(f"[device] Device is free")
+
     # Pipeline loop
     prefetch_proc = None
     processed = 0
