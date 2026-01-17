@@ -172,6 +172,101 @@ def sync_state_to_gdrive(run_name: str) -> bool:
         return False
 
 
+def is_device_busy(device: str = "auto") -> bool:
+    """Check if TPU/MPS is busy (other process using it).
+
+    Note: CUDA/NVIDIA GPUs support concurrent access, so we don't check those.
+    TPU and MPS are exclusive - only one heavy process at a time.
+
+    Returns True if device appears busy, False if free.
+    """
+    try:
+        # CUDA GPUs support concurrent access - no need to wait
+        if device == "cuda" or device.startswith("cuda:"):
+            return False
+
+        # Check for TPU (XLA) - exclusive access, check /dev/vfio/0
+        if device in ("auto", "tpu", "xla") or device.startswith("xla"):
+            # Check if TPU device exists
+            if not os.path.exists("/dev/vfio/0"):
+                return False  # No TPU device, not busy
+
+            # Try lsof first (check if device is open by any process)
+            result = subprocess.run(
+                ["lsof", "/dev/vfio/0"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                # Device is in use - check if it's our process
+                current_pid = str(os.getpid())
+                lines = result.stdout.strip().split('\n')[1:]  # Skip header
+                for line in lines:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        pid = parts[1]
+                        if pid != current_pid:
+                            return True  # Another process is using TPU
+                return False  # Only our process (or no process)
+
+            # Fallback: try fuser
+            result = subprocess.run(
+                ["fuser", "-v", "/dev/vfio/0"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                # fuser outputs PIDs to stderr with -v
+                output = result.stderr.strip() if result.stderr else result.stdout.strip()
+                if output:
+                    current_pid = str(os.getpid())
+                    # Parse fuser output (PIDs are space-separated)
+                    pids = [p.strip() for p in output.split() if p.strip().isdigit()]
+                    other_pids = [p for p in pids if p != current_pid]
+                    if other_pids:
+                        return True
+            return False
+
+        # MPS (Apple Silicon) - exclusive for heavy workloads
+        if device in ("auto", "mps"):
+            result = subprocess.run(
+                ["pgrep", "-f", "python.*measure_perplexity"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                pids = [p.strip() for p in result.stdout.strip().split('\n') if p.strip()]
+                current_pid = str(os.getpid())
+                other_pids = [p for p in pids if p != current_pid]
+                if other_pids:
+                    return True
+            return False
+
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        pass
+
+    return False
+
+
+def wait_for_device(device: str = "auto", check_interval: int = 60, max_wait: int = 3600) -> bool:
+    """Wait until device is free.
+
+    Args:
+        device: Device type (auto, cuda, tpu, mps)
+        check_interval: Seconds between checks (default: 60)
+        max_wait: Maximum wait time in seconds (default: 3600 = 1 hour)
+
+    Returns:
+        True if device became free, False if max_wait exceeded
+    """
+    waited = 0
+    while is_device_busy(device):
+        if waited >= max_wait:
+            print(f"  [warn] Max wait time ({max_wait}s) exceeded, proceeding anyway")
+            return False
+        print(f"  [wait] Device busy, waiting {check_interval}s... (total waited: {waited}s)")
+        time.sleep(check_interval)
+        waited += check_interval
+    return True
+
+
 def is_baked(state: dict, step: int) -> bool:
     """Check if step is already baked (legacy, kept for compatibility)."""
     e = state["entries"].get(str(step))
@@ -593,6 +688,8 @@ def main():
                 print(f"  [cache] Found in results/perplexity.json: PPL={ppl:.2f}")
                 cached += 1
             else:
+                # Wait for device to be free before running PPL
+                wait_for_device(args.device)
                 ppl, xe, tokens, elapsed, _ = run_ppl(
                     baked_path, args.config, args.dtype, args.device, args.max_chunks
                 )
