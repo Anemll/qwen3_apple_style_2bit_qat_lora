@@ -36,16 +36,16 @@ REPO_DIR = Path(__file__).parent.parent
 
 
 def sync_folder(folder: str, dry_run: bool = False, exclude: list = None, size_only: bool = False):
-    """Sync a single folder using gdrive_sync.py up."""
+    """Sync a single folder using gdrive_sync.py up - streams output live."""
     cmd = [
         sys.executable,
         str(REPO_DIR / 'scripts' / 'gdrive_sync.py'),
         'up',
         folder,
-        '--size-only' if size_only else '',
     ]
-    # Remove empty strings
-    cmd = [c for c in cmd if c]
+
+    if size_only:
+        cmd.append('--size-only')
 
     if dry_run:
         cmd.append('--dry-run')
@@ -54,8 +54,9 @@ def sync_folder(folder: str, dry_run: bool = False, exclude: list = None, size_o
         for pattern in exclude:
             cmd.extend(['--exclude', pattern])
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    return result
+    # Stream output live instead of capturing
+    result = subprocess.run(cmd)
+    return result.returncode == 0
 
 
 def format_time():
@@ -118,23 +119,11 @@ def main():
             print(f"  WARNING: {folder} does not exist (will sync when created)")
             continue
 
-        print(f"  Syncing: {folder}")
-        result = sync_folder(folder, args.dry_run, args.exclude, args.size_only)
-
-        # Parse output for summary
-        lines = result.stdout.strip().split('\n') if result.stdout else []
-        for line in lines:
-            if 'Files to sync:' in line or 'No files to sync' in line:
-                print(f"    {line.strip()}")
-            elif '[new' in line.lower() or '[modified' in line.lower():
-                print(f"    {line.strip()}")
-
-        if result.returncode != 0:
-            error_count += 1
-            if result.stderr:
-                print(f"    ERROR: {result.stderr[:200]}")
-        else:
+        success = sync_folder(folder, args.dry_run, args.exclude, args.size_only)
+        if success:
             sync_count += 1
+        else:
+            error_count += 1
 
     if args.once:
         print(f"\n[{format_time()}] Single run complete. Synced {sync_count} folders.")
@@ -154,37 +143,22 @@ def main():
             break
 
         # Sync all folders
+        print(f"\n[{format_time()}] Sync cycle...")
         for folder in args.folders:
             if not os.path.exists(folder):
                 continue
 
-            result = sync_folder(folder, args.dry_run, args.exclude, args.size_only)
-
-            # Only print if there were changes
-            if result.stdout:
-                lines = result.stdout.strip().split('\n')
-                has_changes = any('Files to sync:' in line for line in lines)
-                if has_changes:
-                    print(f"[{format_time()}] {folder}:")
-                    for line in lines:
-                        if 'Files to sync:' in line:
-                            print(f"  {line.strip()}")
-                        elif '[new' in line.lower() or '[modified' in line.lower():
-                            print(f"  {line.strip()}")
-                        elif 'Synced' in line and 'files' in line:
-                            print(f"  {line.strip()}")
-                    sync_count += 1
-
-            if result.returncode != 0:
+            success = sync_folder(folder, args.dry_run, args.exclude, args.size_only)
+            if success:
+                sync_count += 1
+            else:
                 error_count += 1
 
     # Final sync
     print(f"\n[{format_time()}] Final sync before exit...")
     for folder in args.folders:
         if os.path.exists(folder):
-            result = sync_folder(folder, args.dry_run, args.exclude, args.size_only)
-            if 'Files to sync:' in (result.stdout or ''):
-                print(f"  {folder}: synced")
+            sync_folder(folder, args.dry_run, args.exclude, args.size_only)
 
     print(f"\n[{format_time()}] Done. Total syncs: {sync_count}, Errors: {error_count}")
     return 0
