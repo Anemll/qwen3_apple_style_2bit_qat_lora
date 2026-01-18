@@ -57,7 +57,7 @@ import gc
 import json
 import sys
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
@@ -646,27 +646,38 @@ def main():
                 gc.collect()
 
     else:
-        # Parallel processing with ProcessPoolExecutor
-        print(f"\n  Preparing {total_layers} layers for parallel processing...")
+        # Parallel processing with ThreadPoolExecutor (avoids spawn overhead)
+        # Note: Using threads instead of processes because:
+        # 1. ProcessPoolExecutor with spawn requires re-importing all modules
+        # 2. Our workload releases GIL during torch tensor operations
+        # 3. Much faster startup and lower memory overhead
+        from concurrent.futures import ThreadPoolExecutor
 
-        # Prepare all layer data upfront (needed for ProcessPoolExecutor)
+        print(f"\n  Preparing {total_layers} layers for parallel processing...")
+        sys.stdout.flush()
+
+        # Prepare all layer data upfront
         tasks = []
         module_map = {}  # name -> module reference for applying results later
 
-        for name, module in layer_list:
+        for i, (name, module) in enumerate(layer_list):
+            if (i + 1) % 50 == 0:
+                print(f"\r    Prepared {i + 1}/{total_layers} layers...", end='', flush=True)
             layer_data = prepare_layer_data(name, module)
             config = shared_config.copy()
             config['activation_var'] = get_activation_var(name)
             tasks.append((name, layer_data, config))
             module_map[name] = module
 
-        print(f"  Starting {args.workers} workers...")
+        print(f"\r    Prepared {total_layers}/{total_layers} layers.       ")
+        print(f"  Starting {args.workers} workers (ThreadPoolExecutor)...")
+        sys.stdout.flush()
 
         # Process in parallel
         results = {}
         completed = 0
 
-        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
             # Submit all tasks
             future_to_name = {executor.submit(process_single_layer, task): task[0] for task in tasks}
 
