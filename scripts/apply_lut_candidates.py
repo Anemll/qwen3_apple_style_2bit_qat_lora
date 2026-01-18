@@ -70,13 +70,39 @@ CONFIG_PRESETS = {
 def snap_to_fp16(lut: torch.Tensor, require_no_zero: bool = True) -> torch.Tensor:
     """Snap LUT values to FP16 and ensure strict monotonicity.
 
+    Uses FP16 bit manipulation to guarantee distinct values after snapping.
+    This is more robust than torch.nextafter() which operates in FP32 space.
+
     Args:
         lut: LUT tensor (assumed symmetric around 0)
         require_no_zero: If True, ensure no exact zero values
 
     Returns:
-        FP16-snapped, strictly monotonic LUT
+        FP16-snapped, strictly monotonic LUT with guaranteed distinct FP16 values
     """
+    import struct
+
+    def float_to_fp16_bits(f: float) -> int:
+        """Convert float to FP16 bit representation."""
+        return struct.unpack('H', struct.pack('e', f))[0]
+
+    def fp16_bits_to_float(bits: int) -> float:
+        """Convert FP16 bits back to float."""
+        return struct.unpack('e', struct.pack('H', bits))[0]
+
+    def next_fp16(f: float) -> float:
+        """Get the next larger distinct FP16 value."""
+        bits = float_to_fp16_bits(f)
+        if f >= 0:
+            return fp16_bits_to_float(bits + 1)
+        else:
+            return fp16_bits_to_float(bits - 1)
+
+    def snap_single_to_fp16(f: float) -> float:
+        """Snap a single float to nearest FP16."""
+        return float(torch.tensor(f, dtype=torch.float32).half().item())
+
+    # Initial FP16 snap
     lut = lut.half().float()
     half = len(lut) // 2
 
@@ -85,20 +111,27 @@ def snap_to_fp16(lut: torch.Tensor, require_no_zero: bool = True) -> torch.Tenso
 
     # Ensure no zero in positive half if required
     if require_no_zero and positive[0] == 0:
-        # Use smallest positive FP16 value
-        positive[0] = torch.tensor(2**-14, dtype=torch.float32)  # ~6e-5
+        # Use smallest positive FP16 subnormal: 2^-24 ≈ 5.96e-8
+        # Or use 2^-14 ≈ 6.1e-5 for smallest normal
+        positive[0] = torch.tensor(2**-14, dtype=torch.float32)
 
-    # Ensure strict monotonicity in positive half
+    # Ensure strict monotonicity using FP16 bit increment
     for i in range(1, len(positive)):
-        if positive[i] <= positive[i - 1]:
-            positive[i] = torch.nextafter(positive[i - 1], torch.tensor(float('inf'), dtype=torch.float32))
+        prev_val = positive[i - 1].item()
+        curr_val = positive[i].item()
+
+        # Snap current to FP16
+        curr_fp16 = snap_single_to_fp16(curr_val)
+
+        # If not strictly greater, increment in FP16 space
+        while curr_fp16 <= prev_val:
+            curr_fp16 = next_fp16(curr_fp16)
+
+        positive[i] = torch.tensor(curr_fp16, dtype=torch.float32)
 
     # Mirror to negative half
     negative = -positive.flip(0)
     lut = torch.cat([negative, positive])
-
-    # Final FP16 snap
-    lut = lut.half().float()
 
     return lut
 
@@ -264,6 +297,177 @@ def generate_lut_family_D(
     return ('D_quantile', lut)
 
 
+def generate_lut_family_G(
+    lut_size: int,
+    Q_eff_target: torch.Tensor,
+    S: torch.Tensor,
+    max_abs: float,
+    eps: float = 1e-4,
+    max_iters: int = 20,
+    max_samples: int = 1_000_000,
+) -> Tuple[str, torch.Tensor]:
+    """Family G: Weighted k-means codebook (Lloyd's algorithm).
+
+    Unlike quantile LUTs, this directly minimizes weighted MSE distortion.
+    Weights = S^2 (so errors in high-scale entries matter more).
+
+    This often beats hand-crafted grids because it adapts to the actual
+    distribution while optimizing the distortion objective.
+
+    Args:
+        lut_size: Number of LUT entries
+        Q_eff_target: Target Q values [out, in]
+        S: Scale matrix [out, in] - used as weights (S^2)
+        max_abs: Maximum absolute value for LUT
+        eps: Threshold for small scales
+        max_iters: Maximum Lloyd iterations
+        max_samples: Maximum samples to use (for speed)
+    """
+    half = lut_size // 2
+
+    # Flatten and get valid entries
+    Q_flat = Q_eff_target.flatten().float()
+    S_flat = S.flatten().abs().float()
+    weights = S_flat ** 2  # Weight by S^2 for MSE objective
+
+    # Filter valid entries
+    valid_mask = S_flat >= eps
+    Q_valid = Q_flat[valid_mask]
+    W_valid = weights[valid_mask]
+
+    if Q_valid.numel() < 100:
+        Q_valid = Q_flat
+        W_valid = weights
+
+    # Sample if too large
+    if Q_valid.numel() > max_samples:
+        stride = Q_valid.numel() // max_samples
+        Q_valid = Q_valid[::stride][:max_samples]
+        W_valid = W_valid[::stride][:max_samples]
+
+    # Work on absolute values (symmetric LUT)
+    Q_abs = Q_valid.abs()
+
+    # Initialize centroids with quantiles (good starting point)
+    quantiles = torch.linspace(0, 1, half + 2)[1:-1]  # Exclude 0 and 1
+    centroids = torch.quantile(Q_abs, quantiles)
+
+    # Lloyd's algorithm (weighted k-means)
+    for _ in range(max_iters):
+        # Assignment: find nearest centroid for each point
+        dists = (Q_abs.unsqueeze(-1) - centroids.unsqueeze(0)).abs()
+        assignments = dists.argmin(dim=-1)
+
+        # Update: weighted mean for each cluster
+        new_centroids = torch.zeros_like(centroids)
+        for k in range(half):
+            mask = assignments == k
+            if mask.sum() > 0:
+                new_centroids[k] = (Q_abs[mask] * W_valid[mask]).sum() / W_valid[mask].sum()
+            else:
+                new_centroids[k] = centroids[k]  # Keep old if empty cluster
+
+        # Check convergence
+        if (new_centroids - centroids).abs().max() < 1e-6:
+            break
+        centroids = new_centroids
+
+    # Sort centroids (required for monotonic LUT)
+    centroids, _ = centroids.sort()
+
+    # Ensure minimum value and max_abs constraint
+    centroids = centroids.clamp(min=max_abs * 0.001, max=max_abs)
+
+    # Ensure strictly increasing
+    for i in range(1, half):
+        if centroids[i] <= centroids[i - 1]:
+            centroids[i] = centroids[i - 1] + max_abs * 0.01
+
+    # Build symmetric LUT
+    lut = torch.cat([-centroids.flip(0), centroids])
+    lut = snap_to_fp16(lut)
+
+    return ('G_kmeans', lut)
+
+
+def compute_weighted_mse(
+    W_eff_old: torch.Tensor,
+    W_eff_new: torch.Tensor,
+    S: torch.Tensor,
+    eps: float = 1e-4,
+) -> float:
+    """Compute S^2-weighted MSE (better proxy for PPL than MAE).
+
+    For a linear layer y = W x, the output MSE depends on:
+    - The weight error ΔW
+    - The input activation covariance Σ_x
+
+    If we approximate Σ_x ∝ I (identity), then we just use MSE.
+    If we weight by S^2, we emphasize entries with larger scales
+    (which typically correspond to more important weight directions).
+
+    Returns:
+        Weighted MSE value (lower is better)
+    """
+    valid_mask = S.abs() >= eps
+    error_sq = (W_eff_old - W_eff_new) ** 2
+    weights = S ** 2
+
+    if valid_mask.sum() > 0:
+        weighted_error = (error_sq * weights)[valid_mask]
+        return weighted_error.mean().item()
+    else:
+        return (error_sq * weights).mean().item()
+
+
+def compute_activation_weighted_mse(
+    W_eff_old: torch.Tensor,
+    W_eff_new: torch.Tensor,
+    input_var: torch.Tensor,
+    eps: float = 1e-8,
+) -> float:
+    """Compute activation-weighted MSE (Option A - best cost/benefit).
+
+    For a linear layer y = W x, the expected output MSE is:
+        E[||ΔW x||²] = tr(ΔW Σ_x ΔW^T)
+
+    If we approximate Σ_x with diagonal (per-feature variance), then:
+        score = Σ_j Var(x_j) * ||ΔW[:,j]||²
+
+    This weights errors by how much each input feature varies during inference,
+    which correlates better with PPL than raw weight MAE.
+
+    Args:
+        W_eff_old: Original effective weights [out_features, in_features]
+        W_eff_new: New effective weights [out_features, in_features]
+        input_var: Per-input-feature variance [in_features] from calibration
+        eps: Small value to avoid division by zero
+
+    Returns:
+        Activation-weighted MSE score (lower is better)
+    """
+    # Weight error per element
+    delta_W = W_eff_old - W_eff_new  # [out, in]
+
+    # Squared column norms: ||ΔW[:,j]||² for each input feature j
+    col_sq_norms = (delta_W ** 2).sum(dim=0)  # [in_features]
+
+    # Ensure input_var matches shape
+    if input_var.shape[0] != col_sq_norms.shape[0]:
+        # Handle shape mismatch (shouldn't happen if calibration is correct)
+        return (delta_W ** 2).mean().item()
+
+    # Weight by input variance
+    # score = Σ_j Var(x_j) * ||ΔW[:,j]||²
+    weighted_score = (input_var * col_sq_norms).sum()
+
+    # Normalize by total variance to make scores comparable across layers
+    total_var = input_var.sum() + eps
+    normalized_score = weighted_score / total_var
+
+    return normalized_score.item()
+
+
 # =============================================================================
 # CORE FUNCTIONS
 # =============================================================================
@@ -349,10 +553,13 @@ def compute_layer_weff_and_qeff(
     # Compute scales
     S = module._compute_full_scales().float().cpu()
 
-    # Safe scales
-    sign = torch.sign(S)
-    sign = torch.where(sign == 0, torch.ones_like(sign), sign)
-    S_safe = torch.where(S.abs() < eps, sign * eps, S)
+    # Safe scales - handle S==0 correctly (torch.sign(0)==0)
+    # Use torch.copysign to preserve sign, defaulting to +eps for zero
+    S_safe = torch.where(
+        S.abs() < eps,
+        torch.copysign(torch.full_like(S, eps), S + eps),  # +eps ensures 0 -> +eps
+        S
+    )
 
     # Current effective weights
     W_eff_old = Q_current * S
