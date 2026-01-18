@@ -236,8 +236,31 @@ def main():
         print(f"  Different:     {len(lut_diff)}")
         if lut_diff:
             print(f"  Top LUT differences:")
-            for k, max_d, mean_d in sorted(lut_diff, key=lambda x: x[1], reverse=True)[:5]:
+            lut_diff_sorted = sorted(lut_diff, key=lambda x: x[1], reverse=True)
+            for k, max_d, mean_d in lut_diff_sorted[:5]:
                 print(f"    {max_d:.6e}  {k}")
+
+            # Print actual values for LUT with highest difference
+            if lut_diff_sorted:
+                worst_lut_key, worst_max_diff, worst_mean_diff = lut_diff_sorted[0]
+                print(f"\n  Detailed values for LUT with highest difference:")
+                print(f"  Key: {worst_lut_key}")
+                print(f"  Max diff: {worst_max_diff:.6e}, Mean diff: {worst_mean_diff:.6e}")
+
+                lut1 = sd1[worst_lut_key]
+                lut2 = sd2[worst_lut_key]
+
+                print(f"\n  Checkpoint 1 ({path1.name}):")
+                print(f"    Shape: {lut1.shape}, dtype: {lut1.dtype}")
+                print(f"    Values: {lut1}")
+
+                print(f"\n  Checkpoint 2 ({path2.name}):")
+                print(f"    Shape: {lut2.shape}, dtype: {lut2.dtype}")
+                print(f"    Values: {lut2}")
+
+                print(f"\n  Absolute difference:")
+                diff_tensor = (lut1.float() - lut2.float()).abs()
+                print(f"    {diff_tensor}")
 
     # Overall verdict
     if len(different) == 0 and len(shape_mismatch) == 0:
