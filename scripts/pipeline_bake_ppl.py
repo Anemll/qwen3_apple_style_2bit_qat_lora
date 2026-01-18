@@ -632,7 +632,9 @@ def run_ppl(
 def print_summary(state: dict):
     """Print summary of all processed checkpoints."""
     entries = state.get("entries", {})
-    if not entries:
+    best_entries = state.get("best_entries", {})
+
+    if not entries and not best_entries:
         print("\nNo checkpoints processed yet.")
         return
 
@@ -672,9 +674,30 @@ def print_summary(state: dict):
 
         print(f"{step:>8} | {ppl_str:>10} | {xe_str:>10} | {tokens_str:>12} | {status}")
 
+    # Add best_state_dict entries (sorted by PPL)
+    if best_entries:
+        print("-" * 70)
+        for md5_key, e in sorted(best_entries.items(), key=lambda x: x[1].get("ppl", 999)):
+            ppl = e.get("ppl")
+            xe = e.get("xe")
+            tokens = e.get("tokens", 0)
+            ppl_ok = e.get("ppl_ok", False)
+
+            status = f"best_{md5_key}" if ppl_ok else f"best_{md5_key}(pending)"
+            ppl_str = f"{ppl:.2f}" if ppl is not None else "-"
+            xe_str = f"{xe:.4f}" if xe is not None else "-"
+            tokens_str = f"{tokens:,}" if tokens else "-"
+
+            print(f"{'best':>8} | {ppl_str:>10} | {xe_str:>10} | {tokens_str:>12} | {status}")
+
+            # Track if any best entry beats step-based best
+            if ppl_ok and ppl is not None and ppl < best_ppl:
+                best_ppl = ppl
+                best_step = f"best_{md5_key}"
+
     print("-" * 70)
     if best_step is not None:
-        print(f"Best: step {best_step} with PPL = {best_ppl:.2f}")
+        print(f"Best: {best_step} with PPL = {best_ppl:.2f}")
     print("=" * 70)
 
 
