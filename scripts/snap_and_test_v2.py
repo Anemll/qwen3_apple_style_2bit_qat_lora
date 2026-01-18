@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import json
+import math
 import torch
 import sys
 from pathlib import Path
@@ -39,6 +40,15 @@ from qat_lora.ane_qat_linear_v2 import (
     resnap_with_lora,
     get_recovery_lora_params,
 )
+
+# Config presets (same as apply_lut_candidates.py, measure_perplexity.py)
+CONFIG_PRESETS = {
+    'q2a4': {'mlp_lut': 4, 'mlp_rank': 32, 'attn_lut': 16, 'attn_rank': 8},
+    'q4a4': {'mlp_lut': 16, 'mlp_rank': 4, 'attn_lut': 16, 'attn_rank': 4},
+    'q4a4_r32': {'mlp_lut': 16, 'mlp_rank': 32, 'attn_lut': 16, 'attn_rank': 32},
+    'q4_r32': {'mlp_lut': 16, 'mlp_rank': 32, 'attn_lut': 16, 'attn_rank': 32},
+    'q2a2': {'mlp_lut': 4, 'mlp_rank': 32, 'attn_lut': 4, 'attn_rank': 32},
+}
 
 
 def main():
@@ -76,7 +86,21 @@ def main():
                         help='Merge LoRA into quantized weights (best for ANE, removes adapter ops)')
     parser.add_argument('--no-test', action='store_true',
                         help='Skip inference test (snap only)')
+    parser.add_argument('--config', type=str, choices=list(CONFIG_PRESETS.keys()),
+                        help='Config preset (q4_r32, q2a4, q4a4, etc.) - overrides lut-bits/scale-rank')
     args = parser.parse_args()
+
+    # Apply config preset if specified (overrides individual args)
+    if args.config:
+        preset = CONFIG_PRESETS[args.config]
+        # Convert LUT size to bits: 4->2, 16->4
+        args.lut_bits = int(math.log2(preset['mlp_lut']))
+        args.attn_lut_bits = int(math.log2(preset['attn_lut']))
+        args.scale_rank = preset['mlp_rank']
+        args.attn_scale_rank = preset['attn_rank']
+        print(f"[Config] Using preset '{args.config}':")
+        print(f"  MLP: {preset['mlp_lut']}-entry LUT ({args.lut_bits} bits), rank={args.scale_rank}")
+        print(f"  Attn: {preset['attn_lut']}-entry LUT ({args.attn_lut_bits} bits), rank={args.attn_scale_rank}")
 
     # Try to auto-detect config from checkpoint directory
     # Check config.json first, then v2_config.json
