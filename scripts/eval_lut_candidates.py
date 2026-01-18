@@ -33,12 +33,18 @@ Usage:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
+
+
+def strip_ansi(text: str) -> str:
+    """Strip ANSI color codes from text."""
+    return re.sub(r'\x1b\[[0-9;]*m', '', text)
 
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_DIR))
@@ -113,11 +119,12 @@ def run_perplexity(
     # Run and capture output
     result = subprocess.run(cmd, capture_output=True, text=True, env=env)
 
-    # Parse perplexity from output
+    # Parse perplexity from output (strip ANSI codes first)
     ppl = None
     time_s = None
+    stdout_clean = strip_ansi(result.stdout)
 
-    for line in result.stdout.split('\n'):
+    for line in stdout_clean.split('\n'):
         if 'Perplexity:' in line:
             # Extract number after "Perplexity:"
             try:
@@ -173,6 +180,8 @@ def parse_args():
                         help='XLA persistent cache dir (avoids recompilation between candidates)')
     parser.add_argument('--output', '-o', default=None,
                         help='Output results JSON path')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Show full stdout/stderr from each evaluation')
 
     args = parser.parse_args()
 
@@ -275,10 +284,17 @@ def main():
                 ppl_fast=ppl_result['perplexity'],
                 time_fast=ppl_result['time'],
             ))
+            if args.verbose:
+                print(f"    stdout: {strip_ansi(ppl_result['stdout'])[-500:]}")
         else:
             print(f"ERROR (returncode={ppl_result['returncode']})")
+            # Always show stdout tail on error to help debug
+            if ppl_result['stdout']:
+                stdout_tail = strip_ansi(ppl_result['stdout'])[-500:]
+                print(f"    stdout (tail): {stdout_tail}")
             if ppl_result['stderr']:
-                print(f"    stderr: {ppl_result['stderr'][:200]}")
+                stderr_clean = ppl_result['stderr'].replace('\n', ' ')[:300]
+                print(f"    stderr: {stderr_clean}")
 
     # Sort by fast PPL
     results.sort(key=lambda x: x.ppl_fast if x.ppl_fast else float('inf'))
