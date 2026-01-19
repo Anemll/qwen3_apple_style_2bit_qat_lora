@@ -56,6 +56,7 @@ import argparse
 import gc
 import json
 import sys
+import time
 from collections import defaultdict
 from concurrent.futures import as_completed
 from datetime import datetime
@@ -78,7 +79,8 @@ from scripts.apply_lut_candidates import (
     generate_lut_family_B,
     generate_lut_family_C,
     generate_lut_family_D,
-    generate_lut_family_G,  # Weighted k-means
+    generate_lut_family_G,  # Weighted k-means (asymmetric, eval-only)
+    generate_lut_family_H_symkmeans,  # Symmetric k-means (trainable-compatible)
     compute_weighted_mse,   # S^2-weighted MSE
     compute_activation_weighted_mse,  # Activation-weighted MSE (Option A)
     quantize_chunked,
@@ -108,6 +110,7 @@ def generate_all_candidates(
     Q_eff_target: Optional[torch.Tensor] = None,
     S: Optional[torch.Tensor] = None,
     eps: float = 1e-4,
+    scale_to_max_abs: bool = False,
 ) -> List[Tuple[str, torch.Tensor]]:
     """Generate all LUT candidates for a given LUT size."""
     candidates = []
@@ -137,10 +140,22 @@ def generate_all_candidates(
         name, lut = generate_lut_family_D(lut_size, Q_eff_target, S, max_abs, eps)
         candidates.append((name, lut))
 
-    # Family G: Weighted k-means (requires layer data)
+    # Family G: Weighted k-means (requires layer data) - asymmetric, eval-only
     if 'G' in families and Q_eff_target is not None and S is not None:
-        name, lut = generate_lut_family_G(lut_size, Q_eff_target, S, max_abs, eps)
+        name, lut = generate_lut_family_G(lut_size, Q_eff_target, S, max_abs, eps, scale_to_max_abs=scale_to_max_abs)
         candidates.append((name, lut))
+
+    # Family H: Symmetric k-means (requires layer data) - trainable-compatible
+    if 'H' in families and Q_eff_target is not None and S is not None:
+        # H expects 1D tensors, flatten and filter valid entries
+        S_flat = S.flatten().abs()
+        Q_flat = Q_eff_target.flatten()
+        valid_mask = S_flat >= eps
+        if valid_mask.sum() > 100:  # Need enough valid entries
+            name, lut, stats = generate_lut_family_H_symkmeans(
+                lut_size, Q_flat[valid_mask], S_flat[valid_mask], max_abs, eps
+            )
+            candidates.append((name, lut))
 
     return candidates
 
@@ -177,6 +192,7 @@ def process_single_layer(args_tuple: Tuple) -> Dict[str, Any]:
     eps = config['eps']
     activation_var = config.get('activation_var')
     verbose = config.get('verbose', False)
+    scale_to_max_abs = config.get('scale_to_max_abs', False)
 
     lut_size = lut.numel()
 
@@ -226,6 +242,7 @@ def process_single_layer(args_tuple: Tuple) -> Dict[str, Any]:
         Q_eff_target=Q_eff_target,
         S=S,
         eps=eps,
+        scale_to_max_abs=scale_to_max_abs,
     )
 
     # Test each candidate
@@ -272,9 +289,9 @@ def process_single_layer(args_tuple: Tuple) -> Dict[str, Any]:
     original_score = all_results.get('E_original', float('inf'))
     improved = best_name != 'E_original' and best_score < original_score
 
-    # Get LUT range for G_kmeans
+    # Get LUT range for winning candidate (always show, not just G_kmeans)
     lut_range = None
-    if best_name == 'G_kmeans' and best_lut is not None:
+    if best_lut is not None:
         lut_range = (best_lut.min().item(), best_lut.max().item())
 
     return {
@@ -308,14 +325,16 @@ def parse_args():
                         help='Output hybrid checkpoint path')
     parser.add_argument('--output-stats', default=None,
                         help='Output JSON with per-layer selection stats')
-    parser.add_argument('--config', default=None,
-                        help='Config preset (q2a4, q4a4, etc.)')
+    parser.add_argument('--config', default='q4_r32',
+                        help='Config preset (q2a4, q4a4, q4_r32, etc.) - default: q4_r32 (LUT16, rank32)')
     parser.add_argument('--model-id', default='Qwen/Qwen3-0.6B',
                         help='Base model for FP32 target weights (SVD target)')
     parser.add_argument('--scope', choices=['mlp', 'attn', 'all'], default='all',
                         help='Layer scope to modify (default: all)')
-    parser.add_argument('--families', default='E,F,G,A,B,C,D',
-                        help='Comma-separated family codes (default: E,F,G,A,B,C,D)')
+    parser.add_argument('--families', default='E,F,A,B,C,D',
+                        help='Comma-separated family codes: '
+                             'E=original, F=predefined, A=uniform, B=dense-center, C=heavy-tail, '
+                             'D=quantile, G=kmeans (eval-only), H=symmetric-kmeans (trainable)')
     parser.add_argument('--max-abs', type=float, default=2.0,
                         help='Max absolute LUT value for generated candidates (default: 2.0 for FP4 range)')
     parser.add_argument('--auto-max-abs', action='store_true',
@@ -332,6 +351,11 @@ def parse_args():
                         help='Number of parallel workers (default: 1, sequential)')
     parser.add_argument('--eps', type=float, default=1e-4,
                         help='Epsilon for safe division (default: 1e-4)')
+    parser.add_argument('--group-size', type=int, default=32,
+                        help='Group size for scale initialization (default: 32, must match init_model_v2.py)')
+    parser.add_argument('--scale-lut', action='store_true',
+                        help='Scale G/H k-means LUTs to fill [0, max_abs] range (new behavior). '
+                             'Without this flag, LUTs use data-adaptive range (old behavior).')
 
     args = parser.parse_args()
 
@@ -368,6 +392,8 @@ def main():
     print(f"Scope:       {args.scope}")
     print(f"Metric:      {args.metric}")
     print(f"Max abs:     {'auto (p99.9)' if args.auto_max_abs else args.max_abs}")
+    print(f"Group size:  {args.group_size}")
+    print(f"Scale LUT:   {'enabled (new)' if args.scale_lut else 'disabled (old/data-adaptive)'}")
     if args.activation_cache:
         print(f"Act cache:   {args.activation_cache}")
     print()
@@ -392,17 +418,20 @@ def main():
     families = [f.strip().upper() for f in args.families.split(',')]
     print(f"Testing LUT families: {families}")
 
-    # Load config
-    if args.config and args.config in CONFIG_PRESETS:
+    # Load config (default: q4_r32 = LUT16, rank32)
+    if args.config in CONFIG_PRESETS:
         preset = CONFIG_PRESETS[args.config]
+        config_name = args.config
     else:
         preset = CONFIG_PRESETS['q4_r32']
+        config_name = 'q4_r32'
+        print(f"Warning: Unknown config '{args.config}', using default 'q4_r32'")
 
     mlp_lut = preset['mlp_lut']
     mlp_rank = preset['mlp_rank']
     attn_lut = preset['attn_lut']
     attn_rank = preset['attn_rank']
-    print(f"Config: MLP LUT{mlp_lut} rank={mlp_rank}, Attn LUT{attn_lut} rank={attn_rank}")
+    print(f"Config: {config_name} -> MLP LUT{mlp_lut} rank={mlp_rank}, Attn LUT{attn_lut} rank={attn_rank}, group_size={args.group_size}")
     print()
 
     # Import V2 classes
@@ -426,16 +455,20 @@ def main():
             original_weights[name] = module.weight.data.float().cpu().clone()
     print(f"  Extracted {len(original_weights)} linear layer weights")
 
-    # Create V2 configs
+    # Create V2 configs (must match init_model_v2.py settings)
     mlp_config = AnemllQuantConfigV2(
         lut_size=mlp_lut,
         scale_rank=mlp_rank,
+        group_size=args.group_size,
+        learnable_lut=False,
         force_positive_scales=False,
         magnitude_activation='identity',
     )
     attn_config = AnemllQuantConfigV2(
         lut_size=attn_lut,
         scale_rank=attn_rank,
+        group_size=args.group_size,
+        learnable_lut=False,
         force_positive_scales=False,
         magnitude_activation='identity',
     )
@@ -458,9 +491,71 @@ def main():
     # This must happen AFTER replace_linear_with_anemll_v2 and BEFORE loading checkpoint
     if args.from_scratch:
         from qat_lora.ane_qat_linear_v2 import freeze_Q_all
+        from scripts.tighten_q import tighten_q_layer
+
         print("Freezing Q (quantizing weights to LUT indices)...")
-        frozen = freeze_Q_all(model)
+        if args.verbose:
+            # Verbose mode: show LUT info and MSE per layer
+            frozen = 0
+            for name, module in model.named_modules():
+                if isinstance(module, AnemllQATLinearV2):
+                    # Get original weight for MSE computation
+                    W_ref = original_weights.get(name)
+                    if W_ref is None:
+                        W_ref = original_weights.get(f"{name}.weight")
+
+                    # Freeze Q
+                    module.freeze_Q()
+                    frozen += 1
+
+                    # Compute W_effective after freeze
+                    S = module._compute_full_scales()
+                    W_eff = module._Q * S
+
+                    # LUT info
+                    lut_min = module.lut.min().item()
+                    lut_max = module.lut.max().item()
+
+                    # Compute MSE vs original weight
+                    if W_ref is not None:
+                        W_ref_dev = W_ref.to(W_eff.device)
+                        mse = ((W_eff - W_ref_dev) ** 2).mean().item()
+                        mae = (W_eff - W_ref_dev).abs().mean().item()
+                        # Short layer name for display
+                        short_name = name.replace('model.layers.', '').replace('.self_attn.', '.').replace('.mlp.', '.')
+                        print(f"  {short_name:40s} LUT=[{lut_min:+.4f}, {lut_max:+.4f}] MSE={mse:.2e} MAE={mae:.2e}")
+                    else:
+                        short_name = name.replace('model.layers.', '').replace('.self_attn.', '.').replace('.mlp.', '.')
+                        print(f"  {short_name:40s} LUT=[{lut_min:+.4f}, {lut_max:+.4f}] (no ref weight)")
+        else:
+            frozen = freeze_Q_all(model)
         print(f"  Froze Q for {frozen} layers")
+
+        # Step 2: Snap magnitudes to FP16 (same as init_model_v2.py)
+        print("Snapping magnitudes to FP16...")
+        mags_snapped = 0
+        with torch.no_grad():
+            for name, module in model.named_modules():
+                if isinstance(module, AnemllQATLinearV2):
+                    if hasattr(module, 'rank_magnitude') and module.rank_magnitude is not None:
+                        module.rank_magnitude.data = module.rank_magnitude.data.to(torch.float16).to(torch.float32)
+                        mags_snapped += 1
+        print(f"  Snapped {mags_snapped} layers")
+
+        # Step 3: Tighten Q (recalculate to match snapped scales)
+        print("Tightening Q (recalculating to match snapped scales)...")
+        tightened = 0
+        for name, module in model.named_modules():
+            if isinstance(module, AnemllQATLinearV2) and module._Q is not None:
+                # Get W_ref for this layer
+                W_ref = original_weights.get(name)
+                if W_ref is None:
+                    # Try alternate key format
+                    W_ref = original_weights.get(f"{name}.weight")
+                if W_ref is not None:
+                    tighten_q_layer(module, W_ref, clamp_q=True)
+                    tightened += 1
+        print(f"  Tightened Q for {tightened} layers")
 
     # Load checkpoint (if provided)
     if args.checkpoint:
@@ -567,16 +662,29 @@ def main():
         'metric': args.metric,
         'eps': args.eps,
         'verbose': args.verbose,
+        'scale_to_max_abs': args.scale_lut,  # If True, scale G k-means LUTs to fill [0, max_abs]
     }
 
     # Process layers - sequential or parallel
+    start_time = time.time()
+
     if args.workers <= 1:
         # Sequential processing (original behavior)
         for layer_idx, (name, module) in enumerate(layer_list, 1):
-            # Progress indicator
+            # Progress indicator with ETA
             pct = 100 * layer_idx / total_layers
-            short_name = name.split('.')[-1]
-            print(f"\r{' ' * 80}\r  Processing: {layer_idx}/{total_layers} ({pct:.0f}%) - {short_name}", end='', flush=True)
+            elapsed = time.time() - start_time
+            if layer_idx > 1:
+                eta_sec = elapsed / (layer_idx - 1) * (total_layers - layer_idx + 1)
+                eta_str = f"{int(eta_sec // 60)}m {int(eta_sec % 60):02d}s"
+            else:
+                eta_str = "..."
+            # Extract layer number and proj name: model.layers.2.self_attn.q_proj -> q_proj.2
+            parts = name.split('.')
+            layer_num = parts[2] if len(parts) > 2 and parts[2].isdigit() else '?'
+            proj_name = parts[-1]
+            short_name = f"{proj_name}.{layer_num}".ljust(12)
+            print(f"\r{' ' * 100}\r  Processing: {layer_idx}/{total_layers} ({pct:.0f}%) - {short_name} ETA: {eta_str}", end='', flush=True)
 
             # Prepare data
             layer_data = prepare_layer_data(name, module)
@@ -629,9 +737,9 @@ def main():
                 status = "IMPROVED" if improved else "kept"
                 metric_label = args.metric.upper()
                 if lut_range:
-                    print(f"  -> {best_name} ({metric_label}={best_score:.2e}, orig={original_score:.2e}) LUT=[{lut_range[0]:.4f}, {lut_range[1]:.4f}] [{status}]")
+                    print(f"  -> {short_name}: {best_name} ({metric_label}={best_score:.2e}, orig={original_score:.2e}) LUT=[{lut_range[0]:.4f}, {lut_range[1]:.4f}] [{status}]")
                 else:
-                    print(f"  -> {best_name} ({metric_label}={best_score:.2e}, orig={original_score:.2e}) [{status}]")
+                    print(f"  -> {short_name}: {best_name} ({metric_label}={best_score:.2e}, orig={original_score:.2e}) [{status}]")
 
             # Apply best LUT to module
             if best_lut is not None and best_indices is not None and not args.dry_run:
@@ -682,12 +790,24 @@ def main():
             future_to_name = {executor.submit(process_single_layer, task): task[0] for task in tasks}
 
             # Collect results as they complete
+            parallel_start = time.time()
             for future in as_completed(future_to_name):
                 name = future_to_name[future]
                 completed += 1
                 pct = 100 * completed / total_layers
-                short_name = name.split('.')[-1]
-                print(f"\r{' ' * 80}\r  Completed: {completed}/{total_layers} ({pct:.0f}%) - {short_name}", end='', flush=True)
+                # ETA calculation
+                elapsed = time.time() - parallel_start
+                if completed > 0:
+                    eta_sec = elapsed / completed * (total_layers - completed)
+                    eta_str = f"{int(eta_sec // 60)}m {int(eta_sec % 60):02d}s"
+                else:
+                    eta_str = "..."
+                # Extract layer number and proj name: model.layers.2.self_attn.q_proj -> q_proj.2
+                parts = name.split('.')
+                layer_num = parts[2] if len(parts) > 2 and parts[2].isdigit() else '?'
+                proj_name = parts[-1]
+                short_name = f"{proj_name}.{layer_num}".ljust(12)
+                print(f"\r{' ' * 100}\r  Completed: {completed}/{total_layers} ({pct:.0f}%) - {short_name} ETA: {eta_str}", end='', flush=True)
 
                 try:
                     result = future.result()
@@ -734,10 +854,15 @@ def main():
             if args.verbose:
                 status = "IMPROVED" if improved else "kept"
                 metric_label = args.metric.upper()
+                # Extract layer number: model.layers.2.self_attn.q_proj -> q_proj.2
+                parts = name.split('.')
+                layer_num = parts[2] if len(parts) > 2 and parts[2].isdigit() else '?'
+                proj_name = parts[-1]
+                short_name = f"{proj_name}.{layer_num}".ljust(12)
                 if lut_range:
-                    print(f"    {name.split('.')[-1]}: {best_name} ({metric_label}={best_score:.2e}, orig={original_score:.2e}) LUT=[{lut_range[0]:.4f}, {lut_range[1]:.4f}] [{status}]")
+                    print(f"    {short_name}: {best_name} ({metric_label}={best_score:.2e}, orig={original_score:.2e}) LUT=[{lut_range[0]:.4f}, {lut_range[1]:.4f}] [{status}]")
                 else:
-                    print(f"    {name.split('.')[-1]}: {best_name} ({metric_label}={best_score:.2e}, orig={original_score:.2e}) [{status}]")
+                    print(f"    {short_name}: {best_name} ({metric_label}={best_score:.2e}, orig={original_score:.2e}) [{status}]")
 
             # Apply best LUT to module
             if best_lut is not None and best_indices is not None and not args.dry_run:

@@ -213,6 +213,9 @@ def tighten_q_layer(
     # 1. Get full scales using module's own method
     S = module._compute_full_scales()  # [out, in]
 
+    # Ensure W_ref is on the same device as S
+    W_ref = W_ref.to(S.device)
+
     # Validate shapes match
     assert S.shape == W_ref.shape, f"S.shape {S.shape} != W_ref.shape {W_ref.shape}"
 

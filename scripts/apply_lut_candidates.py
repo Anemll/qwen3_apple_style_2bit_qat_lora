@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Generate LUT candidates from 4 families and apply them to create checkpoint variants.
+Generate LUT candidates from multiple families and apply them to create checkpoint variants.
 
 LUT Families:
     A: Uniform - linspace(-M, M, 16), standard baseline
     B: Dense-center - more values near zero (asinh, tanh, sqrt grids)
     C: Heavy-tail - more values at extremes (geometric, power2, power3)
-    D: Quantile - data-driven from layer's own |Q_eff|
+    D: Quantile - data-driven from layer's |Q_eff| percentiles
+    G: K-Means - weighted 16-center Lloyd's algorithm (eval-only, asymmetric)
+    H: Symmetric K-Means - 8-center on |Q_eff|, mirrored (trainable-compatible)
 
 For each candidate:
     1. Keep S (scales) fixed
@@ -305,6 +307,7 @@ def generate_lut_family_G(
     eps: float = 1e-4,
     max_iters: int = 20,
     max_samples: int = 1_000_000,
+    scale_to_max_abs: bool = False,  # If True, scale centroids to fill [0, max_abs]
 ) -> Tuple[str, torch.Tensor]:
     """Family G: Weighted k-means codebook (Lloyd's algorithm).
 
@@ -322,6 +325,8 @@ def generate_lut_family_G(
         eps: Threshold for small scales
         max_iters: Maximum Lloyd iterations
         max_samples: Maximum samples to use (for speed)
+        scale_to_max_abs: If True, scale centroids to fill [0.01*max_abs, max_abs].
+                          If False (default), use data-adaptive range (old behavior).
     """
     half = lut_size // 2
 
@@ -375,19 +380,226 @@ def generate_lut_family_G(
     # Sort centroids (required for monotonic LUT)
     centroids, _ = centroids.sort()
 
-    # Ensure minimum value and max_abs constraint
-    centroids = centroids.clamp(min=max_abs * 0.001, max=max_abs)
+    if scale_to_max_abs:
+        # NEW: Scale centroids to span [min_pos, max_abs] (use full range)
+        # This ensures consistent LUT range regardless of data distribution
+        min_pos = max_abs * 0.01  # Minimum positive value (1% of max_abs)
+        c_min = centroids.min()
+        c_max = centroids.max()
+        if c_max > c_min:
+            # Linear scaling: map [c_min, c_max] -> [min_pos, max_abs]
+            centroids = min_pos + (centroids - c_min) * (max_abs - min_pos) / (c_max - c_min)
+        else:
+            # Fallback: uniform spacing if all centroids collapsed
+            centroids = torch.linspace(min_pos, max_abs, half)
+    else:
+        # OLD BEHAVIOR: Just clamp to max_abs, keep data-adaptive range
+        centroids = centroids.clamp(min=max_abs * 0.001, max=max_abs)
 
     # Ensure strictly increasing
     for i in range(1, half):
         if centroids[i] <= centroids[i - 1]:
-            centroids[i] = centroids[i - 1] + max_abs * 0.01
+            centroids[i] = centroids[i - 1] + max_abs * 0.001
 
     # Build symmetric LUT
     lut = torch.cat([-centroids.flip(0), centroids])
     lut = snap_to_fp16(lut)
 
     return ('G_kmeans', lut)
+
+
+def generate_lut_family_H_symkmeans(
+    lut_size: int,
+    Q_flat: torch.Tensor,      # 1D tensor, already flattened & filtered
+    S_flat: torch.Tensor,      # 1D tensor, same shape as Q_flat
+    max_abs: float,
+    eps: float = 1e-4,
+    max_iters: int = 30,
+    max_samples: int = 1_000_000,
+    verbose: bool = False,
+) -> Tuple[str, torch.Tensor, Dict]:
+    """Family H: Symmetric k-means (abs-space mirrored) - GLOBAL.
+
+    Runs k-means on |Q| to find K/2 positive centers (8 for LUT16),
+    then mirrors to create symmetric LUT. TRAINABLE-COMPATIBLE.
+
+    Args:
+        lut_size: Number of LUT entries (e.g., 16)
+        Q_flat: 1D tensor of Q_eff values (pre-flattened, valid entries only)
+        S_flat: 1D tensor of scale values (same shape as Q_flat)
+        max_abs: Maximum absolute value for LUT
+        eps: Threshold for small scales (unused here, for API consistency)
+        max_iters: Maximum Lloyd iterations
+        max_samples: Maximum samples to use (for speed)
+        verbose: Print diagnostic info
+
+    Returns:
+        (name, lut_tensor, stats_dict)
+    """
+    # Input validation
+    assert Q_flat.dim() == 1 and S_flat.dim() == 1, \
+        f"H expects 1D tensors, got Q_flat.dim()={Q_flat.dim()}, S_flat.dim()={S_flat.dim()}"
+    assert Q_flat.numel() == S_flat.numel(), \
+        f"Shape mismatch: Q_flat={Q_flat.numel()}, S_flat={S_flat.numel()}"
+
+    # Compute x = |Q| clamped to [0, max_abs]
+    x = Q_flat.abs().clamp(0, max_abs).float()
+
+    # Compute weights w = S^2 (matches weighted MSE selection metric)
+    w = S_flat.abs().float() ** 2
+
+    # Save first samples for diagnostics (before sampling)
+    first_samples = Q_flat[:5].tolist() if Q_flat.numel() >= 5 else Q_flat.tolist()
+
+    # Seeded sampling for reproducibility and avoiding layer-order bias
+    if x.numel() > max_samples:
+        g = torch.Generator().manual_seed(42)
+        perm = torch.randperm(x.numel(), generator=g)[:max_samples]
+        x, w = x[perm], w[perm]
+
+    # Number of positive centers (8 for LUT16)
+    K = lut_size // 2
+
+    # min_pos = 1/32 of max_abs (FP4-classic at max_abs=2.0 gives 0.0625)
+    min_pos = max_abs * 0.03125
+    small_delta = min_pos / 8
+
+    # Initialize with quantiles (good starting point)
+    centers = torch.quantile(x, torch.linspace(0.05, 0.95, K))
+
+    # Headroom-aware upper caps: each center has room for bump without exceeding max_abs
+    # upper_caps[i] = max_abs - (K-1-i)*small_delta
+    upper_caps = max_abs - torch.arange(K - 1, -1, -1).float() * small_delta
+
+    # Clamp and sort centers (use element-wise min/max for mixed float/tensor)
+    centers = torch.maximum(centers, torch.tensor(min_pos))
+    centers = torch.minimum(centers, upper_caps)
+    centers, _ = centers.sort()
+
+    # De-duplicate: ensure strictly increasing after init
+    for i in range(1, K):
+        if centers[i] <= centers[i - 1]:
+            centers[i] = min(centers[i - 1] + small_delta, upper_caps[i])
+
+    # Lloyd's algorithm (weighted 1D k-means on absolute values)
+    converged_iter = max_iters
+    for iteration in range(max_iters):
+        # Assignment: find nearest center for each point
+        dists = (x.unsqueeze(-1) - centers.unsqueeze(0)).abs()
+        assign = dists.argmin(dim=-1)
+
+        # Update: weighted mean for each cluster
+        new_centers = torch.zeros_like(centers)
+        for ci in range(K):
+            mask = (assign == ci)
+            w_sum = w[mask].sum() if mask.sum() > 0 else 0
+
+            if mask.sum() > 0 and w_sum > 0:
+                new_centers[ci] = (x[mask] * w[mask]).sum() / w_sum
+            else:
+                # Re-seed empty cluster to percentile target (deterministic)
+                # Target percentile for cluster ci: p = (ci+1) / (K+1)
+                p = (ci + 1) / (K + 1)
+                new_centers[ci] = max(min(torch.quantile(x, p).item(), upper_caps[ci].item()), min_pos)
+
+        # Re-apply headroom-aware de-dup after update
+        new_centers = torch.maximum(new_centers, torch.tensor(min_pos))
+        new_centers = torch.minimum(new_centers, upper_caps)
+        new_centers, _ = new_centers.sort()
+        for i in range(1, K):
+            if new_centers[i] <= new_centers[i - 1]:
+                new_centers[i] = min(new_centers[i - 1] + small_delta, upper_caps[i])
+
+        # Check convergence
+        if (new_centers - centers).abs().max() < 1e-6:
+            converged_iter = iteration + 1
+            centers = new_centers
+            break
+        centers = new_centers
+
+    # Final sort (should already be sorted, but ensure)
+    centers, _ = centers.sort()
+
+    # CRITICAL: Force endpoints for trainable-compat LUT
+    # - centers[0] = min_pos (smallest representable positive value)
+    # - centers[-1] = max_abs (must span full range for LUT training)
+    centers[0] = min_pos
+    centers[-1] = max_abs
+
+    # Re-enforce strict increasing after forcing endpoints
+    for i in range(1, K - 1):  # Skip first and last (they're fixed)
+        if centers[i] <= centers[i - 1]:
+            centers[i] = centers[i - 1] + small_delta
+        if centers[i] >= centers[i + 1]:
+            # Squeeze towards midpoint if collision with next
+            centers[i] = (centers[i - 1] + centers[i + 1]) / 2
+
+    centers_raw = centers.clone()
+
+    # Build symmetric LUT: [-c7, -c6, ..., -c0, c0, c1, ..., c7]
+    lut = torch.cat([-centers.flip(0), centers])
+
+    # Snap to FP16 (handles monotonicity repair and symmetric mirroring)
+    lut = snap_to_fp16(lut)
+
+    # Extract FP16 centers (positive half)
+    centers_fp16 = lut[K:].tolist()
+
+    # Compute stats
+    min_gap = float('inf')
+    for i in range(1, len(lut)):
+        gap = (lut[i] - lut[i - 1]).item()
+        if gap < min_gap:
+            min_gap = gap
+
+    # Saturation percentage
+    pct_saturated = ((Q_flat.abs() >= max_abs).float().mean().item()) * 100
+
+    stats = {
+        'centers_raw': centers_raw.tolist(),
+        'centers_fp16': centers_fp16,
+        'min_gap': min_gap,
+        'pct_saturated': pct_saturated,
+        'kmeans_iters': converged_iter,
+        'first_samples': first_samples,
+        'n_samples': x.numel(),
+    }
+
+    return ('H_symkmeans', lut, stats)
+
+
+def aggregate_layer_data_1d(
+    layer_data: dict,
+    lut_size: int,
+    eps: float = 1e-4,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Aggregate Q_eff and S from all layers with given LUT size.
+
+    Returns 1D tensors (pre-flattened, valid entries only).
+
+    Args:
+        layer_data: Dict mapping name -> (W_eff_old, S, Q_eff_target, lut_size)
+        lut_size: LUT size to filter by
+        eps: Threshold for valid scales
+
+    Returns:
+        (Q_flat, S_flat) or (None, None) if no matching layers
+    """
+    all_Q = []
+    all_S = []
+
+    for name, (W_eff_old, S, Q_eff_target, ls) in layer_data.items():
+        if ls != lut_size:
+            continue
+        S_flat = S.flatten().abs()
+        Q_flat = Q_eff_target.flatten()
+        valid_mask = S_flat >= eps
+        all_Q.append(Q_flat[valid_mask])
+        all_S.append(S_flat[valid_mask])
+
+    if all_Q:
+        return torch.cat(all_Q), torch.cat(all_S)
+    return None, None
 
 
 def compute_weighted_mse(
@@ -779,7 +991,9 @@ def parse_args():
     parser.add_argument('--scope', choices=['mlp', 'attn', 'all'], default='all',
                         help='Layer scope to modify (default: all)')
     parser.add_argument('--families', default='A,B,C,D',
-                        help='Comma-separated family codes: A=uniform, B=dense-center, C=heavy-tail, D=quantile')
+                        help='Comma-separated family codes: '
+                             'A=uniform, B=dense-center, C=heavy-tail, D=quantile, '
+                             'G=kmeans (eval-only), H=symmetric-kmeans (trainable)')
     parser.add_argument('--max-abs', type=float, default=1.0,
                         help='Max absolute LUT value (default: 1.0)')
     parser.add_argument('--dry-run', action='store_true',
@@ -965,6 +1179,58 @@ def main():
                     print(f"    WARNING: {cand_name} FP16 validation failed: {validation}")
                 candidates_by_size[lut_size].append((cand_name, lut))
                 print(f"    LUT{lut_size}: Added {cand_name} (unique={validation['unique_fp16']})")
+
+    # Family G: Weighted k-means - asymmetric 16-center (EVAL ONLY, not trainable-compatible)
+    # NOTE: G uses same aggregation as D (no pre-filtering) for consistency
+    if 'G' in families:
+        print("  Generating k-means LUTs (family G) [eval-only, asymmetric]...")
+        for lut_size in lut_sizes:
+            # Aggregate Q_eff AND S from all layers (same as D, no pre-filtering)
+            all_Q_eff = []
+            all_S = []
+            for layer_name, (W_eff_old, S, Q_eff_target, ls) in layer_data.items():
+                if ls == lut_size:
+                    all_Q_eff.append(Q_eff_target.flatten())
+                    all_S.append(S.flatten())
+
+            if all_Q_eff:
+                combined_Q_eff = torch.cat(all_Q_eff)
+                combined_S = torch.cat(all_S)
+                # G expects 2D input, reshape to [N, 1]
+                cand_name, lut = generate_lut_family_G(
+                    lut_size,
+                    combined_Q_eff.unsqueeze(1),  # [N, 1]
+                    combined_S.unsqueeze(1),      # [N, 1]
+                    args.max_abs, eps=args.eps
+                )
+                validation = validate_lut_fp16(lut)
+                if not validation['valid']:
+                    print(f"    WARNING: {cand_name} FP16 invalid")
+                candidates_by_size[lut_size].append((cand_name, lut))
+                print(f"    LUT{lut_size}: Added {cand_name}")
+
+    # Family H: Symmetric k-means - 8-center mirrored (TRAINABLE-COMPATIBLE)
+    if 'H' in families:
+        print("  Generating symmetric k-means LUTs (family H) [trainable-compatible]...")
+        for lut_size in lut_sizes:
+            Q_agg, S_agg = aggregate_layer_data_1d(layer_data, lut_size, args.eps)
+            if Q_agg is not None:
+                # H expects 1D input (already aggregated)
+                cand_name, lut, stats = generate_lut_family_H_symkmeans(
+                    lut_size, Q_agg, S_agg,
+                    args.max_abs, eps=args.eps, verbose=args.verbose
+                )
+                validation = validate_lut_fp16(lut)
+                if not validation['valid']:
+                    print(f"    WARNING: {cand_name} FP16 invalid")
+                candidates_by_size[lut_size].append((cand_name, lut))
+
+                # Diagnostic output
+                print(f"    LUT{lut_size}: Added {cand_name}")
+                print(f"      Centers (8): [{', '.join(f'{c:.4f}' for c in stats['centers_fp16'])}]")
+                print(f"      Min gap: {stats['min_gap']:.6f}, Saturated: {stats['pct_saturated']:.1f}%")
+                if args.verbose and 'first_samples' in stats:
+                    print(f"      First 5 Q samples: {stats['first_samples'][:5]}")
 
     # Evaluate candidates
     print("\nEvaluating candidates...")

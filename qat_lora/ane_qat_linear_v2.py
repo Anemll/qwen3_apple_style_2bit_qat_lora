@@ -775,7 +775,13 @@ class AnemllQATLinearV2(nn.Module):
         # u columns and vh rows are already unit-norm from SVD!
         self.scale_A.data = u[:, :r].to(self.weight.dtype)
         self.scale_B.data = vh[:r, :].to(self.weight.dtype)
-        self.rank_magnitude.data = s[:r].to(self.weight.dtype)
+
+        # Floor small singular values to prevent dead ranks
+        # Minimum is 1% of largest singular value (or 0.01 absolute minimum)
+        s_r = s[:r]
+        min_magnitude = max(0.01 * s_r[0].item(), 0.01)
+        s_floored = s_r.clamp(min=min_magnitude)
+        self.rank_magnitude.data = s_floored.to(self.weight.dtype)
 
     def _get_normalized_scales(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return normalized scale directions + per-rank magnitude.
