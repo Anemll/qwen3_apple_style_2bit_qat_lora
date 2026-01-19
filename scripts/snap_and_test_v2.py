@@ -118,6 +118,29 @@ def main():
             print(f"[Auto-config] Found {config_path}")
             break
 
+    # Check for LUT selection stats file (from select_best_lut_per_layer.py)
+    # Try multiple patterns: stats.json, layer_lut_selection.json, checkpoint_stats.json
+    lut_stats = {}
+    for stats_name in ['stats.json', 'layer_lut_selection.json', f'{ckpt_path.stem}_stats.json']:
+        stats_path = ckpt_path.parent / stats_name
+        if stats_path.exists():
+            with open(stats_path) as f:
+                lut_stats = json.load(f)
+            print(f"[LUT Stats] Found {stats_path}")
+            if lut_stats.get('activation_cache'):
+                print(f"  Activation cache: {lut_stats['activation_cache']}")
+            if lut_stats.get('metric'):
+                print(f"  Metric: {lut_stats['metric']}")
+            if lut_stats.get('families'):
+                print(f"  Families: {lut_stats['families']}")
+            if lut_stats.get('improved_layers') is not None and lut_stats.get('total_layers'):
+                print(f"  Improved: {lut_stats['improved_layers']}/{lut_stats['total_layers']} layers")
+            if lut_stats.get('total_score') is not None and lut_stats.get('total_original_score') is not None:
+                print(f"  Total {lut_stats.get('metric', 'score').upper()}: {lut_stats['total_score']:.4e} (orig: {lut_stats['total_original_score']:.4e})")
+                if lut_stats.get('score_reduction_pct') is not None:
+                    print(f"  Reduction: {lut_stats['score_reduction_pct']:.2f}%")
+            break
+
     # Use auto-detected values if not explicitly set (check if using defaults)
     # Support both naming conventions: lut_bits/mlp_lut_bits, scale_rank/mlp_scale_rank
     if auto_config:

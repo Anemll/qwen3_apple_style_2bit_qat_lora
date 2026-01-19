@@ -494,6 +494,18 @@ def main():
         from scripts.tighten_q import tighten_q_layer
 
         print("Freezing Q (quantizing weights to LUT indices)...")
+
+        # Print LUT values once (all layers use the same default LUT)
+        first_lut_printed = False
+        for name, module in model.named_modules():
+            if isinstance(module, AnemllQATLinearV2) and not first_lut_printed:
+                lut = module.lut.cpu()
+                lut_size = lut.numel()
+                lut_str = ", ".join([f"{v:+.4f}" for v in lut.tolist()])
+                print(f"  Default LUT ({lut_size} entries): [{lut_str}]")
+                first_lut_printed = True
+                break
+
         if args.verbose:
             # Verbose mode: show LUT info and MSE per layer
             frozen = 0
@@ -605,6 +617,8 @@ def main():
     layer_selections = {}
     family_counts = defaultdict(int)
     improved_layers = 0
+    total_score = 0.0  # Sum of all best scores
+    total_original_score = 0.0  # Sum of all original scores
 
     # Helper function to find activation variance for a layer
     def get_activation_var(name):
@@ -726,9 +740,11 @@ def main():
                 'all_candidates': all_results,
             }
 
-            # Count family
+            # Count family and track totals
             family_code = best_name[0] if best_name else '?'
             family_counts[family_code] += 1
+            total_score += best_score
+            total_original_score += original_score
 
             if improved:
                 improved_layers += 1
@@ -844,9 +860,11 @@ def main():
                 'all_candidates': all_results,
             }
 
-            # Count family
+            # Count family and track totals
             family_code = best_name[0] if best_name else '?'
             family_counts[family_code] += 1
+            total_score += best_score
+            total_original_score += original_score
 
             if improved:
                 improved_layers += 1
@@ -880,6 +898,13 @@ def main():
     print(f"Total layers:    {total_layers}")
     print(f"Improved layers: {improved_layers} ({100*improved_layers/total_layers:.1f}%)")
     print()
+    print(f"Total {args.metric.upper()}:")
+    print(f"  Original:  {total_original_score:.6e}")
+    print(f"  Optimized: {total_score:.6e}")
+    if total_original_score > 0:
+        reduction = (total_original_score - total_score) / total_original_score * 100
+        print(f"  Reduction: {reduction:.2f}%")
+    print()
     print("LUT Family Distribution:")
     for family in sorted(family_counts.keys()):
         count = family_counts[family]
@@ -905,8 +930,14 @@ def main():
             'scope': args.scope,
             'metric': args.metric,
             'max_abs': 'auto' if args.auto_max_abs else args.max_abs,
+            'activation_cache': str(args.activation_cache) if args.activation_cache else None,
+            'config': args.config,
+            'group_size': args.group_size,
             'total_layers': total_layers,
             'improved_layers': improved_layers,
+            'total_score': total_score,
+            'total_original_score': total_original_score,
+            'score_reduction_pct': (total_original_score - total_score) / total_original_score * 100 if total_original_score > 0 else 0,
             'family_counts': dict(family_counts),
             'layer_selections': layer_selections,
         }
