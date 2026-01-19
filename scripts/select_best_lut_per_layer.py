@@ -356,6 +356,8 @@ def parse_args():
     parser.add_argument('--scale-lut', action='store_true',
                         help='Scale G/H k-means LUTs to fill [0, max_abs] range (new behavior). '
                              'Without this flag, LUTs use data-adaptive range (old behavior).')
+    parser.add_argument('--no-tighten', action='store_true',
+                        help='Skip tightening Q after FP16 snap (for --from-scratch mode)')
 
     args = parser.parse_args()
 
@@ -394,6 +396,8 @@ def main():
     print(f"Max abs:     {'auto (p99.9)' if args.auto_max_abs else args.max_abs}")
     print(f"Group size:  {args.group_size}")
     print(f"Scale LUT:   {'enabled (new)' if args.scale_lut else 'disabled (old/data-adaptive)'}")
+    if args.from_scratch:
+        print(f"Tighten Q:   {'disabled (--no-tighten)' if args.no_tighten else 'enabled'}")
     if args.activation_cache:
         print(f"Act cache:   {args.activation_cache}")
     print()
@@ -555,24 +559,27 @@ def main():
         print(f"  Snapped {mags_snapped} layers")
 
         # Step 3: Tighten Q (recalculate to match snapped scales)
-        print("Tightening Q (recalculating to match snapped scales)...")
-        tightened = 0
-        tighten_mse_old_sum = 0.0
-        tighten_mse_new_sum = 0.0
-        for name, module in model.named_modules():
-            if isinstance(module, AnemllQATLinearV2) and module._Q is not None:
-                # Get W_ref for this layer
-                W_ref = original_weights.get(name)
-                if W_ref is None:
-                    # Try alternate key format
-                    W_ref = original_weights.get(f"{name}.weight")
-                if W_ref is not None:
-                    result = tighten_q_layer(module, W_ref, clamp_q=True)
-                    tighten_mse_old_sum += result['mse_old']
-                    tighten_mse_new_sum += result['mse_new']
-                    tightened += 1
-        print(f"  Tightened Q for {tightened} layers")
-        print(f"  Total MSE (sum): before={tighten_mse_old_sum:.6e}, after={tighten_mse_new_sum:.6e}")
+        if args.no_tighten:
+            print("Skipping Tighten Q (--no-tighten)")
+        else:
+            print("Tightening Q (recalculating to match snapped scales)...")
+            tightened = 0
+            tighten_mse_old_sum = 0.0
+            tighten_mse_new_sum = 0.0
+            for name, module in model.named_modules():
+                if isinstance(module, AnemllQATLinearV2) and module._Q is not None:
+                    # Get W_ref for this layer
+                    W_ref = original_weights.get(name)
+                    if W_ref is None:
+                        # Try alternate key format
+                        W_ref = original_weights.get(f"{name}.weight")
+                    if W_ref is not None:
+                        result = tighten_q_layer(module, W_ref, clamp_q=True)
+                        tighten_mse_old_sum += result['mse_old']
+                        tighten_mse_new_sum += result['mse_new']
+                        tightened += 1
+            print(f"  Tightened Q for {tightened} layers")
+            print(f"  Total MSE (sum): before={tighten_mse_old_sum:.6e}, after={tighten_mse_new_sum:.6e}")
 
     # Load checkpoint (if provided)
     if args.checkpoint:
