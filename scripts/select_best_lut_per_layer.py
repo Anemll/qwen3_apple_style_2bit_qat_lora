@@ -351,8 +351,8 @@ def parse_args():
                         help='Number of parallel workers (default: 1, sequential)')
     parser.add_argument('--eps', type=float, default=1e-4,
                         help='Epsilon for safe division (default: 1e-4)')
-    parser.add_argument('--group-size', type=int, default=32,
-                        help='Group size for scale initialization (default: 32, must match init_model_v2.py)')
+    parser.add_argument('--group-size', type=int, default=16,
+                        help='Group size for scale initialization (default: 16, must match init_model_v2.py)')
     parser.add_argument('--scale-lut', action='store_true',
                         help='Scale G/H k-means LUTs to fill [0, max_abs] range (new behavior). '
                              'Without this flag, LUTs use data-adaptive range (old behavior).')
@@ -557,6 +557,8 @@ def main():
         # Step 3: Tighten Q (recalculate to match snapped scales)
         print("Tightening Q (recalculating to match snapped scales)...")
         tightened = 0
+        tighten_mse_old_sum = 0.0
+        tighten_mse_new_sum = 0.0
         for name, module in model.named_modules():
             if isinstance(module, AnemllQATLinearV2) and module._Q is not None:
                 # Get W_ref for this layer
@@ -565,9 +567,12 @@ def main():
                     # Try alternate key format
                     W_ref = original_weights.get(f"{name}.weight")
                 if W_ref is not None:
-                    tighten_q_layer(module, W_ref, clamp_q=True)
+                    result = tighten_q_layer(module, W_ref, clamp_q=True)
+                    tighten_mse_old_sum += result['mse_old']
+                    tighten_mse_new_sum += result['mse_new']
                     tightened += 1
         print(f"  Tightened Q for {tightened} layers")
+        print(f"  Total MSE (sum): before={tighten_mse_old_sum:.6e}, after={tighten_mse_new_sum:.6e}")
 
     # Load checkpoint (if provided)
     if args.checkpoint:

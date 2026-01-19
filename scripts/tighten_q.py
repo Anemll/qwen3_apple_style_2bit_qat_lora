@@ -519,6 +519,8 @@ def main():
         total_changed = sum(r['num_changed'] for r in qc_results.values())
         total_params = sum(r['total'] for r in qc_results.values())
         avg_mse_delta = sum(r['mse_delta'] for r in qc_results.values()) / len(qc_results)
+        total_mse_old = sum(r['mse_old'] for r in qc_results.values())
+        total_mse_new = sum(r['mse_new'] for r in qc_results.values())
 
         print(f"\n{'='*60}")
         print("SUMMARY")
@@ -526,6 +528,12 @@ def main():
         print(f"Layers tightened: {len(qc_results)}")
         print(f"Total Q changed:  {total_changed:,} / {total_params:,} ({100*total_changed/total_params:.2f}%)")
         print(f"Avg MSE delta:    {avg_mse_delta:+.2e}")
+        print(f"Total MSE (sum):")
+        print(f"  Before: {total_mse_old:.6e}")
+        print(f"  After:  {total_mse_new:.6e}")
+        if total_mse_old > 0:
+            reduction = (total_mse_old - total_mse_new) / total_mse_old * 100
+            print(f"  Change: {reduction:+.2f}%")
 
         # Warn if high saturation
         high_sat_layers = [n for n, r in qc_results.items()
