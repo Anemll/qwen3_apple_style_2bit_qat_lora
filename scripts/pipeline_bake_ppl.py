@@ -336,7 +336,8 @@ def check_and_snap_best(
         return False
 
     print(f"\n  {'='*50}")
-    print(f"  NEW BEST PPL: {current_ppl:.2f} (was {prev_best_ppl:.2f if prev_best_ppl else 'N/A'})")
+    was_str = f"{prev_best_ppl:.2f}" if prev_best_ppl is not None else "N/A"
+    print(f"  NEW BEST PPL: {current_ppl:.2f} (was {was_str})")
     print(f"  {'='*50}")
 
     # Snap the checkpoint
