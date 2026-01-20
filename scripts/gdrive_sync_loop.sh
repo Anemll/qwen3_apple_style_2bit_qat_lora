@@ -6,6 +6,7 @@
 # Usage:
 #   ./scripts/gdrive_sync_loop.sh runs/my_training
 #   ./scripts/gdrive_sync_loop.sh runs/my_training --interval 600
+#   ./scripts/gdrive_sync_loop.sh runs/my_training --best  # Upload best_state_dict.pt only
 #   INTERVAL_SEC=300 ./scripts/gdrive_sync_loop.sh runs/my_training
 #
 # Environment variables:
@@ -32,12 +33,17 @@ cd "$SCRIPT_DIR"
 SYNC_DIR="${1:-${SYNC_DIR:-}}"
 shift 2>/dev/null || true
 
-# Parse optional --interval flag
+# Parse optional flags
+BEST_ONLY=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --interval|-i)
             INTERVAL_SEC="$2"
             shift 2
+            ;;
+        --best|-b)
+            BEST_ONLY="1"
+            shift
             ;;
         *)
             echo "Unknown option: $1"
@@ -53,11 +59,16 @@ PY_BIN="${PY_BIN:-python3}"
 
 # Validate
 if [[ -z "$SYNC_DIR" ]]; then
-    echo "Usage: $0 <sync_dir> [--interval SECONDS]"
+    echo "Usage: $0 <sync_dir> [--interval SECONDS] [--best]"
+    echo ""
+    echo "Options:"
+    echo "  --interval, -i  Seconds between syncs (default: 300)"
+    echo "  --best, -b      Upload best_state_dict.pt and related files only"
     echo ""
     echo "Examples:"
     echo "  $0 runs/my_training"
     echo "  $0 runs/my_training --interval 600"
+    echo "  $0 runs/my_training --best  # Upload best checkpoint only"
     echo "  SYNC_DIR=runs/foo INTERVAL_SEC=120 $0"
     exit 1
 fi
@@ -89,6 +100,10 @@ trap cleanup EXIT INT TERM
 
 # Build command
 CMD=( "$PY_BIN" scripts/gdrive_sync.py up "$SYNC_DIR" )
+if [[ -n "$BEST_ONLY" ]]; then
+    # Upload only best checkpoint and related files
+    CMD+=( --only "best_state_dict.pt" --only "config.json" --only "v2_config.json" --only "ppl_state.json" )
+fi
 
 # Print startup info
 echo "=========================================="
@@ -96,6 +111,7 @@ echo "Google Drive Sync Loop"
 echo "=========================================="
 echo "Sync dir:  $SYNC_DIR"
 echo "Interval:  ${INTERVAL_SEC}s"
+[[ -n "$BEST_ONLY" ]] && echo "Mode:      BEST ONLY (best_state_dict.pt + configs)"
 echo "Log file:  $LOG_FILE"
 echo "Lock:      $LOCKDIR"
 echo "Command:   ${CMD[*]}"
