@@ -1422,6 +1422,8 @@ def replace_linear_layers_with_optimal_luts(
 def freeze_quantized_weights(
     model: nn.Module,
     verbose: bool = True,
+    detailed: bool = False,
+    original_weights: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Dict[str, Any]:
     """
     Freeze Q (quantized weight lookup tables) for all V2 layers.
@@ -1438,31 +1440,89 @@ def freeze_quantized_weights(
     Args:
         model: Model with AnemllQATLinearV2 layers
         verbose: Print freeze progress
+        detailed: Show LUT values and MSE per layer (requires original_weights)
+        original_weights: Optional dict of original FP32 weights for MSE computation
 
     Returns:
         Dict with freeze stats
     """
-    from qat_lora.ane_qat_linear_v2 import freeze_Q_all
+    from qat_lora.ane_qat_linear_v2 import AnemllQATLinearV2
 
     if verbose:
         print(f"\n[Step 5] Freezing Q (quantized weight LUTs)")
 
     t0 = time.time()
-    frozen_count = freeze_Q_all(model, verbose=False)
-    elapsed = time.time() - t0
 
-    # Verify freeze
-    from qat_lora.ane_qat_linear_v2 import AnemllQATLinearV2
+    # Print LUT values once (all layers use the same default LUT per type)
+    if detailed:
+        first_mlp_lut_printed = False
+        first_attn_lut_printed = False
+        for name, module in model.named_modules():
+            if isinstance(module, AnemllQATLinearV2):
+                lut = module.lut.cpu()
+                lut_size = lut.numel()
+                is_mlp = 'mlp' in name.lower()
+
+                if is_mlp and not first_mlp_lut_printed:
+                    lut_str = ", ".join([f"{v:+.4f}" for v in lut.tolist()])
+                    print(f"  MLP LUT ({lut_size} entries): [{lut_str}]")
+                    first_mlp_lut_printed = True
+                elif not is_mlp and not first_attn_lut_printed:
+                    lut_str = ", ".join([f"{v:+.4f}" for v in lut.tolist()])
+                    print(f"  Attn LUT ({lut_size} entries): [{lut_str}]")
+                    first_attn_lut_printed = True
+
+                if first_mlp_lut_printed and first_attn_lut_printed:
+                    break
+
+    # Freeze Q for all layers, computing MSE if detailed
+    frozen_count = 0
     frozen_verified = 0
     unfrozen = 0
+    total_mse = 0.0
+    layer_stats = []
+
     for name, module in model.named_modules():
         if isinstance(module, AnemllQATLinearV2):
+            # Freeze Q
+            module.freeze_Q()
+            frozen_count += 1
+
             if module._Q is not None:
                 frozen_verified += 1
+
+                # Compute MSE if detailed mode and original weights provided
+                if detailed and original_weights is not None:
+                    W_ref = original_weights.get(name)
+                    if W_ref is None:
+                        W_ref = original_weights.get(f"{name}.weight")
+
+                    if W_ref is not None:
+                        # Compute W_effective after freeze
+                        S = module._compute_full_scales()
+                        W_eff = module._Q * S
+
+                        # Ensure W_ref is on same device
+                        W_ref_dev = W_ref.to(W_eff.device)
+                        mse = ((W_eff - W_ref_dev) ** 2).mean().item()
+                        mae = (W_eff - W_ref_dev).abs().mean().item()
+                        total_mse += mse
+
+                        # LUT range
+                        lut_min = module.lut.min().item()
+                        lut_max = module.lut.max().item()
+
+                        # Short layer name for display
+                        short_name = name.replace('model.layers.', '').replace('.self_attn.', '.').replace('.mlp.', '.')
+                        print(f"  {short_name:40s} LUT=[{lut_min:+.4f}, {lut_max:+.4f}] MSE={mse:.2e} MAE={mae:.2e}")
+
+                        layer_stats.append({'name': name, 'mse': mse, 'mae': mae})
             else:
                 unfrozen += 1
                 if verbose:
                     print(f"  [WARN] Not frozen: {name}")
+
+    elapsed = time.time() - t0
 
     stats = {
         'frozen_count': frozen_count,
@@ -1471,9 +1531,15 @@ def freeze_quantized_weights(
         'time_seconds': elapsed,
     }
 
+    if detailed and layer_stats:
+        stats['total_mse'] = total_mse
+        stats['layer_count'] = len(layer_stats)
+
     if verbose:
         print(f"  Frozen: {frozen_count} layers")
         print(f"  Verified: {frozen_verified}/{frozen_verified + unfrozen}")
+        if detailed and layer_stats:
+            print(f"  Total MSE (sum): {total_mse:.6e}")
         if unfrozen > 0:
             print(f"  [ERROR] {unfrozen} layers failed to freeze!")
 
@@ -1901,6 +1967,7 @@ def init_v2_model(
     search_group_sizes: Optional[List[int]] = None,
     search_lut: bool = False,
     verbose: bool = True,
+    detailed: bool = False,
 ) -> Dict[str, Any]:
     """
     Complete pipeline to initialize a V2 QAT model from scratch.
@@ -1922,6 +1989,7 @@ def init_v2_model(
         search_group_sizes: List of group sizes to test per tensor (e.g., [128, 64, 32, 16])
         search_lut: Search for optimal LUT per tensor (only for 4-bit layers)
         verbose: Print progress
+        detailed: Show LUT values and MSE per layer during freeze step
 
     Returns:
         Dict with all metrics and paths
@@ -1968,6 +2036,17 @@ def init_v2_model(
         dtype=torch.float32,  # Always FP32 for init
         verbose=verbose,
     )
+
+    # Capture original weights if detailed output is requested
+    original_weights = {}
+    if detailed:
+        if verbose:
+            print(f"  Capturing original FP32 weights for detailed output...")
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear):
+                original_weights[name] = module.weight.data.float().cpu().clone()
+        if verbose:
+            print(f"  Captured {len(original_weights)} linear layer weights")
 
     # Step 3: Create V2 configs
     # NOTE: Use defaults (force_positive_scales=False, magnitude_activation='identity')
@@ -2121,6 +2200,8 @@ def init_v2_model(
     freeze_stats = freeze_quantized_weights(
         model=model,
         verbose=verbose,
+        detailed=detailed,
+        original_weights=original_weights if detailed else None,
     )
     metrics['steps']['freeze'] = freeze_stats
 
@@ -2363,6 +2444,8 @@ Examples:
     # Other options
     parser.add_argument('--quiet', '-q', action='store_true',
                         help='Minimal output')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                        help='Show detailed LUT values and MSE per layer during freeze')
 
     # List presets
     parser.add_argument('--list-presets', action='store_true',
@@ -2436,6 +2519,7 @@ Examples:
             search_group_sizes=search_group_sizes,
             search_lut=args.search_lut,
             verbose=not args.quiet,
+            detailed=args.verbose,
         )
 
         return 0 if metrics.get('steps', {}).get('validate', {}).get('passed', True) else 1
