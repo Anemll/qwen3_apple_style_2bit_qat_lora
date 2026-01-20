@@ -943,6 +943,10 @@ def main():
                         help="Delete raw checkpoints after successful bake+ppl")
     parser.add_argument("--best", action="store_true",
                         help="Process best_state_dict.pt (force download, md5 dedup, bake, ppl)")
+    parser.add_argument("--list", action="store_true",
+                        help="List all checkpoint records (steps and best entries)")
+    parser.add_argument("--delete", type=str, metavar="ENTRY",
+                        help="Delete a record by step number (e.g., '100') or best md5 (e.g., 'best_abc12')")
 
     args = parser.parse_args()
 
