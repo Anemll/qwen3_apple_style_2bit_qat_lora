@@ -535,7 +535,13 @@ def force_download_best(run_name: str, local_dir: Path, timeout: int = 600) -> O
         print(f"  [error] Download claimed success but file missing")
         return None
 
-    print(f"  [download] Done: {local_best.stat().st_size / 1e6:.1f} MB")
+    file_size = local_best.stat().st_size
+    if file_size < 1000:  # Less than 1KB is definitely corrupt/empty
+        print(f"  [error] Downloaded file is too small ({file_size} bytes) - likely missing on GDrive")
+        local_best.unlink()  # Remove corrupt file
+        return None
+
+    print(f"  [download] Done: {file_size / 1e6:.1f} MB")
     return local_best
 
 
@@ -980,6 +986,130 @@ def main():
     state["run"] = run_name
     state["config"] = args.config
     state["dtype"] = args.dtype
+
+    # Handle --list: show all records with details
+    if args.list:
+        entries = state.get("entries", {})
+        best_entries = state.get("best_entries", {})
+        snapped_best = state.get("snapped_best")
+
+        print("\n" + "=" * 70)
+        print(f"CHECKPOINT RECORDS FOR: {run_name}")
+        print("=" * 70)
+
+        if entries:
+            print(f"\nStep-based entries ({len(entries)} total):")
+            print("-" * 70)
+            print(f"{'Step':>8} | {'PPL':>10} | {'Baked File':30} | {'Delete Key'}")
+            print("-" * 70)
+            for step_str in sorted(entries.keys(), key=int):
+                e = entries[step_str]
+                ppl = e.get("ppl")
+                ppl_str = f"{ppl:.2f}" if ppl is not None else "-"
+                baked = Path(e.get("baked_path", "")).name if e.get("baked_path") else "-"
+                print(f"{step_str:>8} | {ppl_str:>10} | {baked:30} | {step_str}")
+        else:
+            print("\nNo step-based entries.")
+
+        if best_entries:
+            print(f"\nBest checkpoint entries ({len(best_entries)} total):")
+            print("-" * 70)
+            print(f"{'MD5':>8} | {'PPL':>10} | {'Baked File':30} | {'Delete Key'}")
+            print("-" * 70)
+            for md5_key, e in sorted(best_entries.items(), key=lambda x: x[1].get("ppl", 999)):
+                ppl = e.get("ppl")
+                ppl_str = f"{ppl:.2f}" if ppl is not None else "-"
+                baked = e.get("baked_name", "-")
+                print(f"{md5_key:>8} | {ppl_str:>10} | {baked:30} | best_{md5_key}")
+        else:
+            print("\nNo best checkpoint entries.")
+
+        if snapped_best:
+            print(f"\nSnapped best checkpoint:")
+            print(f"  Source: {snapped_best.get('source', '?')}")
+            print(f"  PPL:    {snapped_best.get('ppl', '?')}")
+            print(f"  File:   {snapped_best.get('snapped_name', '?')}")
+            print(f"  Delete: snapped_best")
+
+        print("\n" + "=" * 70)
+        print("To delete a record:")
+        print("  python scripts/pipeline_bake_ppl.py <run> --delete <key>")
+        print("  e.g., --delete 100        (delete step 100)")
+        print("  e.g., --delete best_abc12 (delete best entry)")
+        print("  e.g., --delete snapped_best (delete snapped best info)")
+        print("=" * 70)
+        return 0
+
+    # Handle --delete: remove a specific record
+    if args.delete:
+        key = args.delete
+        entries = state.get("entries", {})
+        best_entries = state.get("best_entries", {})
+        deleted = False
+
+        # Check if it's a step number
+        if key.isdigit():
+            if key in entries:
+                entry = entries[key]
+                ppl = entry.get("ppl", "?")
+                baked_path = entry.get("baked_path")
+                del entries[key]
+                deleted = True
+                print(f"Deleted step {key} (PPL={ppl})")
+                if baked_path and Path(baked_path).exists():
+                    print(f"  Note: Baked file still exists: {baked_path}")
+                    print(f"  To delete file: rm '{baked_path}'")
+            else:
+                print(f"Error: Step {key} not found in records")
+                return 1
+
+        # Check if it's a best entry (best_XXXXX)
+        elif key.startswith("best_"):
+            md5_key = key[5:]  # Remove "best_" prefix
+            if md5_key in best_entries:
+                entry = best_entries[md5_key]
+                ppl = entry.get("ppl", "?")
+                baked_path = entry.get("baked_path")
+                del best_entries[md5_key]
+                deleted = True
+                print(f"Deleted best entry {md5_key} (PPL={ppl})")
+                if baked_path and Path(baked_path).exists():
+                    print(f"  Note: Baked file still exists: {baked_path}")
+                    print(f"  To delete file: rm '{baked_path}'")
+            else:
+                print(f"Error: Best entry {md5_key} not found in records")
+                return 1
+
+        # Check if it's snapped_best
+        elif key == "snapped_best":
+            if "snapped_best" in state:
+                snapped = state["snapped_best"]
+                snapped_path = snapped.get("snapped_path")
+                del state["snapped_best"]
+                deleted = True
+                print(f"Deleted snapped_best info")
+                if snapped_path and Path(snapped_path).exists():
+                    print(f"  Note: Snapped file still exists: {snapped_path}")
+                    print(f"  To delete file: rm '{snapped_path}'")
+            else:
+                print(f"Error: No snapped_best info in records")
+                return 1
+        else:
+            print(f"Error: Unknown key format '{key}'")
+            print("  Use step number (e.g., '100'), 'best_XXXXX', or 'snapped_best'")
+            return 1
+
+        if deleted:
+            atomic_write_json(state_path, state)
+            print(f"State saved to: {state_path}")
+
+            # Sync to GDrive
+            if not args.local_only:
+                print("Syncing updated state to Google Drive...")
+                if sync_state_to_gdrive(run_name):
+                    print("Done")
+
+        return 0
 
     # Handle --summary
     if args.summary:
