@@ -178,6 +178,188 @@ def sync_state_to_gdrive(run_name: str) -> bool:
         return False
 
 
+def upload_file_to_gdrive(local_path: Path, run_name: str, timeout: int = 600) -> bool:
+    """Upload a single file to Google Drive run folder."""
+    if not local_path.exists():
+        print(f"  [upload] File not found: {local_path}")
+        return False
+
+    file_name = local_path.name
+    cmd = [
+        sys.executable, str(REPO_ROOT / "scripts" / "gdrive_sync.py"),
+        "up", f"runs/{run_name}", "--only", file_name
+    ]
+    try:
+        print(f"  [upload] Uploading {file_name} to GDrive ({local_path.stat().st_size / 1e6:.1f} MB)...")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode == 0:
+            print(f"  [upload] Done: {file_name}")
+            return True
+        else:
+            print(f"  [upload] Failed: {result.stderr[-500:] if result.stderr else 'unknown'}")
+            return False
+    except subprocess.TimeoutExpired:
+        print(f"  [upload] Timed out uploading {file_name}")
+        return False
+    except Exception as e:
+        print(f"  [upload] Error: {e}")
+        return False
+
+
+def find_best_ppl(state: dict) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+    """Find the best (lowest) PPL from all entries.
+
+    Returns:
+        Tuple of (best_ppl, best_source, best_baked_path)
+        - best_ppl: The lowest PPL value, or None if no PPL recorded
+        - best_source: "step_N" or "best_XXXXX" identifying the source
+        - best_baked_path: Path to the baked checkpoint with best PPL
+    """
+    best_ppl = float('inf')
+    best_source = None
+    best_baked_path = None
+
+    # Check step-based entries
+    for step_str, entry in state.get("entries", {}).items():
+        if entry.get("ppl_ok") and entry.get("ppl") is not None:
+            ppl = entry["ppl"]
+            if ppl < best_ppl:
+                best_ppl = ppl
+                best_source = f"step_{step_str}"
+                best_baked_path = entry.get("baked_path")
+
+    # Check best_state_dict entries
+    for md5_key, entry in state.get("best_entries", {}).items():
+        if entry.get("ppl_ok") and entry.get("ppl") is not None:
+            ppl = entry["ppl"]
+            if ppl < best_ppl:
+                best_ppl = ppl
+                best_source = f"best_{md5_key}"
+                best_baked_path = entry.get("baked_path")
+
+    if best_ppl == float('inf'):
+        return None, None, None
+
+    return best_ppl, best_source, best_baked_path
+
+
+def snap_checkpoint(baked_path: Path, config: str, output_path: Path, timeout: int = 300) -> bool:
+    """Snap a baked checkpoint to FP16 for ANE export.
+
+    Args:
+        baked_path: Path to the baked checkpoint
+        config: Config preset (q4_r32, q2a4, etc.)
+        output_path: Path to save the snapped checkpoint
+        timeout: Timeout in seconds
+
+    Returns:
+        True if snapping succeeded, False otherwise
+    """
+    if not baked_path.exists():
+        print(f"  [snap] Baked checkpoint not found: {baked_path}")
+        return False
+
+    print(f"  [snap] Snapping {baked_path.name} → {output_path.name}...")
+    cmd = [
+        sys.executable, str(REPO_ROOT / "scripts" / "snap_and_test_v2.py"),
+        "--checkpoint", str(baked_path),
+        "--config", config,
+        "--fp16",
+        "--no-test",
+        "--output", str(output_path),
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            print(f"  [snap] Failed: {result.stderr[-500:] if result.stderr else 'unknown'}")
+            return False
+    except subprocess.TimeoutExpired:
+        print(f"  [snap] Timed out")
+        return False
+    except Exception as e:
+        print(f"  [snap] Error: {e}")
+        return False
+
+    if not output_path.exists():
+        print(f"  [snap] Output file not created")
+        return False
+
+    print(f"  [snap] Done: {output_path.name} ({output_path.stat().st_size / 1e6:.1f} MB)")
+    return True
+
+
+def check_and_snap_best(
+    state: dict,
+    current_ppl: float,
+    current_source: str,
+    baked_path: Path,
+    local_dir: Path,
+    run_name: str,
+    config: str,
+    upload: bool = True,
+) -> bool:
+    """Check if current PPL is the best, and if so, snap and upload.
+
+    Args:
+        state: Pipeline state dict
+        current_ppl: The PPL just measured
+        current_source: Source identifier (e.g., "step_100" or "best_abc12")
+        baked_path: Path to the baked checkpoint
+        local_dir: Local run directory
+        run_name: Run name for GDrive upload
+        config: Config preset for snapping
+        upload: Whether to upload to GDrive
+
+    Returns:
+        True if this was the new best and was snapped/uploaded
+    """
+    # Find previous best
+    prev_best_ppl, prev_best_source, _ = find_best_ppl(state)
+
+    # Check if current is the new best
+    is_new_best = prev_best_ppl is None or current_ppl < prev_best_ppl
+
+    if not is_new_best:
+        if prev_best_ppl is not None:
+            print(f"  [best] Not the best: {current_ppl:.2f} > {prev_best_ppl:.2f} ({prev_best_source})")
+        return False
+
+    print(f"\n  {'='*50}")
+    print(f"  NEW BEST PPL: {current_ppl:.2f} (was {prev_best_ppl:.2f if prev_best_ppl else 'N/A'})")
+    print(f"  {'='*50}")
+
+    # Snap the checkpoint
+    snapped_name = f"snapped_best_{current_source.replace('step_', 's')}.pt"
+    snapped_path = local_dir / snapped_name
+
+    if not snap_checkpoint(baked_path, config, snapped_path):
+        print(f"  [best] Snapping failed, skipping upload")
+        return False
+
+    # Update state with snapped info
+    state.setdefault("snapped_best", {})
+    state["snapped_best"] = {
+        "source": current_source,
+        "ppl": current_ppl,
+        "baked_path": str(baked_path),
+        "snapped_path": str(snapped_path),
+        "snapped_name": snapped_name,
+        "snap_time": datetime.now().isoformat(),
+    }
+
+    # Upload to GDrive
+    if upload:
+        if upload_file_to_gdrive(snapped_path, run_name):
+            state["snapped_best"]["uploaded"] = True
+            state["snapped_best"]["upload_time"] = datetime.now().isoformat()
+            print(f"  [best] Uploaded snapped checkpoint to GDrive!")
+        else:
+            print(f"  [best] Upload failed (checkpoint saved locally)")
+
+    return True
+
+
 def is_device_busy(device: str = "auto") -> bool:
     """Check if TPU/MPS is busy (other process using it).
 
@@ -470,6 +652,19 @@ def process_best_checkpoint(
     print(f"  [done] PPL={ppl:.2f}, XE={xe:.4f}, time={elapsed:.1f}s")
     print(f"  [done] Saved as: {baked_final.name}")
 
+    # Check if this is the new best PPL and snap/upload if so
+    check_and_snap_best(
+        state=state,
+        current_ppl=ppl,
+        current_source=f"best_{md5_short}",
+        baked_path=baked_final,
+        local_dir=local_dir,
+        run_name=run_name,
+        config=config,
+        upload=not local_only,
+    )
+    atomic_write_json(state_path, state)
+
     # 6) Print summary of all best entries
     print("\n" + "-" * 50)
     print("BEST CHECKPOINTS SUMMARY")
@@ -698,6 +893,16 @@ def print_summary(state: dict):
     print("-" * 70)
     if best_step is not None:
         print(f"Best: {best_step} with PPL = {best_ppl:.2f}")
+
+    # Show snapped best info if available
+    snapped_best = state.get("snapped_best")
+    if snapped_best:
+        print(f"\nSnapped Best Checkpoint:")
+        print(f"  Source:  {snapped_best.get('source', '?')}")
+        print(f"  PPL:     {snapped_best.get('ppl', '?'):.2f}" if snapped_best.get('ppl') else "  PPL:     ?")
+        print(f"  File:    {snapped_best.get('snapped_name', '?')}")
+        uploaded = snapped_best.get('uploaded', False)
+        print(f"  GDrive:  {'uploaded' if uploaded else 'not uploaded'}")
     print("=" * 70)
 
 
@@ -937,11 +1142,24 @@ def main():
             })
             atomic_write_json(state_path, state)
 
+            print(f"  [done] PPL={ppl:.2f}, XE={xe:.4f}, time={elapsed:.1f}s")
+
+            # Check if this is the new best PPL and snap/upload if so
+            check_and_snap_best(
+                state=state,
+                current_ppl=ppl,
+                current_source=f"step_{step}",
+                baked_path=baked_path,
+                local_dir=local_dir,
+                run_name=run_name,
+                config=args.config,
+                upload=not args.local_only,
+            )
+            atomic_write_json(state_path, state)
+
             # Sync state to Google Drive (backup results)
             if not args.local_only:
                 sync_state_to_gdrive(run_name)
-
-            print(f"  [done] PPL={ppl:.2f}, XE={xe:.4f}, time={elapsed:.1f}s")
 
             # 5) Optionally clean up raw checkpoint
             if args.clean_checkpoints and ckpt_path.exists():
