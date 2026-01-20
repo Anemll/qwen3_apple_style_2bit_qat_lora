@@ -566,8 +566,12 @@ def process_best_checkpoint(
     device: str,
     max_chunks: Optional[int] = None,
     local_only: bool = False,
+    test_snap: bool = False,
 ) -> bool:
     """Process best_state_dict.pt with md5-based deduplication.
+
+    Args:
+        test_snap: If True, skip PPL calculation and use fake PPL=99.99 to test snap/upload flow.
 
     Returns True if processed successfully, False otherwise.
     """
@@ -643,17 +647,22 @@ def process_best_checkpoint(
     }
     atomic_write_json(state_path, state)
 
-    # 5) Wait for device and run perplexity
-    wait_for_device(device)
+    # 5) Wait for device and run perplexity (or use fake PPL for test)
+    if test_snap:
+        # Test mode: skip PPL calculation, use fake values
+        ppl, xe, tokens, elapsed = 99.99, 4.6052, 0, 0.0
+        print(f"  [test-snap] Using fake PPL={ppl:.2f} (skipping actual calculation)")
+    else:
+        wait_for_device(device)
 
-    print(f"  [ppl] Running perplexity on {baked_final.name}...")
-    try:
-        ppl, xe, tokens, elapsed, _ = run_ppl(
-            baked_final, config, dtype, device, max_chunks
-        )
-    except Exception as e:
-        print(f"  [error] Perplexity failed: {e}")
-        return False
+        print(f"  [ppl] Running perplexity on {baked_final.name}...")
+        try:
+            ppl, xe, tokens, elapsed, _ = run_ppl(
+                baked_final, config, dtype, device, max_chunks
+            )
+        except Exception as e:
+            print(f"  [error] Perplexity failed: {e}")
+            return False
 
     # Update state after PPL
     best_entries[md5_short].update({
@@ -964,6 +973,8 @@ def main():
                         help="List all checkpoint records (steps and best entries)")
     parser.add_argument("--delete", type=str, metavar="ENTRY",
                         help="Delete a record by step number (e.g., '100') or best md5 (e.g., 'best_abc12')")
+    parser.add_argument("--test-snap", action="store_true",
+                        help="Test snap+upload flow with fake PPL (skip actual PPL calculation)")
 
     args = parser.parse_args()
 
@@ -1127,8 +1138,8 @@ def main():
         print_summary(state)
         return 0
 
-    # Handle --best: process best_state_dict.pt and exit
-    if args.best:
+    # Handle --best or --test-snap: process best_state_dict.pt and exit
+    if args.best or args.test_snap:
         success = process_best_checkpoint(
             run_name=run_name,
             local_dir=local_dir,
@@ -1139,6 +1150,7 @@ def main():
             device=args.device,
             max_chunks=args.max_chunks,
             local_only=args.local_only,
+            test_snap=args.test_snap,
         )
         # Sync state to Google Drive
         if not args.local_only:
