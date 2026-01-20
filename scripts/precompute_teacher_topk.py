@@ -194,7 +194,18 @@ def _chat_text_variants(tokenizer, messages: List[dict], thinking_mode: str) -> 
     - "both": mix of true and false
     - "none": raw text without chat template (just concatenate content)
     - "all": all three variants (true, false, none)
+
+    Note: Qwen3 tokenizer ignores enable_thinking for existing assistant messages,
+    so we manually strip <think>...</think> blocks for no-think variants.
     """
+    import re
+
+    def strip_think_tags(text: str) -> str:
+        """Strip <think>...</think> blocks (Qwen3 tokenizer bug workaround)"""
+        text = re.sub(r'<think>\s*</think>\s*', '', text)
+        text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
+        return text
+
     mode = (thinking_mode or "false").lower()
     if mode not in ("false", "true", "both", "none", "all"):
         raise ValueError(f"Unknown thinking mode: {thinking_mode}")
@@ -213,10 +224,11 @@ def _chat_text_variants(tokenizer, messages: List[dict], thinking_mode: str) -> 
         yield tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False, enable_thinking=True
         )
-        # Thinking disabled
-        yield tokenizer.apply_chat_template(
+        # Thinking disabled (strip <think> tags)
+        text_no_think = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False, enable_thinking=False
         )
+        yield strip_think_tags(text_no_think)
         # Raw text (no template)
         raw_text = "\n\n".join(m.get("content", "") for m in messages if m.get("content"))
         if raw_text.strip():
@@ -226,12 +238,16 @@ def _chat_text_variants(tokenizer, messages: List[dict], thinking_mode: str) -> 
     # Standard modes: true, false, both
     flags = [False, True] if mode == "both" else [mode == "true"]
     for enable in flags:
-        yield tokenizer.apply_chat_template(
+        text = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=False,
             enable_thinking=enable,
         )
+        # For no-think mode (enable=False), strip <think>...</think> blocks
+        if not enable:
+            text = strip_think_tags(text)
+        yield text
 
 
 def _iter_text_samples(dataset_iter: Iterator[dict], args, tokenizer) -> Iterator[str]:
