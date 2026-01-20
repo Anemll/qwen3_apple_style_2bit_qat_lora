@@ -206,8 +206,12 @@ def upload_file_to_gdrive(local_path: Path, run_name: str, timeout: int = 600) -
         return False
 
 
-def find_best_ppl(state: dict) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+def find_best_ppl(state: dict, exclude_source: Optional[str] = None) -> Tuple[Optional[float], Optional[str], Optional[str]]:
     """Find the best (lowest) PPL from all entries.
+
+    Args:
+        state: Pipeline state dict
+        exclude_source: Optional source to exclude from comparison (e.g., "step_100" or "best_abc12")
 
     Returns:
         Tuple of (best_ppl, best_source, best_baked_path)
@@ -221,20 +225,26 @@ def find_best_ppl(state: dict) -> Tuple[Optional[float], Optional[str], Optional
 
     # Check step-based entries
     for step_str, entry in state.get("entries", {}).items():
+        source = f"step_{step_str}"
+        if source == exclude_source:
+            continue
         if entry.get("ppl_ok") and entry.get("ppl") is not None:
             ppl = entry["ppl"]
             if ppl < best_ppl:
                 best_ppl = ppl
-                best_source = f"step_{step_str}"
+                best_source = source
                 best_baked_path = entry.get("baked_path")
 
     # Check best_state_dict entries
     for md5_key, entry in state.get("best_entries", {}).items():
+        source = f"best_{md5_key}"
+        if source == exclude_source:
+            continue
         if entry.get("ppl_ok") and entry.get("ppl") is not None:
             ppl = entry["ppl"]
             if ppl < best_ppl:
                 best_ppl = ppl
-                best_source = f"best_{md5_key}"
+                best_source = source
                 best_baked_path = entry.get("baked_path")
 
     if best_ppl == float('inf'):
@@ -314,8 +324,8 @@ def check_and_snap_best(
     Returns:
         True if this was the new best and was snapped/uploaded
     """
-    # Find previous best
-    prev_best_ppl, prev_best_source, _ = find_best_ppl(state)
+    # Find previous best (exclude current source since it's already in state)
+    prev_best_ppl, prev_best_source, _ = find_best_ppl(state, exclude_source=current_source)
 
     # Check if current is the new best
     is_new_best = prev_best_ppl is None or current_ppl < prev_best_ppl
