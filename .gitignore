@@ -29,3 +29,7 @@ docs/SR-008B-terminal.md
 results/perplexity.json
 tmp/
 lut_output/training_log.csv
+hybrid/hybrid_g8.py
+hybrid/init_metrics.json
+hybrid/config.json
+config.json
