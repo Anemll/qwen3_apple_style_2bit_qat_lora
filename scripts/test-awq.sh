@@ -15,13 +15,13 @@
 #    python scripts/init_model_v2.py --model-id runs/awq_scaled_model --output runs/v2_awq_alpha05 --config q4a4_r32 --search-lut --imatrix runs/imatrix_qwen3_0.6b_random.pt --svd-error
 #
 # 4. Measure PPL (V2 init):
-#    python scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device tpu --dtype fp16 --max-chunks 20
+#    python scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device tpu --dtype fp16 
 #
 # 5. Select best LUT per layer (sequential, verbose - shows per-tensor stats):
 #    python scripts/select_best_lut_per_layer.py runs/v2_awq_alpha05/v2_initial.pt -o runs/v2_init_imse/ihybrid.pt --metric iActMSE --imatrix runs/imatrix_qwen3_0.6b_random.pt --families E,G --no-tighten --verbose
 #
 # 6. Measure PPL (hybrid):
-#    python scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device tpu --dtype fp16 --max-chunks 20
+#    python scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device tpu --dtype fp16 
 #
 # 7. Test inference:
 #    python scripts/test_inference.py runs/v2_init_imse/ihybrid.pt --prompt "Who invented the iPad?" --no-think
@@ -83,8 +83,8 @@ python3 scripts/init_model_v2.py \
 # PPL check after init
 echo ""
 echo ">>> Step 2b: Measuring PPL (V2 init)"
-echo "    CMD: python3 scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device $DEVICE --dtype fp16 --max-chunks 20 --output-ppl"
-PPL_OUTPUT=$(python3 scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device $DEVICE --dtype fp16 --max-chunks 20 --output-ppl 2>&1)
+echo "    CMD: python3 scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device $DEVICE --dtype fp16  --output-ppl"
+PPL_OUTPUT=$(python3 scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device $DEVICE --dtype fp16  --output-ppl 2>&1)
 PPL=$(echo "$PPL_OUTPUT" | grep "^PPL=" | cut -d= -f2)
 PPL_RESULTS["v2_init"]=$PPL
 echo "    PPL (v2_init) = $PPL"
@@ -111,8 +111,8 @@ python3 scripts/select_best_lut_per_layer.py runs/v2_awq_alpha05/v2_initial.pt \
 # PPL check after hybrid
 echo ""
 echo ">>> Step 4b: Measuring PPL (E,G hybrid)"
-echo "    CMD: python3 scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device $DEVICE --dtype fp16 --max-chunks 20 --output-ppl"
-PPL_OUTPUT=$(python3 scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device $DEVICE --dtype fp16 --max-chunks 20 --output-ppl 2>&1)
+echo "    CMD: python3 scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device $DEVICE --dtype fp16  --output-ppl"
+PPL_OUTPUT=$(python3 scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device $DEVICE --dtype fp16  --output-ppl 2>&1)
 PPL=$(echo "$PPL_OUTPUT" | grep "^PPL=" | cut -d= -f2)
 PPL_RESULTS["hybrid"]=$PPL
 echo "    PPL (hybrid) = $PPL"
