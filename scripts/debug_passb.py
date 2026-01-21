@@ -202,10 +202,11 @@ def test_level2_pair_v_o(base_a: str, base_ab: str, layer: int = 0):
     vB = attnB.v_proj
     oB = attnB.o_proj
 
-    # GQA info
-    num_heads = attnA.num_heads
-    num_kv_heads = attnA.num_key_value_heads
-    head_dim = attnA.head_dim
+    # GQA info - access via model config (Qwen3Attention doesn't expose these directly)
+    config = mA.config
+    num_heads = config.num_attention_heads
+    num_kv_heads = getattr(config, 'num_key_value_heads', num_heads)  # default to MHA if not set
+    head_dim = config.hidden_size // num_heads
     groups = num_heads // num_kv_heads
 
     print(f"\nGQA config:")
