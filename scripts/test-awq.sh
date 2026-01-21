@@ -1,10 +1,51 @@
 #!/bin/bash
 # Test AWQ pipeline with perplexity tracking
+#
+# MANUAL TEST COMMANDS (copy/paste):
+# ==================================
+#
+# 1. Create iMatrix (if needed):
+#    python scripts/compute_imatrix.py --model Qwen/Qwen3-0.6B --tokens 50000 --seq-len 512 --calib-mode random_ids --out runs/imatrix_qwen3_0.6b_random.pt
+#
+# 2. Apply AWQ scales:
+#    python scripts/apply_awq_equiv_scales.py --model-id Qwen/Qwen3-0.6B --imatrix runs/imatrix_qwen3_0.6b_random.pt --alpha 0.5 --output runs/awq_scaled_model
+#
+# 3. Initialize V2:
+#    python scripts/init_model_v2.py --model-id runs/awq_scaled_model --output runs/v2_awq_alpha05 --config q4a4_r32 --search-lut --imatrix runs/imatrix_qwen3_0.6b_random.pt --svd-error
+#
+# 4. Measure PPL (V2 init):
+#    python scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device tpu --dtype fp16 --max-chunks 20
+#
+# 5. Select best LUT per layer (sequential, verbose - shows per-tensor stats):
+#    python scripts/select_best_lut_per_layer.py runs/v2_awq_alpha05/v2_initial.pt -o runs/v2_init_imse/ihybrid.pt --metric iActMSE --imatrix runs/imatrix_qwen3_0.6b_random.pt --families E,G --no-tighten --verbose
+#
+# 6. Measure PPL (hybrid):
+#    python scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device tpu --dtype fp16 --max-chunks 20
+#
+# 7. Test inference:
+#    python scripts/test_inference.py runs/v2_init_imse/ihybrid.pt --prompt "Who invented the iPad?" --no-think
+#
 
 IM=runs/imatrix_qwen3_0.6b_random.pt
 BASE=Qwen/Qwen3-0.6B
 ALPHA=0.5
 DEVICE=${DEVICE:-tpu}  # tpu, cuda, mps, cpu
+
+# Check if iMatrix exists, create if not
+if [ ! -f "$IM" ]; then
+  echo ">>> iMatrix not found: $IM"
+  echo "    Creating from random data..."
+  python scripts/compute_imatrix.py \
+    --model $BASE \
+    --tokens 50000 --seq-len 512 \
+    --calib-mode random_ids \
+    --out $IM
+  if [ $? -ne 0 ]; then
+    echo "ERROR: Failed to create iMatrix"
+    exit 1
+  fi
+  echo ""
+fi
 
 # Collect PPL results
 declare -A PPL_RESULTS
@@ -40,7 +81,7 @@ python3 scripts/init_model_v2.py \
 echo ""
 echo ">>> Step 2b: Measuring PPL (V2 init)"
 PPL_OUTPUT=$(python3 scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device $DEVICE --dtype fp16 --max-chunks 20 2>&1)
-PPL=$(echo "$PPL_OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | grep -E "^Perplexity:" | grep -oE "[0-9]+\.[0-9]+")
+PPL=$(echo "$PPL_OUTPUT" | sed $'s/\x1b\\[[0-9;]*m//g' | grep "Perplexity:" | grep -oE "[0-9]+\\.[0-9]+")
 PPL_RESULTS["v2_init"]=$PPL
 echo "    PPL (v2_init) = $PPL"
 
@@ -52,15 +93,14 @@ python3 scripts/test_inference.py runs/v2_awq_alpha05/v2_initial.pt \
      --no-think \
      --config q4_r32
 
-# Step 4: Select best LUT per layer
+# Step 4: Select best LUT per layer (no --workers = sequential with verbose per-tensor stats)
 echo ""
 echo ">>> Step 4: Selecting best LUT per layer (E,G families)"
 python3 scripts/select_best_lut_per_layer.py runs/v2_awq_alpha05/v2_initial.pt \
     -o runs/v2_init_imse/ihybrid.pt \
-    --workers 8 \
     --metric iActMSE \
     --imatrix $IM \
-    --families E,G --no-tighten
+    --families E,G --no-tighten --verbose
 
 # PPL check after hybrid
 echo ""

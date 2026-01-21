@@ -613,17 +613,18 @@ def main():
         trust_remote_code=True,
     )
 
-    # For --from-scratch mode: extract W_orig from base model BEFORE V2 conversion
-    # For checkpoint mode: we'll compute W_eff = Q * S from checkpoint later (self-contained!)
+    # CRITICAL FIX: Always extract W_orig from base model BEFORE V2 conversion
+    # This is the TRUE optimization target - the AWQ-scaled (or original) FP16 weights.
+    # Using W_eff = Q * S from checkpoint would make optimization meaningless
+    # (Q_target = W_eff / S = Q, just recovering existing quantized values).
     original_weights = {}
-    if args.from_scratch:
-        print("Extracting original FP32 weights (--from-scratch mode)...")
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Linear):
-                original_weights[name] = module.weight.data.float().cpu().clone()
-        print(f"  Extracted {len(original_weights)} linear layer weights")
-    else:
-        print("  (Checkpoint mode: W_orig will be computed from checkpoint's W_eff = Q * S)")
+    print("Extracting original FP32 weights from base model...")
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            original_weights[name] = module.weight.data.float().cpu().clone()
+    print(f"  Extracted {len(original_weights)} linear layer weights")
+    if not args.from_scratch:
+        print(f"  These are the TRUE targets (from {args.model_id}), not W_eff from checkpoint")
 
     # Create V2 configs (must match init_model_v2.py settings)
     mlp_config = AnemllQuantConfigV2(
@@ -762,28 +763,13 @@ def main():
                 if q_key in state_dict and m._Q is None:
                     m.register_buffer("_Q", state_dict[q_key])
 
-        # CRITICAL for AWQ: Extract W_eff = Q * S from the loaded checkpoint as W_orig
-        # This makes LUT optimization self-contained (no need to specify AWQ-scaled model)
+        # NOTE: We now use original_weights from the base model (AWQ-scaled or original FP16),
+        # NOT W_eff = Q * S from checkpoint. This is the correct optimization target:
+        # Q_target = W_ref / S (what we want to approximate)
+        # Using W_eff = Q * S would give Q_target = Q (existing values), making optimization useless.
         if not args.from_scratch:
-            print("Extracting W_eff = Q * S from checkpoint as optimization target...")
-            for name, m in model.named_modules():
-                if isinstance(m, AnemllQATLinearV2):
-                    # Compute W_eff = Q * S from the loaded checkpoint
-                    if m._Q is not None:
-                        Q = m._Q.float()
-                    elif m._indices is not None:
-                        Q = m.lut[m._indices].float()
-                    else:
-                        continue
-
-                    # Compute full scales S = (A * mag) @ B
-                    A_scaled = m.scale_A.float() * m.rank_magnitude.float()
-                    S = A_scaled @ m.scale_B.float()
-
-                    # W_eff = Q * S (this is what the checkpoint represents)
-                    W_eff = Q * S
-                    original_weights[name] = W_eff.cpu().clone()
-            print(f"  Extracted W_eff for {len(original_weights)} V2 layers")
+            print(f"  Using original weights from {args.model_id} as optimization target")
+            print(f"  (NOT W_eff from checkpoint - that would just recover existing Q values)")
     elif not args.from_scratch:
         print("Using SVD-initialized scales (no checkpoint)")
 
