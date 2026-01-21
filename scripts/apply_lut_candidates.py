@@ -241,11 +241,15 @@ def generate_lut_family_D(
     max_abs: float,
     eps: float = 1e-4,
     max_samples: int = 10_000_000,
+    sigma2: Optional[torch.Tensor] = None,  # [in_features] iMatrix variance
 ) -> Tuple[str, torch.Tensor]:
     """Family D: Quantile LUT from layer's own |Q_eff|.
 
     Data-driven: places LUT values at data quantiles.
     CRITICAL: Excludes entries where |S| < eps to avoid division artifacts.
+
+    With sigma2 (iMatrix): Uses weighted quantiles where weight = σ² × S².
+    This places more LUT entries where activation error matters most.
 
     Args:
         lut_size: Number of LUT entries
@@ -254,36 +258,79 @@ def generate_lut_family_D(
         max_abs: Maximum absolute value for LUT
         eps: Threshold for small scales
         max_samples: Maximum samples for quantile computation (avoids OOM)
+        sigma2: Optional [in_features] iMatrix variance for weighted quantiles.
     """
+    out_features, in_features = Q_eff_target.shape
+
     # Mask out entries where S is too small (division artifacts)
-    S_flat = S.flatten().abs()
+    S_flat = S.flatten().abs().float()
     Q_flat = Q_eff_target.abs().flatten().float()
 
     valid_mask = S_flat >= eps
     Q_valid = Q_flat[valid_mask]
+    S_valid = S_flat[valid_mask]
+
+    # Compute weights if sigma2 provided
+    if sigma2 is not None:
+        sigma2_float = sigma2.float()
+        sigma2_norm = sigma2_float / (sigma2_float.mean() + eps)
+        sigma2_norm = sigma2_norm.clamp(0.1, 10.0)
+        sigma2_tiled = sigma2_norm.repeat(out_features)
+        weights_full = sigma2_tiled * (S_flat ** 2)
+        W_valid = weights_full[valid_mask]
+        name_suffix = '_imatrix'
+    else:
+        W_valid = None
+        name_suffix = ''
 
     if Q_valid.numel() < 100:
         # Fallback: not enough valid entries, use all
         print(f"    WARNING: Only {Q_valid.numel()} valid Q_eff entries (S >= {eps}), using all")
         Q_valid = Q_flat
+        if sigma2 is not None:
+            W_valid = weights_full
 
     # Sample if tensor is too large (torch.quantile has limits)
     # Use strided sampling (works on TPU, avoids randperm issues)
     if Q_valid.numel() > max_samples:
         stride = Q_valid.numel() // max_samples
         Q_valid = Q_valid[::stride][:max_samples]
+        if W_valid is not None:
+            W_valid = W_valid[::stride][:max_samples]
 
     half = lut_size // 2
 
-    # Use percentiles to determine positive half
-    # Good spread: 50, 70, 85, 92, 96, 98, 99.5, 99.9 (for 8 positive values)
+    # Quantile fractions
     if half == 8:
-        quantiles = torch.tensor([50, 70, 85, 92, 96, 98, 99.5, 99.9])
+        quantile_fracs = torch.tensor([0.50, 0.70, 0.85, 0.92, 0.96, 0.98, 0.995, 0.999])
     else:
-        # Generic spread for other sizes
-        quantiles = torch.linspace(50, 99.9, half)
+        quantile_fracs = torch.linspace(0.5, 0.999, half)
 
-    positive = torch.quantile(Q_valid, quantiles / 100)
+    if W_valid is not None:
+        # Weighted quantiles using cumulative weight approach
+        sorted_idx = Q_valid.argsort()
+        Q_sorted = Q_valid[sorted_idx]
+        W_sorted = W_valid[sorted_idx]
+
+        # Cumulative weights
+        W_cumsum = W_sorted.cumsum(0)
+        W_total = W_cumsum[-1]
+
+        positive = []
+        for frac in quantile_fracs:
+            target = frac * W_total
+            # Find first index where cumsum >= target
+            matches = (W_cumsum >= target).nonzero(as_tuple=True)[0]
+            if matches.numel() > 0:
+                idx = matches[0].item()
+            else:
+                idx = len(Q_sorted) - 1
+            positive.append(Q_sorted[idx].item())
+
+        positive = torch.tensor(positive, dtype=torch.float32)
+    else:
+        # Unweighted quantiles (original behavior)
+        positive = torch.quantile(Q_valid, quantile_fracs)
 
     # Clamp to max_abs
     positive = positive.clamp(max=max_abs)
@@ -296,7 +343,7 @@ def generate_lut_family_D(
     lut = torch.cat([-positive.flip(0), positive])
     lut = snap_to_fp16(lut)
 
-    return ('D_quantile', lut)
+    return (f'D_quantile{name_suffix}', lut)
 
 
 def generate_lut_family_G(
@@ -308,14 +355,18 @@ def generate_lut_family_G(
     max_iters: int = 20,
     max_samples: int = 1_000_000,
     scale_to_max_abs: bool = False,  # If True, scale centroids to fill [0, max_abs]
+    sigma2: Optional[torch.Tensor] = None,  # [in_features] iMatrix variance
 ) -> Tuple[str, torch.Tensor]:
     """Family G: Weighted k-means codebook (Lloyd's algorithm).
 
     Unlike quantile LUTs, this directly minimizes weighted MSE distortion.
-    Weights = S^2 (so errors in high-scale entries matter more).
 
-    This often beats hand-crafted grids because it adapts to the actual
-    distribution while optimizing the distortion objective.
+    Weighting options:
+    - Without sigma2: weights = S² (scale-weighted)
+    - With sigma2: weights = σ² × S² (iActMSE-optimal)
+
+    The iMatrix-weighted version optimizes for expected activation error,
+    not just weight reconstruction error.
 
     Args:
         lut_size: Number of LUT entries
@@ -327,13 +378,31 @@ def generate_lut_family_G(
         max_samples: Maximum samples to use (for speed)
         scale_to_max_abs: If True, scale centroids to fill [0.01*max_abs, max_abs].
                           If False (default), use data-adaptive range (old behavior).
+        sigma2: Optional [in_features] iMatrix variance for iActMSE weighting.
+                If provided, weights = σ² × S² (recommended for best PPL).
     """
     half = lut_size // 2
 
     # Flatten and get valid entries
     Q_flat = Q_eff_target.flatten().float()
     S_flat = S.flatten().abs().float()
-    weights = S_flat ** 2  # Weight by S^2 for MSE objective
+
+    # Compute weights based on whether iMatrix is provided
+    if sigma2 is not None:
+        # iActMSE-optimal weighting: σ² × S²
+        out_features, in_features = Q_eff_target.shape
+        sigma2_float = sigma2.float()
+        # Normalize sigma2 to prevent extreme weighting
+        sigma2_norm = sigma2_float / (sigma2_float.mean() + eps)
+        sigma2_norm = sigma2_norm.clamp(0.1, 10.0)
+        # Tile to match Q_flat: [in] -> [out * in]
+        sigma2_tiled = sigma2_norm.repeat(out_features)
+        weights = sigma2_tiled * (S_flat ** 2)
+        name_suffix = '_imatrix'
+    else:
+        # Original S²-only weighting
+        weights = S_flat ** 2
+        name_suffix = ''
 
     # Filter valid entries
     valid_mask = S_flat >= eps
@@ -405,7 +474,7 @@ def generate_lut_family_G(
     lut = torch.cat([-centroids.flip(0), centroids])
     lut = snap_to_fp16(lut)
 
-    return ('G_kmeans', lut)
+    return (f'G_kmeans{name_suffix}', lut)
 
 
 def generate_lut_family_H_symkmeans(
@@ -678,6 +747,63 @@ def compute_activation_weighted_mse(
     normalized_score = weighted_score / total_var
 
     return normalized_score.item()
+
+
+def compute_iActMSE(
+    Q_target: torch.Tensor,     # [out, in] - target Q values (from W_ref / S)
+    Q_quant: torch.Tensor,      # [out, in] - quantized Q values (from LUT)
+    S: torch.Tensor,            # [out, in] - scale matrix
+    sigma2: torch.Tensor,       # [in] - input activation variance from iMatrix
+    normalize: bool = True,
+    eps: float = 1e-8,
+) -> float:
+    """Compute iMatrix-weighted activation MSE (iActMSE).
+
+    For a linear layer y = W @ x, the expected squared output error is:
+        E[||ΔW @ x||²] = tr(ΔW @ Σ_x @ ΔW^T)
+
+    With diagonal Σ_x = diag(σ²):
+        = Σ_{o,i} σ²[i] * ΔW[o,i]²
+
+    Since W = Q * S (element-wise):
+        = Σ_{o,i} σ²[i] * S[o,i]² * ΔQ[o,i]²
+
+    This is the "correct" metric for LUT optimization because it measures
+    expected activation error, not just weight error.
+
+    Args:
+        Q_target: Target Q values = W_ref / S [out, in]
+        Q_quant: Quantized Q values from LUT [out, in]
+        S: Scale matrix [out, in]
+        sigma2: Input activation variance [in] from iMatrix
+        normalize: If True, normalize for cross-layer comparison
+        eps: Small value to avoid division by zero
+
+    Returns:
+        iActMSE score (lower is better)
+    """
+    delta_Q = Q_target - Q_quant
+
+    # Normalize sigma2 to prevent extreme weighting (one channel dominating)
+    sigma2_float = sigma2.float()
+    sigma2_norm = sigma2_float / (sigma2_float.mean() + eps)
+    sigma2_norm = sigma2_norm.clamp(0.1, 10.0)
+
+    # Weight: σ²[i] * S[o,i]²
+    # Broadcast σ² from [in] to [out, in]
+    S_float = S.float()
+    weights = sigma2_norm.view(1, -1) * (S_float ** 2)
+
+    # Weighted MSE
+    score = (weights * (delta_Q.float() ** 2)).sum()
+
+    if normalize:
+        # Normalize for cross-layer comparison
+        # Division by (σ².sum() * S².sum()) makes scores comparable
+        norm_factor = sigma2_norm.sum() * (S_float ** 2).mean() + eps
+        score = score / norm_factor
+
+    return score.item()
 
 
 # =============================================================================

@@ -19,7 +19,10 @@ LUT Families:
 Selection Metrics:
     --metric weighted_mse   (default) - S^2-weighted MSE (better PPL correlation)
     --metric mae            - Mean absolute error (original)
-    --metric activation_mse - Activation-weighted MSE (BEST - requires calibration)
+    --metric activation_mse - Activation-weighted MSE (requires --imatrix)
+    --metric iActMSE        - BEST: iMatrix-weighted activation MSE (requires --imatrix)
+                              iActMSE = Σ σ²[i] * S² * (Q_target - Q_quant)²
+                              This is the theoretically correct metric for PPL optimization.
 
 Note:
     - checkpoint.pt provides: scales (scale_A, scale_B), current LUT, _Q/_indices
@@ -40,10 +43,10 @@ Usage:
     # Use weighted MSE (default, better PPL correlation)
     python scripts/select_best_lut_per_layer.py checkpoint.pt -o hybrid.pt --metric weighted_mse
 
-    # BEST: Use activation-weighted MSE (requires calibration first)
-    python scripts/calibrate_activation_stats.py --output activation_stats.pt
+    # BEST: Use iActMSE metric (requires imatrix first)
+    python scripts/compute_imatrix.py --output imatrix.pt
     python scripts/select_best_lut_per_layer.py checkpoint.pt -o hybrid.pt \
-        --metric activation_mse --activation-cache activation_stats.pt
+        --metric iActMSE --imatrix imatrix.pt --families E,G
 
     # With stats output
     python scripts/select_best_lut_per_layer.py checkpoint.pt -o hybrid.pt --output-stats stats.json
@@ -83,6 +86,7 @@ from scripts.apply_lut_candidates import (
     generate_lut_family_H_symkmeans,  # Symmetric k-means (trainable-compatible)
     compute_weighted_mse,   # S^2-weighted MSE
     compute_activation_weighted_mse,  # Activation-weighted MSE (Option A)
+    compute_iActMSE,  # iMatrix-weighted activation MSE (CORRECT metric)
     quantize_chunked,
     matches_scope,
     compute_layer_weff_and_qeff,
@@ -111,8 +115,23 @@ def generate_all_candidates(
     S: Optional[torch.Tensor] = None,
     eps: float = 1e-4,
     scale_to_max_abs: bool = False,
+    sigma2: Optional[torch.Tensor] = None,  # [in_features] iMatrix variance
 ) -> List[Tuple[str, torch.Tensor]]:
-    """Generate all LUT candidates for a given LUT size."""
+    """Generate all LUT candidates for a given LUT size.
+
+    Args:
+        lut_size: Number of LUT entries
+        max_abs: Maximum absolute LUT value
+        families: List of family codes to generate
+        original_lut: Original LUT from checkpoint (for Family E)
+        Q_eff_target: Target Q values [out, in] = W_ref / S
+        S: Scale matrix [out, in]
+        eps: Threshold for small scales
+        scale_to_max_abs: If True, scale k-means LUTs to fill [0, max_abs]
+        sigma2: Optional [in_features] iMatrix variance for iActMSE-optimal
+                k-means and quantile generation. If provided, D/G families
+                will use σ² × S² weighting.
+    """
     candidates = []
 
     # Family E: Original LUT (baseline)
@@ -137,12 +156,20 @@ def generate_all_candidates(
 
     # Family D: Quantile (requires layer data)
     if 'D' in families and Q_eff_target is not None and S is not None:
-        name, lut = generate_lut_family_D(lut_size, Q_eff_target, S, max_abs, eps)
+        # With sigma2: uses iMatrix-weighted quantiles (σ² × S²)
+        # Without sigma2: uses unweighted quantiles (original behavior)
+        name, lut = generate_lut_family_D(lut_size, Q_eff_target, S, max_abs, eps, sigma2=sigma2)
         candidates.append((name, lut))
 
     # Family G: Weighted k-means (requires layer data) - asymmetric, eval-only
     if 'G' in families and Q_eff_target is not None and S is not None:
-        name, lut = generate_lut_family_G(lut_size, Q_eff_target, S, max_abs, eps, scale_to_max_abs=scale_to_max_abs)
+        # With sigma2: uses iMatrix × S² weighting (iActMSE-optimal)
+        # Without sigma2: uses S²-only weighting (original behavior)
+        name, lut = generate_lut_family_G(
+            lut_size, Q_eff_target, S, max_abs, eps,
+            scale_to_max_abs=scale_to_max_abs,
+            sigma2=sigma2,
+        )
         candidates.append((name, lut))
 
     # Family H: Symmetric k-means (requires layer data) - trainable-compatible
@@ -164,6 +191,10 @@ def process_single_layer(args_tuple: Tuple) -> Dict[str, Any]:
     """
     Process a single layer - standalone function for multiprocessing.
 
+    CRITICAL: Uses W_ref (original FP32 weights) as target, not W_eff_old.
+    This is the key insight: we want to optimize Q_target = W_ref / S,
+    not preserve the existing quantized values.
+
     Args:
         args_tuple: (name, layer_data, config) where:
             - name: layer name string
@@ -182,7 +213,7 @@ def process_single_layer(args_tuple: Tuple) -> Dict[str, Any]:
     scale_A = layer_data['scale_A']
     scale_B = layer_data['scale_B']
     rank_magnitude = layer_data['rank_magnitude']
-    W_orig = layer_data['W_orig']
+    W_orig = layer_data['W_orig']  # W_ref: Original FP32 weights (THE TARGET)
 
     # Unpack config
     families = config['families']
@@ -190,7 +221,7 @@ def process_single_layer(args_tuple: Tuple) -> Dict[str, Any]:
     auto_max_abs = config['auto_max_abs']
     metric = config['metric']
     eps = config['eps']
-    activation_var = config.get('activation_var')
+    activation_var = config.get('activation_var')  # σ² from iMatrix [in_features]
     verbose = config.get('verbose', False)
     scale_to_max_abs = config.get('scale_to_max_abs', False)
 
@@ -202,7 +233,7 @@ def process_single_layer(args_tuple: Tuple) -> Dict[str, Any]:
     A_scaled = scale_A * rank_magnitude  # [out, rank] * [rank] = [out, rank]
     S = A_scaled @ scale_B  # [out, rank] @ [rank, in] = [out, in]
 
-    # Current Q values
+    # Current Q values (for fallback/comparison only)
     if _Q is not None:
         Q_current = _Q.float()
     elif _indices is not None:
@@ -210,39 +241,40 @@ def process_single_layer(args_tuple: Tuple) -> Dict[str, Any]:
     else:
         return {'name': name, 'error': 'No _Q or _indices'}
 
-    # Current W_eff
-    W_eff_old = Q_current * S
-
-    # Target: original FP32 weights (continuous, not snapped)
+    # CRITICAL: Target is W_ref / S (original FP32 weights), NOT W_eff_old
+    # This is what makes optimization meaningful - we're trying to best
+    # approximate the original weights, not preserve existing quantization.
     if W_orig is not None:
         S_safe = torch.where(S.abs() < eps, torch.full_like(S, eps), S)
-        Q_eff_target = W_orig / S_safe
-        W_eff_target = W_orig
+        Q_target = W_orig / S_safe  # Target Q values (what we want to quantize)
+        W_ref = W_orig  # Reference weights for scoring
     else:
-        # Fallback to snapped values
-        Q_eff_target = Q_current
-        W_eff_target = W_eff_old
+        # Fallback: no original weights available, can only preserve existing
+        Q_target = Q_current
+        W_ref = Q_current * S
 
     # Compute per-layer max_abs if requested
     if auto_max_abs:
         valid_mask = S.abs() >= eps
-        Q_valid = Q_eff_target.abs()[valid_mask] if valid_mask.sum() > 0 else Q_eff_target.abs()
+        Q_valid = Q_target.abs()[valid_mask] if valid_mask.sum() > 0 else Q_target.abs()
         layer_max_abs = torch.quantile(Q_valid.flatten().float(), 0.999).item()
         layer_max_abs = max(layer_max_abs, 0.1)
     else:
         layer_max_abs = max_abs
 
     # Generate all candidates for this layer
+    # Pass sigma2 (activation_var) for iMatrix-weighted k-means/quantile
     original_lut = lut.float().clone()
     candidates = generate_all_candidates(
         lut_size=lut_size,
         max_abs=layer_max_abs,
         families=families,
         original_lut=original_lut,
-        Q_eff_target=Q_eff_target,
+        Q_eff_target=Q_target,  # Target from W_ref / S
         S=S,
         eps=eps,
         scale_to_max_abs=scale_to_max_abs,
+        sigma2=activation_var,  # Pass iMatrix for weighted k-means/quantile
     )
 
     # Test each candidate
@@ -258,24 +290,25 @@ def process_single_layer(args_tuple: Tuple) -> Dict[str, Any]:
         if not v['valid']:
             continue
 
-        indices_new, stats = apply_lut_candidate(
-            W_eff_old, S, Q_eff_target, lut_new,
-            eps=eps,
-        )
+        # Quantize Q_target to LUT
+        indices_new = quantize_chunked(Q_target, lut_new)
+        Q_quant = lut_new[indices_new]
+        W_new = Q_quant * S
 
         # Compute score based on selected metric
-        Q_new = lut_new[indices_new]
-        W_eff_new = Q_new * S
-
-        if metric == 'weighted_mse':
-            score = compute_weighted_mse(W_eff_target, W_eff_new, S, eps=eps)
+        # ALL metrics should compare to W_ref (original weights), not W_eff_old
+        if metric == 'iActMSE' and activation_var is not None:
+            # CORRECT metric: iActMSE = Σ σ²[i] * S² * (Q_target - Q_quant)²
+            score = compute_iActMSE(Q_target, Q_quant, S, activation_var, normalize=True)
         elif metric == 'activation_mse' and activation_var is not None:
-            score = compute_activation_weighted_mse(W_eff_target, W_eff_new, activation_var)
-        else:  # mae or fallback
-            if metric == 'activation_mse' and activation_var is None:
-                score = compute_weighted_mse(W_eff_target, W_eff_new, S, eps=eps)
-            else:
-                score = stats['mae']
+            # Legacy: activation-weighted MSE on W (same as iActMSE but computed differently)
+            score = compute_activation_weighted_mse(W_ref, W_new, activation_var)
+        elif metric == 'weighted_mse':
+            # S²-weighted MSE (no iMatrix)
+            score = compute_weighted_mse(W_ref, W_new, S, eps=eps)
+        else:
+            # MAE fallback
+            score = (W_ref - W_new).abs().mean().item()
 
         all_results[cand_name] = score
 
@@ -339,10 +372,11 @@ def parse_args():
                         help='Max absolute LUT value for generated candidates (default: 2.0 for FP4 range)')
     parser.add_argument('--auto-max-abs', action='store_true',
                         help='Use per-layer max_abs from p99.9 of |Q_eff| (recommended)')
-    parser.add_argument('--metric', choices=['weighted_mse', 'mae', 'activation_mse'], default='weighted_mse',
-                        help='Selection metric: weighted_mse (S^2), mae, or activation_mse (best, requires --activation-cache)')
-    parser.add_argument('--activation-cache', default=None,
-                        help='Path to activation_stats.pt from calibrate_activation_stats.py (enables activation_mse)')
+    parser.add_argument('--metric', choices=['weighted_mse', 'mae', 'activation_mse', 'iActMSE'], default='weighted_mse',
+                        help='Selection metric: weighted_mse (S^2), mae, activation_mse, or iActMSE (BEST - requires --imatrix). '
+                             'iActMSE = Σ σ²[i] * S² * (Q_target - Q_quant)² is the theoretically correct metric.')
+    parser.add_argument('--imatrix', default=None,
+                        help='Path to importance matrix (.pt file) for activation_mse metric. Use compute_imatrix.py or calibrate_activation_stats.py to generate.')
     parser.add_argument('--dry-run', action='store_true',
                         help='Show selections without saving checkpoint')
     parser.add_argument('--verbose', action='store_true',
@@ -398,24 +432,29 @@ def main():
     print(f"Scale LUT:   {'enabled (new)' if args.scale_lut else 'disabled (old/data-adaptive)'}")
     if args.from_scratch:
         print(f"Tighten Q:   {'disabled (--no-tighten)' if args.no_tighten else 'enabled'}")
-    if args.activation_cache:
-        print(f"Act cache:   {args.activation_cache}")
+    if args.imatrix:
+        print(f"iMatrix:     {args.imatrix}")
     print()
 
     # Validate metric requirements
-    if args.metric == 'activation_mse' and not args.activation_cache:
-        print("ERROR: --metric activation_mse requires --activation-cache")
-        print("Run: python scripts/calibrate_activation_stats.py --output activation_stats.pt")
+    if args.metric in ('activation_mse', 'iActMSE') and not args.imatrix:
+        print(f"ERROR: --metric {args.metric} requires --imatrix")
+        print("Run: python scripts/compute_imatrix.py --output imatrix.pt")
         return 1
 
-    # Load activation cache if provided
+    # Load importance matrix if provided
     activation_variances = None
-    if args.activation_cache:
-        print(f"Loading activation cache: {args.activation_cache}")
-        cache_data = torch.load(args.activation_cache, map_location='cpu', weights_only=False)
-        activation_variances = cache_data.get('variances', {})
-        print(f"  Loaded variances for {len(activation_variances)} layers")
-        print(f"  Calibration: {cache_data.get('num_samples', '?')} samples, {cache_data.get('dataset', '?')}")
+    if args.imatrix:
+        print(f"Loading importance matrix: {args.imatrix}")
+        cache_data = torch.load(args.imatrix, map_location='cpu', weights_only=False)
+        # Support both formats: 'variances' (old) and 'sigma2' (new from compute_imatrix.py)
+        activation_variances = cache_data.get('variances') or cache_data.get('sigma2', {})
+        print(f"  Loaded σ² for {len(activation_variances)} layers")
+        if 'metadata' in cache_data:
+            meta = cache_data['metadata']
+            print(f"  Source: {meta.get('model_id', '?')}, tokens={meta.get('num_tokens', '?')}")
+        elif 'num_samples' in cache_data:
+            print(f"  Calibration: {cache_data.get('num_samples', '?')} samples, {cache_data.get('dataset', '?')}")
         print()
 
     # Parse families
@@ -942,7 +981,7 @@ def main():
             'scope': args.scope,
             'metric': args.metric,
             'max_abs': 'auto' if args.auto_max_abs else args.max_abs,
-            'activation_cache': str(args.activation_cache) if args.activation_cache else None,
+            'imatrix': str(args.imatrix) if args.imatrix else None,
             'config': args.config,
             'group_size': args.group_size,
             'total_layers': total_layers,

@@ -1034,16 +1034,19 @@ def search_optimal_luts(
     mlp_scale_rank: int = 32,
     attn_lut_bits: int = 4,
     attn_scale_rank: int = 32,
+    imatrix: Optional[Dict[str, torch.Tensor]] = None,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
-    Search for optimal LUT per tensor by testing candidates and minimizing MAE.
+    Search for optimal LUT per tensor by testing candidates and minimizing MSE or iMSE.
 
     For each 4-bit linear layer, tests each LUT candidate by:
     1. Computing SVD-based scale initialization with that LUT
     2. Quantizing to LUT
-    3. Measuring reconstruction MAE = |W_ref - Q * S|
-    4. Selecting LUT with minimum MAE
+    3. Measuring reconstruction error:
+       - MSE = mean((W_ref - Q * S)²)  if no imatrix
+       - iMSE = weighted MSE using σ² from importance matrix (if imatrix provided)
+    4. Selecting LUT with minimum error
 
     NOTE: Only searches for 4-bit layers (LUT16). 2-bit layers keep uniform LUT.
 
@@ -1056,6 +1059,7 @@ def search_optimal_luts(
         mlp_scale_rank: Scale rank for MLP layers
         attn_lut_bits: LUT bits for Attention layers
         attn_scale_rank: Scale rank for Attention layers
+        imatrix: Dict mapping layer name -> σ² tensor (importance weights per input dim)
         verbose: Print progress
 
     Returns:
@@ -1063,11 +1067,16 @@ def search_optimal_luts(
     """
     from qat_lora.ane_qat_linear_v2 import AnemllQuantConfigV2, AnemllQATLinearV2
 
+    use_imatrix = imatrix is not None and len(imatrix) > 0
     if verbose:
         print(f"\n[Step 4e] Searching optimal LUT per tensor")
         print(f"  Testing LUTs: {list(lut_candidates.keys())}")
         print(f"  MLP: LUT{2**mlp_lut_bits} ({mlp_lut_bits}-bit), rank={mlp_scale_rank}")
         print(f"  Attn: LUT{2**attn_lut_bits} ({attn_lut_bits}-bit), rank={attn_scale_rank}")
+        if use_imatrix:
+            print(f"  Scoring: iMSE (importance-weighted, {len(imatrix)} layers)")
+        else:
+            print(f"  Scoring: MSE (uniform weighting)")
 
     t0 = time.time()
 
@@ -1191,12 +1200,22 @@ def search_optimal_luts(
                     print(f"      DEBUG: {lut_name} Q unique={len(unique_q)}, range=[{Q.min():.4f}, {Q.max():.4f}]")
                     print(f"      DEBUG: {lut_name} idx histogram: {idx_hist}")
 
-                # Compute MSE (penalizes large errors more than MAE)
-                mse = ((W_ref - W_eff) ** 2).mean().item()
-                lut_mses[lut_name] = mse
+                # Compute error score: iMSE (importance-weighted) or plain MSE
+                err2 = (W_ref - W_eff).pow(2)  # [out, in]
 
-                if mse < best_mse:
-                    best_mse = mse
+                if use_imatrix and name in imatrix:
+                    # iMSE: importance-weighted MSE using σ² from calibration
+                    sigma2 = imatrix[name].to(device=err2.device, dtype=err2.dtype)  # [in]
+                    # Normalize: sum(err² * σ²) / (out * sum(σ²))
+                    score = (err2 * sigma2.view(1, -1)).sum().item() / (err2.shape[0] * sigma2.sum().item())
+                else:
+                    # Plain MSE (uniform weighting)
+                    score = err2.mean().item()
+
+                lut_mses[lut_name] = score
+
+                if score < best_mse:
+                    best_mse = score
                     best_lut_name = lut_name
 
                 # Clean up
@@ -1212,9 +1231,13 @@ def search_optimal_luts(
             'shape': [out_features, in_features],
             'type': layer_type,
             'optimal_lut': best_lut_name,
+            'optimal_score': best_mse,
+            'all_scores': lut_mses,
+            'score_type': 'iMSE' if use_imatrix else 'MSE',
+            'skipped': False,
+            # Legacy keys for backwards compatibility
             'optimal_mse': best_mse,
             'all_mses': lut_mses,
-            'skipped': False,
         }
         layer_results.append(layer_result)
 
@@ -1228,21 +1251,22 @@ def search_optimal_luts(
         # Progress (print every layer for debugging)
         if verbose:
             short_name = name.split('.')[-2] + '.' + name.split('.')[-1] if '.' in name else name
-            # Show MSE for ALL LUTs, sorted by MSE value (scientific notation)
-            # Highlight lowest (best) MSE in green if terminal supports colors
-            sorted_mses = sorted(lut_mses.items(), key=lambda x: x[1])
+            # Show scores for ALL LUTs, sorted by value (scientific notation)
+            # Highlight lowest (best) score in green if terminal supports colors
+            sorted_scores = sorted(lut_mses.items(), key=lambda x: x[1])
             use_color = sys.stdout.isatty()
             GREEN = '\033[92m' if use_color else ''
             RESET = '\033[0m' if use_color else ''
-            mse_parts = []
-            for i, (n, m) in enumerate(sorted_mses):
-                if i == 0:  # Best (lowest) MSE - show in green
-                    mse_parts.append(f"{GREEN}{n}={m:.2e}{RESET}")
+            score_parts = []
+            for i, (n, m) in enumerate(sorted_scores):
+                if i == 0:  # Best (lowest) score - show in green
+                    score_parts.append(f"{GREEN}{n}={m:.2e}{RESET}")
                 else:
-                    mse_parts.append(f"{n}={m:.2e}")
-            mse_str = ', '.join(mse_parts)
+                    score_parts.append(f"{n}={m:.2e}")
+            score_str = ', '.join(score_parts)
+            score_label = "iMSE" if use_imatrix else "MSE"
             print(f"    [{layer_idx+1}/{len(linear_layers)}] {short_name}: best={best_lut_name}")
-            print(f"        MSEs: {mse_str}")
+            print(f"        {score_label}: {score_str}")
 
     elapsed = time.time() - t0
 
@@ -1259,11 +1283,14 @@ def search_optimal_luts(
         'optimal_lut_map': optimal_lut_map,
         'layer_results': layer_results,
         'time_seconds': elapsed,
+        'score_type': 'iMSE' if use_imatrix else 'MSE',
+        'imatrix_used': use_imatrix,
     }
 
     if verbose:
         print(f"\n  LUT Search Results:")
         print(f"    Layers analyzed: {stats['num_layers']}")
+        print(f"    Scoring method: {stats['score_type']}")
         print(f"    Time: {elapsed:.1f}s")
         print(f"\n  Optimal LUT Distribution:")
         for lut_name in lut_names:
@@ -1966,6 +1993,8 @@ def init_v2_model(
     measure_svd_error: bool = False,
     search_group_sizes: Optional[List[int]] = None,
     search_lut: bool = False,
+    imatrix_path: Optional[str] = None,
+    awq_alpha: float = 0.0,
     verbose: bool = True,
     detailed: bool = False,
 ) -> Dict[str, Any]:
@@ -1988,6 +2017,12 @@ def init_v2_model(
         measure_svd_error: Measure SVD approximation error (MAE vs original)
         search_group_sizes: List of group sizes to test per tensor (e.g., [128, 64, 32, 16])
         search_lut: Search for optimal LUT per tensor (only for 4-bit layers)
+        imatrix_path: Path to importance matrix (.pt file) for iMSE scoring
+        awq_alpha: AWQ-style importance weighting for scale initialization (default: 0.0).
+                   0.0 = no effect (standard SVD), 0.5 = moderate (recommended), 1.0 = strong.
+                   Higher values bias scales toward important columns (from iMatrix).
+                   Requires imatrix_path. This can improve PPL by reducing quantization
+                   error for important weights.
         verbose: Print progress
         detailed: Show LUT values and MSE per layer during freeze step
 
@@ -2064,6 +2099,19 @@ def init_v2_model(
     optimal_lut_map = None
     lut_candidates = None
 
+    # Load importance matrix if provided
+    imatrix = None
+    if imatrix_path:
+        if verbose:
+            print(f"\n[INFO] Loading importance matrix from: {imatrix_path}")
+        imatrix_data = torch.load(imatrix_path, weights_only=False)
+        imatrix = imatrix_data.get('sigma2', {})
+        if verbose:
+            print(f"  Loaded σ² for {len(imatrix)} layers")
+            if 'metadata' in imatrix_data:
+                meta = imatrix_data['metadata']
+                print(f"  Source: {meta.get('model_id', 'N/A')}, tokens={meta.get('num_tokens', 'N/A')}")
+
     # Step 4a: LUT search (only for 4-bit layers)
     if search_lut and (preset.mlp_lut_bits == 4 or preset.attn_lut_bits == 4):
         if verbose:
@@ -2083,6 +2131,7 @@ def init_v2_model(
             mlp_scale_rank=preset.mlp_rank,
             attn_lut_bits=preset.attn_lut_bits,
             attn_scale_rank=preset.attn_rank,
+            imatrix=imatrix,
             verbose=verbose,
         )
         metrics['steps']['lut_search'] = lut_search_stats
@@ -2179,6 +2228,41 @@ def init_v2_model(
             verbose=verbose,
         )
         metrics['steps']['replace'] = replace_stats
+
+    # Step 4b-AWQ: Apply AWQ-style importance weighting to scales (optional)
+    # This re-initializes scales with importance weighting from iMatrix
+    if awq_alpha > 0 and imatrix:
+        if verbose:
+            print(f"\n[Step 4b] Applying AWQ-style scale weighting (alpha={awq_alpha})...")
+
+        from qat_lora.ane_qat_linear_v2 import AnemllQATLinearV2
+
+        awq_count = 0
+        for name, module in model.named_modules():
+            if isinstance(module, AnemllQATLinearV2):
+                # Find the corresponding iMatrix entry
+                # iMatrix keys may not match exactly, try common patterns
+                sigma2 = None
+                for pattern in [name, name.replace('.linear', ''), name + '.linear']:
+                    if pattern in imatrix:
+                        sigma2 = imatrix[pattern]
+                        break
+
+                if sigma2 is not None:
+                    # Re-initialize scales with AWQ weighting
+                    module._init_scales_from_weight(importance=sigma2, awq_alpha=awq_alpha)
+                    awq_count += 1
+                else:
+                    if verbose:
+                        print(f"    WARNING: No iMatrix for {name}, skipping AWQ weighting")
+
+        if verbose:
+            print(f"  Applied AWQ weighting to {awq_count} layers")
+        metrics['awq_alpha'] = awq_alpha
+        metrics['awq_layers'] = awq_count
+    elif awq_alpha > 0 and not imatrix:
+        if verbose:
+            print(f"\n[Step 4b] AWQ weighting SKIPPED (awq_alpha={awq_alpha} but no iMatrix provided)")
 
     # Ensure all model tensors are on the correct device after replacement
     # (SVD initialization may leave some buffers on CPU)
@@ -2440,6 +2524,13 @@ Examples:
                         help='Search optimal group size per tensor. Comma-separated sizes (e.g., "128,64,32,16")')
     parser.add_argument('--search-lut', action='store_true',
                         help='Search optimal LUT per tensor (4-bit layers only). Tests: uniform, power2, power3, inv_mu50')
+    parser.add_argument('--imatrix', type=str, default=None,
+                        help='Path to importance matrix (.pt file) for iMSE scoring. Use compute_imatrix.py to generate.')
+    parser.add_argument('--awq-alpha', type=float, default=0.0,
+                        help='AWQ-style importance weighting for scale initialization. '
+                             '0.0 = no effect (standard SVD), 0.5 = moderate (recommended), 1.0 = strong. '
+                             'Higher values bias scales toward important columns (from iMatrix). '
+                             'Requires --imatrix. This can improve PPL by reducing quantization error for important weights.')
 
     # Other options
     parser.add_argument('--quiet', '-q', action='store_true',
@@ -2464,6 +2555,10 @@ Examples:
     # Validate --output is provided
     if args.output is None:
         parser.error("--output is required")
+
+    # Validate --awq-alpha requires --imatrix
+    if args.awq_alpha > 0 and not args.imatrix:
+        parser.error("--awq-alpha requires --imatrix. Use compute_imatrix.py to generate one.")
 
     # Get preset and apply overrides
     preset = PRESETS[args.config]
@@ -2518,6 +2613,8 @@ Examples:
             measure_svd_error=args.svd_error,
             search_group_sizes=search_group_sizes,
             search_lut=args.search_lut,
+            imatrix_path=args.imatrix,
+            awq_alpha=args.awq_alpha,
             verbose=not args.quiet,
             detailed=args.verbose,
         )

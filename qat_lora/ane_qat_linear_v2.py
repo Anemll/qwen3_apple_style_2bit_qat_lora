@@ -734,18 +734,36 @@ class AnemllQATLinearV2(nn.Module):
             nn.init.zeros_(self.lora_B)
 
     @torch.no_grad()
-    def _init_scales_from_weight(self):
+    def _init_scales_from_weight(
+        self,
+        importance: Optional[torch.Tensor] = None,
+        awq_alpha: float = 0.0,
+    ):
         """Initialize scale parameters with unit-norm + magnitude decomposition.
 
         Uses V1's group-based initialization:
         1. Compute per-group max-abs scales
-        2. Expand to per-weight
-        3. SVD to get unit-norm A, B and magnitudes G
+        2. (Optional) Apply AWQ-style importance weighting
+        3. Expand to per-weight
+        4. SVD to get unit-norm A, B and magnitudes G
+
+        AWQ-Style Weighting (when importance and awq_alpha > 0):
+        - importance: [in_features] activation variance σ² from iMatrix
+        - awq_alpha: Weighting strength (0=none, 0.5=moderate, 1.0=strong)
+        - Effect: scales_per_weight *= (σ² ** awq_alpha)
+        - This biases scale allocation toward important input channels,
+          reducing quantization error for weights connected to high-variance activations.
 
         Result:
         - scale_A = u[:, :r] (unit-norm columns)
         - scale_B = vh[:r, :] (unit-norm rows)
         - rank_magnitude = s[:r] (singular values = magnitudes G)
+
+        Args:
+            importance: Optional [in_features] tensor of activation variance (σ²) from iMatrix.
+                       If provided with awq_alpha > 0, applies AWQ-style importance weighting.
+            awq_alpha: AWQ weighting strength. 0.0 = disabled (standard SVD),
+                      0.5 = moderate (recommended), 1.0 = strong.
         """
         w = self.weight.float()
         group_size = self.config.group_size
@@ -767,6 +785,25 @@ class AnemllQATLinearV2(nn.Module):
 
         # Trim to actual input size (V2 doesn't use padding in forward)
         scales_per_weight = scales_per_weight[:, :self.in_features]
+
+        # Step 2b: AWQ-style importance weighting (optional)
+        # Bias scale allocation toward important input channels
+        if importance is not None and awq_alpha > 0:
+            imp = importance.to(w.device).float()
+            # Normalize importance to mean=1
+            imp = imp / (imp.mean() + 1e-8)
+            # Clamp to prevent extreme values (0.1x to 10x range)
+            imp = imp.clamp(0.1, 10.0)
+            # Apply AWQ weighting: important columns get larger scales
+            # This makes Q_target smaller for those columns -> closer to LUT center
+            # -> less quantization error for important weights
+            awq_factor = imp ** awq_alpha
+            # CRITICAL: Renormalize awq_factor to mean=1
+            # This ensures AWQ is a REDISTRIBUTION (some scales up, others down)
+            # without changing the TOTAL scale magnitude.
+            # Without this, scales can shrink causing normalized values > LUT range!
+            awq_factor = awq_factor / (awq_factor.mean() + 1e-8)
+            scales_per_weight = scales_per_weight * awq_factor.view(1, -1)
 
         # Step 3: SVD: scales ≈ u @ diag(s) @ vh
         u, s, vh = torch.linalg.svd(scales_per_weight, full_matrices=False)
