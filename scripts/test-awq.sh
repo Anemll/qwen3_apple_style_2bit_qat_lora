@@ -4,6 +4,7 @@
 IM=runs/imatrix_qwen3_0.6b_random.pt
 BASE=Qwen/Qwen3-0.6B
 ALPHA=0.5
+DEVICE=${DEVICE:-tpu}  # tpu, cuda, mps, cpu
 
 # Collect PPL results
 declare -A PPL_RESULTS
@@ -38,8 +39,8 @@ python3 scripts/init_model_v2.py \
 # PPL check after init
 echo ""
 echo ">>> Step 2b: Measuring PPL (V2 init)"
-PPL_OUTPUT=$(python3 scripts/quick_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --max-chunks 20 2>&1)
-PPL=$(echo "$PPL_OUTPUT" | grep -iE "quick ppl|perplexity" | tail -1 | grep -oE "[0-9]+\.[0-9]+")
+PPL_OUTPUT=$(python3 scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device $DEVICE --dtype fp16 --max-chunks 20 2>&1)
+PPL=$(echo "$PPL_OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | grep -E "^Perplexity:" | grep -oE "[0-9]+\.[0-9]+")
 PPL_RESULTS["v2_init"]=$PPL
 echo "    PPL (v2_init) = $PPL"
 
@@ -64,8 +65,8 @@ python3 scripts/select_best_lut_per_layer.py runs/v2_awq_alpha05/v2_initial.pt \
 # PPL check after hybrid
 echo ""
 echo ">>> Step 4b: Measuring PPL (E,G hybrid)"
-PPL_OUTPUT=$(python3 scripts/quick_perplexity.py runs/v2_init_imse/ihybrid.pt --max-chunks 20 2>&1)
-PPL=$(echo "$PPL_OUTPUT" | grep -iE "quick ppl|perplexity" | tail -1 | grep -oE "[0-9]+\.[0-9]+")
+PPL_OUTPUT=$(python3 scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device $DEVICE --dtype fp16 --max-chunks 20 2>&1)
+PPL=$(echo "$PPL_OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | grep -E "^Perplexity:" | grep -oE "[0-9]+\.[0-9]+")
 PPL_RESULTS["hybrid"]=$PPL
 echo "    PPL (hybrid) = $PPL"
 

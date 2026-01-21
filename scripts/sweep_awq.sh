@@ -4,6 +4,7 @@
 IM=runs/imatrix_qwen3_0.6b_random.pt
 BASE=Qwen/Qwen3-0.6B
 ALPHAS="0.0 0.25 0.5 0.75 1.0"
+DEVICE=${DEVICE:-tpu}  # tpu, cuda, mps, cpu
 
 # Results array (alpha:ppl pairs)
 declare -A RESULTS
@@ -46,10 +47,10 @@ for a in $ALPHAS; do
   # Step 3: Measure perplexity (capture result)
   PPL_OUTPUT=$(python scripts/measure_perplexity.py \
     $OUT_INIT/v2_initial.pt \
-    --max-chunks 20 2>&1 | tee -a "$LOG_FILE")
+    --device $DEVICE --dtype fp16 --max-chunks 20 2>&1 | tee -a "$LOG_FILE")
 
-  # Extract perplexity value (look for "Perplexity:" or "PPL:" line)
-  PPL=$(echo "$PPL_OUTPUT" | grep -iE "perplexity|ppl" | tail -1 | grep -oE "[0-9]+\.[0-9]+")
+  # Extract perplexity value (look for "Perplexity:" line)
+  PPL=$(echo "$PPL_OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | grep -E "^Perplexity:" | grep -oE "[0-9]+\.[0-9]+")
 
   if [ -z "$PPL" ]; then
     PPL="ERROR"
