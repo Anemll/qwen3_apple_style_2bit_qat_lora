@@ -11,18 +11,57 @@ LUT Families:
     E: Original - existing LUT from checkpoint (baseline to beat!)
     F: Predefined - from init_model_v2.py (fp4_dense, uniform)
     G: K-means - weighted Lloyd's algorithm (often beats hand-crafted grids!)
+    H: Symmetric K-means - trainable-compatible symmetric LUT
     A: Uniform - linspace(-M, M, 16)
     B: Dense-center - asinh, tanh, sqrt
     C: Heavy-tail - geometric, power2, power3
     D: Quantile - data-driven from layer's |Q_eff|
 
 Selection Metrics:
-    --metric weighted_mse   (default) - S^2-weighted MSE (better PPL correlation)
+    --metric weighted_mse   (default) - S²-weighted MSE (better PPL correlation)
     --metric mae            - Mean absolute error (original)
     --metric activation_mse - Activation-weighted MSE (requires --imatrix)
     --metric iActMSE        - BEST: iMatrix-weighted activation MSE (requires --imatrix)
                               iActMSE = Σ σ²[i] * S² * (Q_target - Q_quant)²
                               This is the theoretically correct metric for PPL optimization.
+
+IMATRIX (Importance Matrix):
+===========================
+
+  The iMatrix captures input activation statistics (σ² = E[x_i²]) for each linear
+  layer. When provided via --imatrix, it enables:
+
+  1. iActMSE metric: Theoretically correct metric that measures expected activation
+     error, not just weight reconstruction error.
+
+  2. Weighted k-means (Family G): Optimizes LUT centroids using σ² × S² weighting,
+     placing more entries where activation error matters most.
+
+  3. Weighted quantiles (Family D): Places LUT values at importance-weighted
+     quantiles of the Q distribution.
+
+  CREATING AN IMATRIX:
+  -------------------
+
+    # Option 1: compute_imatrix.py (recommended, faster)
+    python scripts/compute_imatrix.py \\
+        --model Qwen/Qwen3-0.6B \\
+        --calib-mode random_ids \\
+        --tokens 100000 --seq-len 512 \\
+        --out runs/imatrix.pt
+
+    # Option 2: calibrate_activation_stats.py (uses WikiText data)
+    python scripts/calibrate_activation_stats.py \\
+        --model Qwen/Qwen3-0.6B \\
+        --output runs/imatrix.pt \\
+        --num-samples 256 --seq-len 512
+
+  The iMatrix .pt file contains:
+    {
+      "sigma2": { "<layer_name>": tensor[in_features], ... },  # E[x_i²]
+      "count":  { "<layer_name>": int, ... },
+      "meta":   { ... }
+    }
 
 Note:
     - checkpoint.pt provides: scales (scale_A, scale_B), current LUT, _Q/_indices
@@ -43,10 +82,14 @@ Usage:
     # Use weighted MSE (default, better PPL correlation)
     python scripts/select_best_lut_per_layer.py checkpoint.pt -o hybrid.pt --metric weighted_mse
 
-    # BEST: Use iActMSE metric (requires imatrix first)
-    python scripts/compute_imatrix.py --output imatrix.pt
-    python scripts/select_best_lut_per_layer.py checkpoint.pt -o hybrid.pt \
-        --metric iActMSE --imatrix imatrix.pt --families E,G
+    # BEST: Use iActMSE with iMatrix (requires creating imatrix first)
+    python scripts/compute_imatrix.py \\
+        --model Qwen/Qwen3-0.6B \\
+        --tokens 100000 --seq-len 512 \\
+        --out runs/imatrix.pt
+
+    python scripts/select_best_lut_per_layer.py checkpoint.pt -o hybrid.pt \\
+        --metric iActMSE --imatrix runs/imatrix.pt --families E,G
 
     # With stats output
     python scripts/select_best_lut_per_layer.py checkpoint.pt -o hybrid.pt --output-stats stats.json

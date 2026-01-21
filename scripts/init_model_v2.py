@@ -64,6 +64,69 @@ NEXT STEPS:
         --output-dir runs/my_run \\
         --max-steps 1000
 
+IMATRIX (Importance Matrix):
+===========================
+
+  The iMatrix captures input activation statistics (σ² = E[x_i²]) for each linear
+  layer's input features. This enables importance-weighted LUT selection, which
+  places more LUT entries where activation error matters most for PPL.
+
+  CREATING AN IMATRIX:
+  -------------------
+
+    # Option 1: compute_imatrix.py (recommended, faster)
+    python scripts/compute_imatrix.py \\
+        --model Qwen/Qwen3-0.6B \\
+        --calib-mode random_ids \\
+        --tokens 100000 --seq-len 512 \\
+        --out runs/imatrix.pt
+
+    # Option 2: calibrate_activation_stats.py (uses WikiText data)
+    python scripts/calibrate_activation_stats.py \\
+        --model Qwen/Qwen3-0.6B \\
+        --output runs/imatrix.pt \\
+        --num-samples 256 --seq-len 512
+
+  USING IMATRIX WITH init_model_v2.py:
+  -----------------------------------
+
+    # Use iMatrix for iMSE-weighted LUT search during initialization
+    python scripts/init_model_v2.py \\
+        --model-id Qwen/Qwen3-0.6B \\
+        --output runs/v2_imse \\
+        --config q4a4 \\
+        --search-lut \\
+        --imatrix runs/imatrix.pt
+
+    The --imatrix flag enables iMSE (importance-weighted MSE) scoring when
+    --search-lut is used. Without it, standard MSE is used.
+
+  USING IMATRIX WITH select_best_lut_per_layer.py:
+  -----------------------------------------------
+
+    # BEST: Use iActMSE metric for per-layer LUT selection
+    python scripts/select_best_lut_per_layer.py \\
+        runs/v2_initial.pt \\
+        -o runs/v2_hybrid.pt \\
+        --metric iActMSE \\
+        --imatrix runs/imatrix.pt \\
+        --families E,G
+
+    iActMSE = Σ σ²[i] * S[o,i]² * (Q_target - Q_quant)²
+
+    This is the theoretically correct metric because it measures expected
+    activation error, not just weight reconstruction error.
+
+  OUTPUT FORMAT:
+  -------------
+
+    The iMatrix .pt file contains:
+    {
+      "sigma2": { "<layer_name>": tensor[in_features], ... },  # E[x_i²]
+      "count":  { "<layer_name>": int, ... },                  # samples per feature
+      "meta":   { ... }                                        # run metadata
+    }
+
 Author: ANEMLL Team
 """
 
@@ -2229,40 +2292,22 @@ def init_v2_model(
         )
         metrics['steps']['replace'] = replace_stats
 
-    # Step 4b-AWQ: Apply AWQ-style importance weighting to scales (optional)
-    # This re-initializes scales with importance weighting from iMatrix
-    if awq_alpha > 0 and imatrix:
-        if verbose:
-            print(f"\n[Step 4b] Applying AWQ-style scale weighting (alpha={awq_alpha})...")
-
-        from qat_lora.ane_qat_linear_v2 import AnemllQATLinearV2
-
-        awq_count = 0
-        for name, module in model.named_modules():
-            if isinstance(module, AnemllQATLinearV2):
-                # Find the corresponding iMatrix entry
-                # iMatrix keys may not match exactly, try common patterns
-                sigma2 = None
-                for pattern in [name, name.replace('.linear', ''), name + '.linear']:
-                    if pattern in imatrix:
-                        sigma2 = imatrix[pattern]
-                        break
-
-                if sigma2 is not None:
-                    # Re-initialize scales with AWQ weighting
-                    module._init_scales_from_weight(importance=sigma2, awq_alpha=awq_alpha)
-                    awq_count += 1
-                else:
-                    if verbose:
-                        print(f"    WARNING: No iMatrix for {name}, skipping AWQ weighting")
-
-        if verbose:
-            print(f"  Applied AWQ weighting to {awq_count} layers")
-        metrics['awq_alpha'] = awq_alpha
-        metrics['awq_layers'] = awq_count
-    elif awq_alpha > 0 and not imatrix:
-        if verbose:
-            print(f"\n[Step 4b] AWQ weighting SKIPPED (awq_alpha={awq_alpha} but no iMatrix provided)")
+    # Step 4b-AWQ: AWQ-style importance weighting (NOT IMPLEMENTED)
+    # AWQ requires BOTH:
+    #   1. Scaling weights by importance factor
+    #   2. Applying INVERSE factor to inputs (via RMSNorm.weight modification)
+    # Without the inverse, the model output changes and inference breaks.
+    # For Qwen3: Would need to modify post_attention_layernorm.weight for gate/up_proj,
+    # input_layernorm.weight for q/k/v_proj. down_proj and o_proj are harder.
+    # TODO: Implement proper AWQ with RMSNorm compensation
+    if awq_alpha > 0:
+        print(f"\n[Step 4b] ERROR: --awq-alpha is NOT IMPLEMENTED correctly!")
+        print(f"  AWQ requires applying inverse scaling to inputs (via RMSNorm.weight),")
+        print(f"  but this is not implemented. Using --awq-alpha will BREAK the model.")
+        print(f"  Skipping AWQ weighting. Remove --awq-alpha from your command.")
+        print()
+        metrics['awq_alpha'] = 0
+        metrics['awq_skipped'] = f'NOT IMPLEMENTED (requested alpha={awq_alpha})'
 
     # Ensure all model tensors are on the correct device after replacement
     # (SVD initialization may leave some buffers on CPU)
@@ -2527,10 +2572,10 @@ Examples:
     parser.add_argument('--imatrix', type=str, default=None,
                         help='Path to importance matrix (.pt file) for iMSE scoring. Use compute_imatrix.py to generate.')
     parser.add_argument('--awq-alpha', type=float, default=0.0,
-                        help='AWQ-style importance weighting for scale initialization. '
-                             '0.0 = no effect (standard SVD), 0.5 = moderate (recommended), 1.0 = strong. '
-                             'Higher values bias scales toward important columns (from iMatrix). '
-                             'Requires --imatrix. This can improve PPL by reducing quantization error for important weights.')
+                        help='[NOT IMPLEMENTED] AWQ-style importance weighting. '
+                             'AWQ requires applying inverse scaling to RMSNorm, which is not yet implemented. '
+                             'Using this option will print an error and skip AWQ. '
+                             'TODO: Implement proper AWQ with RMSNorm compensation for Qwen3.')
 
     # Other options
     parser.add_argument('--quiet', '-q', action='store_true',
@@ -2556,9 +2601,11 @@ Examples:
     if args.output is None:
         parser.error("--output is required")
 
-    # Validate --awq-alpha requires --imatrix
-    if args.awq_alpha > 0 and not args.imatrix:
-        parser.error("--awq-alpha requires --imatrix. Use compute_imatrix.py to generate one.")
+    # Warn about --awq-alpha (not implemented)
+    if args.awq_alpha > 0:
+        print(f"\nWARNING: --awq-alpha is NOT IMPLEMENTED and will be IGNORED.")
+        print(f"  AWQ requires inverse scaling in RMSNorm, which is not implemented.")
+        print(f"  Your checkpoint will be created without AWQ weighting.\n")
 
     # Get preset and apply overrides
     preset = PRESETS[args.config]
