@@ -2116,6 +2116,7 @@ def init_v2_model(
     measure_svd_error: bool = False,
     search_group_sizes: Optional[List[int]] = None,
     search_lut: bool = False,
+    default_lut: Optional[str] = None,
     imatrix_path: Optional[str] = None,
     awq_alpha: float = 0.0,
     verbose: bool = True,
@@ -2140,6 +2141,7 @@ def init_v2_model(
         measure_svd_error: Measure SVD approximation error (MAE vs original)
         search_group_sizes: List of group sizes to test per tensor (e.g., [128, 64, 32, 16])
         search_lut: Search for optimal LUT per tensor (only for 4-bit layers)
+        default_lut: Use specific LUT for all 4-bit layers (e.g., 'fp4_dense'). Skips search.
         imatrix_path: Path to importance matrix (.pt file) for iMSE scoring
         awq_alpha: AWQ-style importance weighting for scale initialization (default: 0.0).
                    0.0 = no effect (standard SVD), 0.5 = moderate (recommended), 1.0 = strong.
@@ -2235,8 +2237,38 @@ def init_v2_model(
                 meta = imatrix_data['metadata']
                 print(f"  Source: {meta.get('model_id', 'N/A')}, tokens={meta.get('num_tokens', 'N/A')}")
 
-    # Step 4a: LUT search (only for 4-bit layers)
-    if search_lut and (preset.mlp_lut_bits == 4 or preset.attn_lut_bits == 4):
+    # Step 4a: LUT selection (search or fixed)
+    # Option 1: Use fixed LUT for all layers (--lut fp4_dense)
+    # Option 2: Search for optimal LUT per layer (--search-lut)
+
+    if default_lut is not None and (preset.mlp_lut_bits == 4 or preset.attn_lut_bits == 4):
+        # Fixed LUT for all 4-bit layers - no search needed
+        lut_candidates = get_lut16_candidates()
+        if default_lut not in lut_candidates:
+            raise ValueError(f"Unknown LUT '{default_lut}'. Available: {list(lut_candidates.keys())}")
+
+        if verbose:
+            print(f"\n[Step 4a] Using fixed LUT: {default_lut} (no search)")
+
+        # Build optimal_lut_map with fixed LUT for all MLP/Attn layers
+        optimal_lut_map = {}
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear):
+                if 'lm_head' in name or 'embed' in name:
+                    continue
+                if 'mlp' in name or 'self_attn' in name or 'attention' in name:
+                    optimal_lut_map[name] = default_lut
+
+        if verbose:
+            print(f"  Applied to {len(optimal_lut_map)} layers")
+
+        metrics['steps']['lut_search'] = {
+            'type': 'fixed',
+            'lut_name': default_lut,
+            'num_layers': len(optimal_lut_map),
+        }
+
+    elif search_lut and (preset.mlp_lut_bits == 4 or preset.attn_lut_bits == 4):
         if verbose:
             print(f"\n[Step 4a] Searching optimal LUT per tensor...")
 
@@ -2259,7 +2291,7 @@ def init_v2_model(
         )
         metrics['steps']['lut_search'] = lut_search_stats
         optimal_lut_map = lut_search_stats['optimal_lut_map']
-    elif search_lut:
+    elif search_lut or default_lut:
         if verbose:
             print(f"\n[Step 4a] LUT search SKIPPED (only for 4-bit layers, preset has {preset.mlp_lut_bits}-bit MLP, {preset.attn_lut_bits}-bit Attn)")
 
@@ -2628,7 +2660,9 @@ Examples:
     parser.add_argument('--search-group', type=str, default=None,
                         help='Search optimal group size per tensor. Comma-separated sizes (e.g., "128,64,32,16")')
     parser.add_argument('--search-lut', action='store_true',
-                        help='Search optimal LUT per tensor (4-bit layers only). Tests: uniform, power2, power3, inv_mu50')
+                        help='Search optimal LUT per tensor (4-bit layers only). Tests: uniform, fp4_dense')
+    parser.add_argument('--lut', type=str, default=None,
+                        help='Use specific LUT for all 4-bit layers (skips search). Options: uniform, fp4_dense')
     parser.add_argument('--imatrix', type=str, default=None,
                         help='Path to importance matrix (.pt file) for iMSE scoring. Use compute_imatrix.py to generate.')
     parser.add_argument('--awq-alpha', type=float, default=0.0,
@@ -2720,6 +2754,7 @@ Examples:
             measure_svd_error=args.svd_error,
             search_group_sizes=search_group_sizes,
             search_lut=args.search_lut,
+            default_lut=args.lut,
             imatrix_path=args.imatrix,
             awq_alpha=args.awq_alpha,
             verbose=not args.quiet,

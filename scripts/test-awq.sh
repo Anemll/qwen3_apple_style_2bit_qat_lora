@@ -10,7 +10,8 @@
 # 2. Apply AWQ scales:
 #    python scripts/apply_awq_equiv_scales.py --model-id Qwen/Qwen3-0.6B --imatrix runs/imatrix_qwen3_0.6b_random.pt --alpha 0.5 --output runs/awq_scaled_model
 #
-# 3. Initialize V2:
+# 3. Initialize V2 (fast: --lut fp4_dense, or slow: --search-lut):
+#    python scripts/init_model_v2.py --model-id runs/awq_scaled_model --output runs/v2_awq_alpha05 --config q4a4_r32 --lut fp4_dense --imatrix runs/imatrix_qwen3_0.6b_random.pt --svd-error
 #    python scripts/init_model_v2.py --model-id runs/awq_scaled_model --output runs/v2_awq_alpha05 --config q4a4_r32 --search-lut --imatrix runs/imatrix_qwen3_0.6b_random.pt --svd-error
 #
 # 4. Measure PPL (V2 init):

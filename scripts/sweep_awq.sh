@@ -10,7 +10,8 @@
 # 2. Apply AWQ scales (alpha=0.5 example):
 #    python scripts/apply_awq_equiv_scales.py --model-id Qwen/Qwen3-0.6B --imatrix runs/imatrix_qwen3_0.6b_random.pt --alpha 0.5 --output runs/awq_scaled_a0.5 --dtype float32
 #
-# 3. Initialize V2:
+# 3. Initialize V2 (fast: --lut fp4_dense, or slow: --search-lut):
+#    python scripts/init_model_v2.py --model-id runs/awq_scaled_a0.5 -o runs/v2_awq_a0.5 -c q4a4_r32 --lut fp4_dense --imatrix runs/imatrix_qwen3_0.6b_random.pt
 #    python scripts/init_model_v2.py --model-id runs/awq_scaled_a0.5 -o runs/v2_awq_a0.5 -c q4a4_r32 --search-lut --imatrix runs/imatrix_qwen3_0.6b_random.pt
 #
 # 4. Measure PPL:
@@ -63,21 +64,23 @@ for a in $ALPHAS; do
   echo "    Init output: $OUT_INIT"
   echo "    Log file:    $LOG_FILE"
 
-  # Step 1: Apply AWQ scales (quiet)
+  # Step 1: Apply AWQ scales (with progress via tee)
   python scripts/apply_awq_equiv_scales.py \
     --model-id $BASE \
     --imatrix $IM \
     --alpha $a \
     --output $OUT_BASE \
-    --dtype float32 > "$LOG_FILE" 2>&1
+    --dtype float32 2>&1 | tee "$LOG_FILE"
 
-  # Step 2: Initialize V2 (quiet)
+  # Step 2: Initialize V2 (with progress via tee)
+  # Use --lut fp4_dense for fast init (no per-layer search)
+  # Or use --search-lut for optimal per-layer LUT selection (slower)
   python scripts/init_model_v2.py \
     --model-id $OUT_BASE \
     -o $OUT_INIT \
     -c q4a4_r32 \
-    --search-lut \
-    --imatrix $IM >> "$LOG_FILE" 2>&1
+    --lut fp4_dense \
+    --imatrix $IM 2>&1 | tee -a "$LOG_FILE"
 
   # Step 3: Measure perplexity (capture result)
   PPL_OUTPUT=$(python scripts/measure_perplexity.py \
