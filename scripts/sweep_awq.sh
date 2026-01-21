@@ -14,8 +14,8 @@
 #    python scripts/init_model_v2.py --model-id runs/awq_scaled_a0.5 -o runs/v2_awq_a0.5 -c q4a4_r32 --lut fp4_dense --imatrix runs/imatrix_qwen3_0.6b_random.pt
 #    python scripts/init_model_v2.py --model-id runs/awq_scaled_a0.5 -o runs/v2_awq_a0.5 -c q4a4_r32 --search-lut --imatrix runs/imatrix_qwen3_0.6b_random.pt
 #
-# 4. Measure PPL:
-#    python scripts/measure_perplexity.py runs/v2_awq_a0.5/v2_initial.pt --device tpu --dtype fp16 --max-chunks 20
+# 4. Measure PPL (full dataset):
+#    python scripts/measure_perplexity.py runs/v2_awq_a0.5/v2_initial.pt --device tpu --dtype fp16
 #
 # Environment: DEVICE=tpu ./scripts/sweep_awq.sh
 #              DEVICE=cuda ./scripts/sweep_awq.sh
@@ -86,12 +86,12 @@ for a in $ALPHAS; do
     --lut fp4_dense \
     --imatrix $IM 2>&1 | tee -a "$LOG_FILE"
 
-  # Step 3: Measure perplexity
+  # Step 3: Measure perplexity (full dataset)
   echo ""
-  echo "    [3/3] python scripts/measure_perplexity.py $OUT_INIT/v2_initial.pt --device $DEVICE --dtype fp16 --max-chunks 20 --output-ppl"
+  echo "    [3/3] python scripts/measure_perplexity.py $OUT_INIT/v2_initial.pt --device $DEVICE --dtype fp16 --output-ppl"
   PPL_OUTPUT=$(python scripts/measure_perplexity.py \
     $OUT_INIT/v2_initial.pt \
-    --device $DEVICE --dtype fp16 --max-chunks 20 --output-ppl 2>&1 | tee -a "$LOG_FILE")
+    --device $DEVICE --dtype fp16 --output-ppl 2>&1 | tee -a "$LOG_FILE")
 
   # Extract perplexity value (--output-ppl gives "PPL=XX.XXXX")
   PPL=$(echo "$PPL_OUTPUT" | grep "^PPL=" | cut -d= -f2)

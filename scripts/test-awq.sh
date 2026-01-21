@@ -80,11 +80,11 @@ python3 scripts/init_model_v2.py \
     --search-lut \
     --imatrix $IM --svd-error
 
-# PPL check after init
+# PPL check after init (full dataset)
 echo ""
 echo ">>> Step 2b: Measuring PPL (V2 init)"
-echo "    CMD: python3 scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device $DEVICE --dtype fp16  --output-ppl"
-PPL_OUTPUT=$(python3 scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device $DEVICE --dtype fp16  --output-ppl 2>&1)
+echo "    CMD: python3 scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device $DEVICE --dtype fp16 --output-ppl"
+PPL_OUTPUT=$(python3 scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device $DEVICE --dtype fp16 --output-ppl 2>&1)
 PPL=$(echo "$PPL_OUTPUT" | grep "^PPL=" | cut -d= -f2)
 PPL_RESULTS["v2_init"]=$PPL
 echo "    PPL (v2_init) = $PPL"
@@ -108,11 +108,11 @@ python3 scripts/select_best_lut_per_layer.py runs/v2_awq_alpha05/v2_initial.pt \
     --imatrix $IM \
     --families A,B,C,D,E,F,G --no-tighten --verbose
 
-# PPL check after hybrid
+# PPL check after hybrid (full dataset)
 echo ""
 echo ">>> Step 4b: Measuring PPL (E,G hybrid)"
-echo "    CMD: python3 scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device $DEVICE --dtype fp16  --output-ppl"
-PPL_OUTPUT=$(python3 scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device $DEVICE --dtype fp16  --output-ppl 2>&1)
+echo "    CMD: python3 scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device $DEVICE --dtype fp16 --output-ppl"
+PPL_OUTPUT=$(python3 scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device $DEVICE --dtype fp16 --output-ppl 2>&1)
 PPL=$(echo "$PPL_OUTPUT" | grep "^PPL=" | cut -d= -f2)
 PPL_RESULTS["hybrid"]=$PPL
 echo "    PPL (hybrid) = $PPL"
