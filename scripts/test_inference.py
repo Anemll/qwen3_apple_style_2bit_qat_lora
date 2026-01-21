@@ -164,9 +164,10 @@ def load_model(args):
     scale_rank = args.scale_rank or config.get('scale_rank') or config.get('mlp_scale_rank', 4)
     attn_scale_rank = args.attn_scale_rank or config.get('attn_scale_rank', scale_rank)
     model_id = config.get('model_id', args.model_id)
+    group_size = config.get('group_size', 16)  # Default matches V2 init
 
     print(f"Config: lut_bits={lut_bits}, attn_lut_bits={attn_lut_bits}, "
-          f"scale_rank={scale_rank}, attn_scale_rank={attn_scale_rank}")
+          f"scale_rank={scale_rank}, attn_scale_rank={attn_scale_rank}, group_size={group_size}")
 
     print(f"Loading base model: {model_id}")
 
@@ -193,12 +194,14 @@ def load_model(args):
         mlp_config = AnemllQuantConfigV2(
             lut_size=2**lut_bits,
             scale_rank=scale_rank,
+            group_size=group_size,
             force_positive_scales=False,  # Match training config (train_v2_simple.py)
             magnitude_activation='identity',
         )
         attn_config = AnemllQuantConfigV2(
             lut_size=2**attn_lut_bits,
             scale_rank=attn_scale_rank,
+            group_size=group_size,
             force_positive_scales=False,  # Match training config (train_v2_simple.py)
             magnitude_activation='identity',
         )

@@ -264,6 +264,8 @@ def main():
     assert os.path.exists(args.cache_dir), f"Cache dir not found: {args.cache_dir}"
 
     # Auto-detect config from checkpoint directory if not specified
+    # Also load lut_bits/rank directly for checkpoints without config_preset
+    _ckpt_config_overrides = {}  # lut_size/rank from checkpoint config.json
     if args.config is None:
         config_detected = False
         # Try to find config.json in checkpoint directory
@@ -279,6 +281,24 @@ def main():
                         args.config = ckpt_config['config_preset']
                         config_detected = True
                         print(f"[Config] Auto-detected from {config_json}: {args.config}")
+                    else:
+                        # No config_preset - read lut_bits/rank directly
+                        # Note: config.json stores lut_bits (2 or 4), convert to lut_size (4 or 16)
+                        if 'lut_bits' in ckpt_config:
+                            _ckpt_config_overrides['mlp_lut'] = 2 ** ckpt_config['lut_bits']
+                        if 'attn_lut_bits' in ckpt_config:
+                            _ckpt_config_overrides['attn_lut'] = 2 ** ckpt_config['attn_lut_bits']
+                        if 'scale_rank' in ckpt_config:
+                            _ckpt_config_overrides['mlp_rank'] = ckpt_config['scale_rank']
+                        if 'attn_scale_rank' in ckpt_config:
+                            _ckpt_config_overrides['attn_rank'] = ckpt_config['attn_scale_rank']
+                        if 'group_size' in ckpt_config:
+                            _ckpt_config_overrides['group_size'] = ckpt_config['group_size']
+                        if _ckpt_config_overrides:
+                            config_detected = True
+                            print(f"[Config] Loaded from {config_json} (no preset):")
+                            for k, v in _ckpt_config_overrides.items():
+                                print(f"    {k}: {v}")
                 except Exception as e:
                     print(f"[Config] Warning: Failed to read {config_json}: {e}")
         # Fallback to default
@@ -382,12 +402,42 @@ def main():
     }
 
     # Load preset and apply overrides
-    preset = CONFIG_PRESETS[args.config]
-    MLP_LUT_SIZE = args.mlp_lut if args.mlp_lut is not None else preset['mlp_lut']
-    MLP_RANK = args.mlp_rank if args.mlp_rank is not None else preset['mlp_rank']
-    ATTN_LUT_SIZE = args.attn_lut if args.attn_lut is not None else preset['attn_lut']
-    ATTN_RANK = args.attn_rank if args.attn_rank is not None else preset['attn_rank']
+    # Priority: CLI args > checkpoint config.json > preset defaults
+    if args.config:
+        preset = CONFIG_PRESETS[args.config]
+    else:
+        # No preset, use q4a4_r32 as base (will be overridden by _ckpt_config_overrides)
+        preset = CONFIG_PRESETS['q4a4_r32']
+
+    # Start with preset
+    MLP_LUT_SIZE = preset['mlp_lut']
+    MLP_RANK = preset['mlp_rank']
+    ATTN_LUT_SIZE = preset['attn_lut']
+    ATTN_RANK = preset['attn_rank']
     GROUP_SIZE = args.group_size
+
+    # Apply checkpoint config.json overrides (if config had no preset)
+    if _ckpt_config_overrides:
+        if 'mlp_lut' in _ckpt_config_overrides:
+            MLP_LUT_SIZE = _ckpt_config_overrides['mlp_lut']
+        if 'attn_lut' in _ckpt_config_overrides:
+            ATTN_LUT_SIZE = _ckpt_config_overrides['attn_lut']
+        if 'mlp_rank' in _ckpt_config_overrides:
+            MLP_RANK = _ckpt_config_overrides['mlp_rank']
+        if 'attn_rank' in _ckpt_config_overrides:
+            ATTN_RANK = _ckpt_config_overrides['attn_rank']
+        if 'group_size' in _ckpt_config_overrides:
+            GROUP_SIZE = _ckpt_config_overrides['group_size']
+
+    # CLI args take highest priority
+    if args.mlp_lut is not None:
+        MLP_LUT_SIZE = args.mlp_lut
+    if args.mlp_rank is not None:
+        MLP_RANK = args.mlp_rank
+    if args.attn_lut is not None:
+        ATTN_LUT_SIZE = args.attn_lut
+    if args.attn_rank is not None:
+        ATTN_RANK = args.attn_rank
 
     # Config name for display
     config_name = args.config.upper()
@@ -926,36 +976,56 @@ def main():
     torch.save(v2_model.state_dict(), fp16_path)
     print(f"  FP16: {fp16_path}")
 
-    # Save config.json if it doesn't exist
+    # Save config.json (always overwrite to capture training info)
     config_path = Path(args.output_dir) / 'config.json'
-    if not config_path.exists():
-        import json
-        # Compute lut_bits from LUT_SIZE (LUT16 = 4-bit, LUT4 = 2-bit)
-        mlp_lut_bits = {4: 2, 16: 4}.get(MLP_LUT_SIZE, 4)
-        attn_lut_bits = {4: 2, 16: 4}.get(ATTN_LUT_SIZE, 4)
-        config_data = {
-            'version': 'v2',
-            'model_id': args.model_id,
-            'config_preset': args.config,
-            # Quantization config
-            'lut_bits': mlp_lut_bits,
-            'mlp_lut_bits': mlp_lut_bits,
-            'attn_lut_bits': attn_lut_bits,
-            'scale_rank': MLP_RANK,
-            'mlp_scale_rank': MLP_RANK,
-            'attn_scale_rank': ATTN_RANK,
-            'group_size': GROUP_SIZE,
-            # LoRA config (0 = no LoRA for this run)
-            'lora_r': 0,
-            'lora_alpha': 0,
-            'lora_mlp_only': False,
-            # Training info
-            'max_steps': args.max_steps,
-            'final_loss': result.get('final_loss'),
-        }
-        with open(config_path, 'w') as f:
-            json.dump(config_data, f, indent=2)
-        print(f"  Config: {config_path}")
+    import json
+
+    # Load source checkpoint's config to preserve provenance
+    source_config = {}
+    if args.v2_checkpoint:
+        source_config_path = Path(args.v2_checkpoint).parent / 'config.json'
+        if source_config_path.exists():
+            try:
+                with open(source_config_path) as f:
+                    source_config = json.load(f)
+            except Exception:
+                pass
+
+    # Compute lut_bits from LUT_SIZE (LUT16 = 4-bit, LUT4 = 2-bit)
+    mlp_lut_bits = {4: 2, 16: 4}.get(MLP_LUT_SIZE, 4)
+    attn_lut_bits = {4: 2, 16: 4}.get(ATTN_LUT_SIZE, 4)
+    config_data = {
+        'version': 'v2',
+        'model_id': args.model_id,
+        'config_preset': args.config,
+        # Quantization config
+        'lut_bits': mlp_lut_bits,
+        'mlp_lut_bits': mlp_lut_bits,
+        'attn_lut_bits': attn_lut_bits,
+        'scale_rank': MLP_RANK,
+        'mlp_scale_rank': MLP_RANK,
+        'attn_scale_rank': ATTN_RANK,
+        'group_size': GROUP_SIZE,
+        # LoRA config (0 = no LoRA for this run)
+        'lora_r': 0,
+        'lora_alpha': 0,
+        'lora_mlp_only': False,
+        # Training info
+        'max_steps': args.max_steps,
+        'final_loss': result.get('final_loss'),
+        # Provenance: source checkpoint
+        'source_checkpoint': args.v2_checkpoint or args.v1_checkpoint,
+    }
+
+    # Preserve important fields from source checkpoint's config
+    # (optimal_lut_map, families, metric, etc.)
+    for key in ['optimal_lut_map', 'families', 'metric']:
+        if key in source_config and key not in config_data:
+            config_data[key] = source_config[key]
+
+    with open(config_path, 'w') as f:
+        json.dump(config_data, f, indent=2)
+    print(f"  Config: {config_path}")
 
     # =========================================================================
     # STEP 5: Upload to Google Drive (optional)

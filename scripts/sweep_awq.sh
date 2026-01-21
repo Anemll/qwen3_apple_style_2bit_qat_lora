@@ -1,0 +1,91 @@
+#!/bin/bash
+# Sweep AWQ alpha values and collect perplexity results
+
+IM=runs/imatrix_qwen3_0.6b_random.pt
+BASE=Qwen/Qwen3-0.6B
+ALPHAS="0.0 0.25 0.5 0.75 1.0"
+
+# Results array (alpha:ppl pairs)
+declare -A RESULTS
+
+echo "============================================================"
+echo "AWQ ALPHA SWEEP"
+echo "============================================================"
+echo "Base model: $BASE"
+echo "iMatrix:    $IM"
+echo "Alphas:     $ALPHAS"
+echo "============================================================"
+echo ""
+
+for a in $ALPHAS; do
+  OUT_BASE=runs/awq_scaled_a${a}
+  OUT_INIT=runs/v2_awq_a${a}
+  LOG_FILE=runs/sweep_awq_a${a}.log
+
+  echo ">>> Alpha = $a"
+  echo "    AWQ output:  $OUT_BASE"
+  echo "    Init output: $OUT_INIT"
+  echo "    Log file:    $LOG_FILE"
+
+  # Step 1: Apply AWQ scales (quiet)
+  python scripts/apply_awq_equiv_scales.py \
+    --model-id $BASE \
+    --imatrix $IM \
+    --alpha $a \
+    --output $OUT_BASE \
+    --dtype float32 > "$LOG_FILE" 2>&1
+
+  # Step 2: Initialize V2 (quiet)
+  python scripts/init_model_v2.py \
+    --model-id $OUT_BASE \
+    -o $OUT_INIT \
+    -c q4a4_r32 \
+    --search-lut \
+    --imatrix $IM >> "$LOG_FILE" 2>&1
+
+  # Step 3: Measure perplexity (capture result)
+  PPL_OUTPUT=$(python scripts/measure_perplexity.py \
+    $OUT_INIT/v2_initial.pt \
+    --max-chunks 20 2>&1 | tee -a "$LOG_FILE")
+
+  # Extract perplexity value (look for "Perplexity:" or "PPL:" line)
+  PPL=$(echo "$PPL_OUTPUT" | grep -iE "perplexity|ppl" | tail -1 | grep -oE "[0-9]+\.[0-9]+")
+
+  if [ -z "$PPL" ]; then
+    PPL="ERROR"
+  fi
+
+  RESULTS[$a]=$PPL
+  echo "    PPL = $PPL"
+  echo ""
+done
+
+# Print summary table
+echo ""
+echo "============================================================"
+echo "SUMMARY: AWQ Alpha Sweep Results"
+echo "============================================================"
+printf "%-10s | %-12s | %s\n" "Alpha" "Perplexity" "Checkpoint"
+echo "-----------|--------------|------------------------------------"
+for a in $ALPHAS; do
+  printf "%-10s | %-12s | %s\n" "$a" "${RESULTS[$a]}" "runs/v2_awq_a${a}/v2_initial.pt"
+done
+echo "============================================================"
+
+# Find best alpha
+BEST_ALPHA=""
+BEST_PPL=999999
+for a in $ALPHAS; do
+  ppl="${RESULTS[$a]}"
+  if [[ "$ppl" != "ERROR" ]] && (( $(echo "$ppl < $BEST_PPL" | bc -l) )); then
+    BEST_PPL=$ppl
+    BEST_ALPHA=$a
+  fi
+done
+
+if [ -n "$BEST_ALPHA" ]; then
+  echo ""
+  echo "Best: alpha=$BEST_ALPHA (PPL=$BEST_PPL)"
+  echo "      runs/v2_awq_a${BEST_ALPHA}/v2_initial.pt"
+fi
+echo ""

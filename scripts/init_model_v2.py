@@ -127,6 +127,66 @@ IMATRIX (Importance Matrix):
       "meta":   { ... }                                        # run metadata
     }
 
+AWQ (Activation-aware Weight Quantization):
+==========================================
+
+  AWQ protects important channels by applying an EQUIVALENT TRANSFORM:
+    - Scale up weight columns for important channels (s > 1)
+    - Apply INVERSE scaling to preceding layer (RMSNorm or previous Linear)
+    - Net effect: y = (W*s) @ (x/s) = W @ x (function preserved!)
+
+  This concentrates quantization error in less important channels.
+
+  FULL AWQ WORKFLOW (recommended):
+  --------------------------------
+
+    # Step 1: Create iMatrix (activation statistics)
+    python scripts/compute_imatrix.py \\
+        --model Qwen/Qwen3-0.6B \\
+        --tokens 100000 --seq-len 512 \\
+        --out runs/imatrix.pt
+
+    # Step 2: Apply AWQ-equivalent transforms to FP model
+    python scripts/apply_awq_equiv_scales.py \\
+        --model-id Qwen/Qwen3-0.6B \\
+        --imatrix runs/imatrix.pt \\
+        --alpha 0.5 \\
+        --output runs/awq_scaled_model
+
+    # Step 3: Initialize V2 from AWQ-scaled model with LUT search
+    python scripts/init_model_v2.py \\
+        --model-id runs/awq_scaled_model \\
+        --output runs/v2_awq \\
+        --config q4a4_r32 \\
+        --search-lut \\
+        --imatrix runs/imatrix.pt
+
+    # Step 4: Select best LUT per layer (E=baseline, G=k-means)
+    python scripts/select_best_lut_per_layer.py runs/v2_awq/v2_initial.pt \\
+        -o runs/v2_hybrid/hybrid.pt \\
+        --workers 8 \\
+        --metric iActMSE \\
+        --imatrix runs/imatrix.pt \\
+        --families E,G
+
+    # Step 5: Measure perplexity
+    python scripts/quick_perplexity.py runs/v2_hybrid/hybrid.pt --max-chunks 20
+
+  This properly applies AWQ with the required inverse compensation:
+    - input_layernorm → q/k/v_proj (RMSNorm scales)
+    - v_proj → o_proj (Linear→Linear with GQA handling)
+    - post_attention_layernorm → gate/up_proj
+    - up_proj → down_proj
+
+  iActMSE METRIC:
+    score = Σ_{o,i} σ²[i] * S[o,i]² * (Q_target - Q_quant)²
+
+    Where σ² is input activation variance from iMatrix. This measures
+    expected squared output error, weighting by channel importance.
+
+  NOTE: The --awq-alpha flag is DEPRECATED and does NOT work correctly
+        because it lacks the inverse compensation. Use the proper workflow above.
+
 Author: ANEMLL Team
 """
 

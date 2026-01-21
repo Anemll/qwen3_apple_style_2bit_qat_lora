@@ -458,6 +458,66 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # ============================================================
+    # AUTO-LOAD CONFIG FROM CHECKPOINT DIRECTORY
+    # ============================================================
+    # If checkpoint is provided, look for sibling config.json and use its values
+    # This ensures consistency with the checkpoint's original settings
+    loaded_from_config = {}
+    if args.checkpoint:
+        ckpt_path = Path(args.checkpoint)
+        config_path = ckpt_path.parent / "config.json"
+        if config_path.exists():
+            print(f"Found config.json in checkpoint directory: {config_path}")
+            with open(config_path, 'r') as f:
+                ckpt_config = json.load(f)
+
+            # Override defaults with checkpoint config values
+            # (only if user didn't explicitly specify them on command line)
+            config_keys = {
+                'model_id': 'model_id',
+                'group_size': 'group_size',
+                'lut_bits': None,  # Used for mlp_lut
+                'attn_lut_bits': None,  # Used for attn_lut
+                'scale_rank': None,  # Used for mlp_rank
+                'attn_scale_rank': None,  # Used for attn_rank
+            }
+
+            # Check if user explicitly set model_id (default is 'Qwen/Qwen3-0.6B')
+            if 'model_id' in ckpt_config and args.model_id == 'Qwen/Qwen3-0.6B':
+                old_val = args.model_id
+                args.model_id = ckpt_config['model_id']
+                if old_val != args.model_id:
+                    loaded_from_config['model_id'] = (old_val, args.model_id)
+
+            # Check if user explicitly set group_size (default is 16)
+            if 'group_size' in ckpt_config and args.group_size == 16:
+                old_val = args.group_size
+                args.group_size = ckpt_config['group_size']
+                if old_val != args.group_size:
+                    loaded_from_config['group_size'] = (old_val, args.group_size)
+
+            # Store LUT/rank config for later use (overrides --config preset)
+            # Note: config.json stores lut_bits (2 or 4), but CONFIG_PRESETS uses lut_size (4 or 16)
+            # Convert: lut_size = 2 ** lut_bits
+            if 'lut_bits' in ckpt_config:
+                loaded_from_config['mlp_lut'] = 2 ** ckpt_config['lut_bits']
+            if 'attn_lut_bits' in ckpt_config:
+                loaded_from_config['attn_lut'] = 2 ** ckpt_config['attn_lut_bits']
+            if 'scale_rank' in ckpt_config:
+                loaded_from_config['mlp_rank'] = ckpt_config['scale_rank']
+            if 'attn_scale_rank' in ckpt_config:
+                loaded_from_config['attn_rank'] = ckpt_config['attn_scale_rank']
+
+            if loaded_from_config:
+                print("  Auto-loaded from config.json:")
+                for key, val in loaded_from_config.items():
+                    if isinstance(val, tuple):
+                        print(f"    {key}: {val[0]} -> {val[1]} (overridden)")
+                    else:
+                        print(f"    {key}: {val}")
+                print()
+
     print("=" * 60)
     print("SELECT BEST LUT PER LAYER")
     print("=" * 60)
@@ -505,6 +565,7 @@ def main():
     print(f"Testing LUT families: {families}")
 
     # Load config (default: q4_r32 = LUT16, rank32)
+    # Priority: checkpoint config.json > --config preset > defaults
     if args.config in CONFIG_PRESETS:
         preset = CONFIG_PRESETS[args.config]
         config_name = args.config
@@ -513,18 +574,38 @@ def main():
         config_name = 'q4_r32'
         print(f"Warning: Unknown config '{args.config}', using default 'q4_r32'")
 
+    # Start with preset values
     mlp_lut = preset['mlp_lut']
     mlp_rank = preset['mlp_rank']
     attn_lut = preset['attn_lut']
     attn_rank = preset['attn_rank']
-    print(f"Config: {config_name} -> MLP LUT{mlp_lut} rank={mlp_rank}, Attn LUT{attn_lut} rank={attn_rank}, group_size={args.group_size}")
+
+    # Override with values from checkpoint's config.json if available
+    config_overridden = False
+    if 'mlp_lut' in loaded_from_config:
+        mlp_lut = loaded_from_config['mlp_lut']
+        config_overridden = True
+    if 'attn_lut' in loaded_from_config:
+        attn_lut = loaded_from_config['attn_lut']
+        config_overridden = True
+    if 'mlp_rank' in loaded_from_config:
+        mlp_rank = loaded_from_config['mlp_rank']
+        config_overridden = True
+    if 'attn_rank' in loaded_from_config:
+        attn_rank = loaded_from_config['attn_rank']
+        config_overridden = True
+
+    if config_overridden:
+        print(f"Config: (from checkpoint config.json) -> MLP LUT{mlp_lut} rank={mlp_rank}, Attn LUT{attn_lut} rank={attn_rank}, group_size={args.group_size}")
+    else:
+        print(f"Config: {config_name} -> MLP LUT{mlp_lut} rank={mlp_rank}, Attn LUT{attn_lut} rank={attn_rank}, group_size={args.group_size}")
     print()
 
     # Import V2 classes
     from qat_lora import AnemllQuantConfigV2, replace_linear_with_anemll_v2
     from qat_lora.ane_qat_linear_v2 import AnemllQATLinearV2
 
-    # Load base model FIRST to get original FP32 weights
+    # Load base model
     print(f"Loading base model: {args.model_id}")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
@@ -532,14 +613,17 @@ def main():
         trust_remote_code=True,
     )
 
-    # Extract original FP32 weights BEFORE replacing with V2 modules
-    print("Extracting original FP32 weights...")
+    # For --from-scratch mode: extract W_orig from base model BEFORE V2 conversion
+    # For checkpoint mode: we'll compute W_eff = Q * S from checkpoint later (self-contained!)
     original_weights = {}
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            # Store original weight for later use
-            original_weights[name] = module.weight.data.float().cpu().clone()
-    print(f"  Extracted {len(original_weights)} linear layer weights")
+    if args.from_scratch:
+        print("Extracting original FP32 weights (--from-scratch mode)...")
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear):
+                original_weights[name] = module.weight.data.float().cpu().clone()
+        print(f"  Extracted {len(original_weights)} linear layer weights")
+    else:
+        print("  (Checkpoint mode: W_orig will be computed from checkpoint's W_eff = Q * S)")
 
     # Create V2 configs (must match init_model_v2.py settings)
     mlp_config = AnemllQuantConfigV2(
@@ -677,6 +761,29 @@ def main():
                 q_key = f"{name}._Q"
                 if q_key in state_dict and m._Q is None:
                     m.register_buffer("_Q", state_dict[q_key])
+
+        # CRITICAL for AWQ: Extract W_eff = Q * S from the loaded checkpoint as W_orig
+        # This makes LUT optimization self-contained (no need to specify AWQ-scaled model)
+        if not args.from_scratch:
+            print("Extracting W_eff = Q * S from checkpoint as optimization target...")
+            for name, m in model.named_modules():
+                if isinstance(m, AnemllQATLinearV2):
+                    # Compute W_eff = Q * S from the loaded checkpoint
+                    if m._Q is not None:
+                        Q = m._Q.float()
+                    elif m._indices is not None:
+                        Q = m.lut[m._indices].float()
+                    else:
+                        continue
+
+                    # Compute full scales S = (A * mag) @ B
+                    A_scaled = m.scale_A.float() * m.rank_magnitude.float()
+                    S = A_scaled @ m.scale_B.float()
+
+                    # W_eff = Q * S (this is what the checkpoint represents)
+                    W_eff = Q * S
+                    original_weights[name] = W_eff.cpu().clone()
+            print(f"  Extracted W_eff for {len(original_weights)} V2 layers")
     elif not args.from_scratch:
         print("Using SVD-initialized scales (no checkpoint)")
 
@@ -1046,6 +1153,27 @@ def main():
         torch.save(model.state_dict(), output_path)
         size_mb = output_path.stat().st_size / (1024 * 1024)
         print(f"\nHybrid checkpoint saved: {output_path} ({size_mb:.1f} MB)")
+
+        # Save config.json (needed for test_inference.py to find model_id)
+        # Note: config.json stores lut_bits (2 or 4), not lut_size (4 or 16)
+        # Convert: lut_bits = log2(lut_size)
+        import math
+        config_data = {
+            'version': 'v2',
+            'model_id': args.model_id,
+            'lut_bits': int(math.log2(mlp_lut)),
+            'attn_lut_bits': int(math.log2(attn_lut)),
+            'scale_rank': mlp_rank,
+            'attn_scale_rank': attn_rank,
+            'group_size': args.group_size,
+            'families': args.families,
+            'metric': args.metric,
+            'source_checkpoint': str(args.checkpoint) if args.checkpoint else None,
+        }
+        config_path = output_path.parent / "config.json"
+        with open(config_path, 'w') as f:
+            json.dump(config_data, f, indent=2)
+        print(f"Config saved: {config_path}")
     elif args.dry_run:
         print("\n(Dry run - no checkpoint saved)")
 

@@ -837,6 +837,7 @@ def load_checkpoint(
         scale_rank=scale_rank,
         force_positive_scales=False,  # Match training config
         magnitude_activation='identity',
+        # Note: group_size only affects init, not needed when skip_init=True
     )
     attn_config = AnemllQuantConfigV2(
         lut_size=attn_lut_size,

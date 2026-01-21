@@ -207,6 +207,17 @@ def bake_lut_checkpoint(
     else:
         torch.save(state_dict, output_path)
 
+    # Copy config.json if output is in a different folder
+    source_dir = Path(checkpoint_path).parent
+    output_dir = Path(output_path).parent
+    if source_dir.resolve() != output_dir.resolve():
+        source_config = source_dir / 'config.json'
+        if source_config.exists():
+            import shutil
+            dest_config = output_dir / 'config.json'
+            shutil.copy2(source_config, dest_config)
+            print(f"  Copied config.json to {dest_config}")
+
     # Summary
     print(f"\n{'-'*60}")
     print("RESULTS")
