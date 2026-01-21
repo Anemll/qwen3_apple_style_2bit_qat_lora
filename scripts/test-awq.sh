@@ -30,7 +30,21 @@
 IM=${IM:-runs/imatrix_qwen3_0.6b_random.pt}
 BASE=${BASE:-Qwen/Qwen3-0.6B}
 ALPHA=${ALPHA:-0.25}
-DEVICE=${DEVICE:-tpu}  # tpu, cuda, mps, cpu
+DEVICE=${DEVICE:-cpu}  # cpu for transforms (safest)
+
+# PPL device: auto-detect best available accelerator
+# Priority: TPU > CUDA > MPS (Mac) > CPU
+if [[ -z "${PPL_DEVICE:-}" ]]; then
+  if python -c "import torch_xla" 2>/dev/null; then
+    PPL_DEVICE="tpu"
+  elif python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    PPL_DEVICE="cuda"
+  elif python -c "import torch; assert torch.backends.mps.is_available()" 2>/dev/null; then
+    PPL_DEVICE="mps"
+  else
+    PPL_DEVICE="cpu"
+  fi
+fi
 
 # PPL measurement: true=full, false=skip, N=max-chunks (e.g., 20)
 EnablePPL=${EnablePPL:-true}
@@ -59,10 +73,11 @@ PPL_HYBRID="N/A"
 echo "============================================================"
 echo "AWQ PIPELINE TEST"
 echo "============================================================"
-echo "Base model: $BASE"
-echo "iMatrix:    $IM"
-echo "Alpha:      $ALPHA"
-echo "EnablePPL:  $EnablePPL"
+echo "Base model:  $BASE"
+echo "iMatrix:     $IM"
+echo "Alpha:       $ALPHA"
+echo "PPL_DEVICE:  $PPL_DEVICE"
+echo "EnablePPL:   $EnablePPL"
 echo "============================================================"
 echo ""
 
@@ -85,16 +100,16 @@ if [[ "${EnablePPL}" == "false" ]]; then
   echo ">>> Step 2b: Skipped (EnablePPL=false)"
   PPL_V2_INIT="N/A"
 elif [[ "${EnablePPL}" == "true" ]]; then
-  echo ">>> Step 2b: Measuring PPL (V2 init) - full"
-  cmd="python3 scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device $DEVICE --dtype fp16 --output-ppl"
+  echo ">>> Step 2b: Measuring PPL (V2 init) - full [$PPL_DEVICE]"
+  cmd="python3 scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device $PPL_DEVICE --dtype fp16 --output-ppl"
   echo "CMD: $cmd"
   PPL_OUTPUT=$($cmd 2>&1)
   PPL=$(echo "$PPL_OUTPUT" | grep "^PPL=" | cut -d= -f2)
   PPL_V2_INIT=$PPL
   echo "    PPL (v2_init) = $PPL"
 elif [[ "${EnablePPL}" =~ ^[0-9]+$ ]]; then
-  echo ">>> Step 2b: Measuring PPL (V2 init) - max-chunks=${EnablePPL}"
-  cmd="python3 scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device $DEVICE --dtype fp16 --output-ppl --max-chunks ${EnablePPL}"
+  echo ">>> Step 2b: Measuring PPL (V2 init) - max-chunks=${EnablePPL} [$PPL_DEVICE]"
+  cmd="python3 scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device $PPL_DEVICE --dtype fp16 --output-ppl --max-chunks ${EnablePPL}"
   echo "CMD: $cmd"
   PPL_OUTPUT=$($cmd 2>&1)
   PPL=$(echo "$PPL_OUTPUT" | grep "^PPL=" | cut -d= -f2)
@@ -125,16 +140,16 @@ if [[ "${EnablePPL}" == "false" ]]; then
   echo ">>> Step 4b: Skipped (EnablePPL=false)"
   PPL_HYBRID="N/A"
 elif [[ "${EnablePPL}" == "true" ]]; then
-  echo ">>> Step 4b: Measuring PPL (hybrid) - full"
-  cmd="python3 scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device $DEVICE --dtype fp16 --output-ppl"
+  echo ">>> Step 4b: Measuring PPL (hybrid) - full [$PPL_DEVICE]"
+  cmd="python3 scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device $PPL_DEVICE --dtype fp16 --output-ppl"
   echo "CMD: $cmd"
   PPL_OUTPUT=$($cmd 2>&1)
   PPL=$(echo "$PPL_OUTPUT" | grep "^PPL=" | cut -d= -f2)
   PPL_HYBRID=$PPL
   echo "    PPL (hybrid) = $PPL"
 elif [[ "${EnablePPL}" =~ ^[0-9]+$ ]]; then
-  echo ">>> Step 4b: Measuring PPL (hybrid) - max-chunks=${EnablePPL}"
-  cmd="python3 scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device $DEVICE --dtype fp16 --output-ppl --max-chunks ${EnablePPL}"
+  echo ">>> Step 4b: Measuring PPL (hybrid) - max-chunks=${EnablePPL} [$PPL_DEVICE]"
+  cmd="python3 scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device $PPL_DEVICE --dtype fp16 --output-ppl --max-chunks ${EnablePPL}"
   echo "CMD: $cmd"
   PPL_OUTPUT=$($cmd 2>&1)
   PPL=$(echo "$PPL_OUTPUT" | grep "^PPL=" | cut -d= -f2)

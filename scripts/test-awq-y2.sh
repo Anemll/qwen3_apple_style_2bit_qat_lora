@@ -32,9 +32,23 @@ SEQ_LEN=${SEQ_LEN:-512}
 BATCH_SIZE=${BATCH_SIZE:-1}
 CALIB_MODE=${CALIB_MODE:-random_ids}   # random_ids|pseudo_text|textfile
 
-# Eval device
+# Eval device for init/transforms (CPU is safest)
 DEVICE=${DEVICE:-cpu}   # cpu|tpu|cuda|mps
 DTYPE=${DTYPE:-float32} # float32|float16|bfloat16
+
+# PPL device: auto-detect best available accelerator
+# Priority: TPU > CUDA > MPS (Mac) > CPU
+if [[ -z "${PPL_DEVICE:-}" ]]; then
+  if python -c "import torch_xla" 2>/dev/null; then
+    PPL_DEVICE="tpu"
+  elif python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    PPL_DEVICE="cuda"
+  elif python -c "import torch; assert torch.backends.mps.is_available()" 2>/dev/null; then
+    PPL_DEVICE="mps"
+  else
+    PPL_DEVICE="cpu"
+  fi
+fi
 
 # PPL measurement: true=full, false=skip, N=max-chunks (e.g., 20)
 EnablePPL=${EnablePPL:-false}
@@ -66,6 +80,7 @@ echo "YM:         ${YM}"
 echo "ALPHA_A:    ${ALPHA_A}"
 echo "ALPHA_ROW:  ${ALPHA_ROW}"
 echo "DEVICE:     ${DEVICE}"
+echo "PPL_DEVICE: ${PPL_DEVICE}"
 echo "DTYPE:      ${DTYPE}"
 echo "V2_CONFIG:  ${V2_CONFIG}"
 echo "EnablePPL:  ${EnablePPL}"
@@ -134,8 +149,8 @@ if [[ "${EnablePPL}" == "false" ]]; then
   PPL_V2_INIT="N/A"
   echo ""
 elif [[ "${EnablePPL}" == "true" ]]; then
-  echo ">>> Step 3: Perplexity (v2_initial.pt) - full"
-  cmd="python scripts/measure_perplexity.py ${OUT_INIT}/v2_initial.pt --device ${DEVICE} --dtype fp16 --output-ppl"
+  echo ">>> Step 3: Perplexity (v2_initial.pt) - full [${PPL_DEVICE}]"
+  cmd="python scripts/measure_perplexity.py ${OUT_INIT}/v2_initial.pt --device ${PPL_DEVICE} --dtype fp16 --output-ppl"
   echo "CMD: $cmd"
   PPL_OUTPUT=$($cmd 2>&1)
   PPL=$(echo "$PPL_OUTPUT" | grep "^PPL=" | cut -d= -f2)
@@ -143,8 +158,8 @@ elif [[ "${EnablePPL}" == "true" ]]; then
   echo "    PPL (v2_init) = $PPL"
   echo ""
 elif [[ "${EnablePPL}" =~ ^[0-9]+$ ]]; then
-  echo ">>> Step 3: Perplexity (v2_initial.pt) - max-chunks=${EnablePPL}"
-  cmd="python scripts/measure_perplexity.py ${OUT_INIT}/v2_initial.pt --device ${DEVICE} --dtype fp16 --output-ppl --max-chunks ${EnablePPL}"
+  echo ">>> Step 3: Perplexity (v2_initial.pt) - max-chunks=${EnablePPL} [${PPL_DEVICE}]"
+  cmd="python scripts/measure_perplexity.py ${OUT_INIT}/v2_initial.pt --device ${PPL_DEVICE} --dtype fp16 --output-ppl --max-chunks ${EnablePPL}"
   echo "CMD: $cmd"
   PPL_OUTPUT=$($cmd 2>&1)
   PPL=$(echo "$PPL_OUTPUT" | grep "^PPL=" | cut -d= -f2)
@@ -175,8 +190,8 @@ if [[ "${EnablePPL}" == "false" ]]; then
   PPL_HYBRID="N/A"
   echo ""
 elif [[ "${EnablePPL}" == "true" ]]; then
-  echo ">>> Step 5: Perplexity (hybrid) - full"
-  cmd="python scripts/measure_perplexity.py ${HYBRID} --device ${DEVICE} --dtype fp16 --output-ppl"
+  echo ">>> Step 5: Perplexity (hybrid) - full [${PPL_DEVICE}]"
+  cmd="python scripts/measure_perplexity.py ${HYBRID} --device ${PPL_DEVICE} --dtype fp16 --output-ppl"
   echo "CMD: $cmd"
   PPL_OUTPUT=$($cmd 2>&1)
   PPL=$(echo "$PPL_OUTPUT" | grep "^PPL=" | cut -d= -f2)
@@ -184,8 +199,8 @@ elif [[ "${EnablePPL}" == "true" ]]; then
   echo "    PPL (hybrid) = $PPL"
   echo ""
 elif [[ "${EnablePPL}" =~ ^[0-9]+$ ]]; then
-  echo ">>> Step 5: Perplexity (hybrid) - max-chunks=${EnablePPL}"
-  cmd="python scripts/measure_perplexity.py ${HYBRID} --device ${DEVICE} --dtype fp16 --output-ppl --max-chunks ${EnablePPL}"
+  echo ">>> Step 5: Perplexity (hybrid) - max-chunks=${EnablePPL} [${PPL_DEVICE}]"
+  cmd="python scripts/measure_perplexity.py ${HYBRID} --device ${PPL_DEVICE} --dtype fp16 --output-ppl --max-chunks ${EnablePPL}"
   echo "CMD: $cmd"
   PPL_OUTPUT=$($cmd 2>&1)
   PPL=$(echo "$PPL_OUTPUT" | grep "^PPL=" | cut -d= -f2)
