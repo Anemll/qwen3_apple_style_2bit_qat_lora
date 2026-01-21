@@ -33,7 +33,7 @@ BATCH_SIZE=${BATCH_SIZE:-1}
 CALIB_MODE=${CALIB_MODE:-random_ids}   # random_ids|pseudo_text|textfile
 
 # Eval device
-DEVICE=${DEVICE:-mps}   # tpu|cuda|mps|cpu
+DEVICE=${DEVICE:-cpu}   # cpu|tpu|cuda|mps
 DTYPE=${DTYPE:-float32} # float32|float16|bfloat16
 
 # PPL measurement: true=full, false=skip, N=max-chunks (e.g., 20)
