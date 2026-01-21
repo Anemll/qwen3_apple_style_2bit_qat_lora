@@ -2638,11 +2638,11 @@ Examples:
     parser.add_argument('--mlp-only', action='store_true',
                         help='Only quantize MLP layers (skip attention)')
 
-    # Device
+    # Device (CPU is default for model construction - TPU only needed for PPL measurement)
     parser.add_argument('--tpu', action='store_true',
-                        help='Force TPU mode')
+                        help='Force TPU mode (not recommended for init, use for PPL only)')
     parser.add_argument('--cpu', action='store_true',
-                        help='Force CPU mode')
+                        help='Force CPU mode (default)')
 
     # Evaluation options
     parser.add_argument('--no-eval', action='store_true',
@@ -2745,7 +2745,7 @@ Examples:
             preset_name=preset.name if preset.name in PRESETS else args.config,
             output_dir=args.output,
             force_tpu=args.tpu,
-            force_cpu=args.cpu,
+            force_cpu=not args.tpu,  # Default to CPU for model construction
             quantize_attn=not args.mlp_only,
             group_size=args.group_size,
             validate=run_validation,
