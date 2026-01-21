@@ -953,7 +953,96 @@ python scripts/measure_perplexity.py checkpoint.pt --device tpu --dtype bf16
 
 ---
 
+## 17. Prior Art & Connections
+
+### 17.1 Scale-Factor SVD Refactoring and Low-Rank Prior Art
+
+AQ1 refactors each Linear weight into a quantized value term and a scale term (`W ≈ Q ⊙ S`), then parameterizes the scale term with a low-rank factorization initialized from an SVD of a per-(group/weight) scale tensor. This is classic "use low-rank structure to capture the hard part," and it's related to recent quantization methods that explicitly use SVD/low-rank components to absorb quantization outliers:
+
+| Method | Approach |
+|--------|----------|
+| **SVDQuant** | Shifts outliers and captures them with a high-precision low-rank branch computed via SVD while a low-bit branch handles the residual |
+| **LoRA** | Popularized low-rank decomposition as an efficient way to represent weight updates |
+| **LoftQ / LoQT** | Explicitly combine quantization with low-rank initialization/adapters to reduce the discrepancy between quantized and full-precision models |
+| **AQLM** | Codebook-based weight quantization using additive/multiple codebooks for LLMs |
+
+AQ1's LUT/codebook side is adjacent to AQLM, though AQ1 uses a different factorization/optimization path and targets ANE-friendly export constraints.
+
+### 17.2 Two-Pass Smoothing with X-matrix and Y-matrix
+
+Our smoothing pipeline builds on equivalent reparameterizations used in AWQ/SmoothQuant-style PTQ:
+
+**Pass A (Column Smoothing):**
+We compute an **X-matrix** (diagonal second moments of layer inputs, `E[x²]`) and apply a per-channel scaling that is inverted in adjacent operators, so the FP model remains (nearly) unchanged while the quantizer sees a better-conditioned distribution. This matches the core idea in:
+
+| Method | Key Insight |
+|--------|-------------|
+| **AWQ** | Activation-aware per-channel scaling via an equivalent transformation |
+| **SmoothQuant** | Migrating quantization difficulty from activations to weights with a mathematically equivalent scaling |
+
+**Pass B (Row Smoothing):**
+After Pass-A, we optionally recompute statistics on selected intermediate outputs (a **Y-matrix**, diagonal second moments `E[y²]`) and apply a second, constrained row-smoothing pass (rows → inverse by columns) only where the inverse path is unambiguous:
+
+| Layer Pair | Why Invertible |
+|------------|----------------|
+| `v_proj → o_proj` | Linear chain within attention |
+| `up_proj → down_proj` | Linear chain within MLP |
+
+This "apply only where invertible" rule mirrors the migration-safety viewpoint emphasized by **Outlier Suppression+** (equivalent shifting/scaling with a migration pattern).
+
+The overall staged conditioning is also conceptually close to multi-stage pre-quant transforms such as **SmoothRot** (scaling + an additional invertible transform) that further reduce outlier-driven quantization error.
+
+### 17.3 Importance-Weighted LUT Construction
+
+We build each tensor's LUT (codebook) using **importance-weighted objectives** instead of plain weight MSE. Concretely, we estimate a diagonal "importance/activation matrix" (our **iMatrix**, storing per-input-channel second moments `E[x_i²]`) and use it to weight quantization error so that channels that see larger (or more variable) activations get finer resolution.
+
+This is closely aligned with the motivation in **AWQ**, which shows that activation statistics identify salient channels and that equivalent scaling can reduce quantization error without retraining.
+
+**iActMSE Metric:**
+For LUT building, we use weighted k-means / weighted Lloyd (and weighted quantiles as a cheaper alternative) where each "point" `Q_target[o,i]` is weighted by an importance term derived from activation statistics (and optionally scale structure), matching an expected output-error proxy:
+
+```
+iActMSE = Σ_{o,i} σ²[i] * S[o,i]² * (Q_target[o,i] - Q_quant[o,i])²
+```
+
+Where `σ²[i]` comes from the iMatrix (activation variance per input channel).
+
+**Related Methods:**
+
+| Method | Approach |
+|--------|----------|
+| **Deep Compression** | Introduced weight sharing via k-means-style clustering of weights into a codebook (centroids), followed by fine-tuning—the classic "LUT/codebook quantization" lineage |
+| **LLM-Codebook** | Proposes Hessian-aware k-means to build codebooks where clustering is guided by second-order sensitivity (importance)—very close in spirit to "importance-weighted Lloyd" |
+| **GPTQ** | Uses approximate second-order information (Hessian / input covariance structure) to minimize layer output distortion—strong justification for weighting by "importance" rather than plain weight MSE |
+| **AWQ** | Uses activation statistics to identify/protect salient channels and applies an equivalent transform to reduce quantization error |
+| **llama.cpp imatrix** | Most directly practical precedent for "activation-statistics-guided quantization" used in modern toolchains, including notes on calibration text sensitivity |
+
+**Unifying View:**
+"Activation Sensitivity as a Unifying Principle for PTQ" explicitly frames activation-aware methods (AWQ-like) vs second-order methods (GPTQ-like) under a common sensitivity perspective. Our iActMSE metric combines both: activation variance (first-order) weighted by scale structure (implicitly capturing weight sensitivity).
+
+**Summary:** AQ1 combines proven techniques (SVD compression, AWQ smoothing, codebook quantization) with novel ANE-specific constraints (FP16-safe LUTs, rank-by-rank forward pass) to achieve efficient 2-bit/4-bit quantization for Apple Neural Engine deployment.
+
+---
+
 ## References
+
+### Academic Papers
+
+- **AWQ**: Activation-aware Weight Quantization for LLM Compression and Acceleration
+- **GPTQ**: Accurate Post-Training Quantization for Generative Pre-trained Transformers
+- **Deep Compression**: Compressing Deep Neural Networks with Pruning, Trained Quantization and Huffman Coding
+- **LLM-Codebook**: Hessian-aware k-means codebooks for LLM quantization
+- **SVDQuant**: Low-rank branch quantization for LLMs
+- **SmoothQuant**: Accurate and Efficient Post-Training Quantization for Large Language Models
+- **Outlier Suppression+**: Equivalent shifting/scaling with migration patterns
+- **LoftQ / LoQT**: Combining quantization with low-rank initialization/adapters
+- **AQLM**: Additive Quantization for Language Models
+
+### Tools & Implementations
+
+- **llama.cpp imatrix**: Importance matrix workflow for activation-statistics-guided quantization
+
+### Project Documentation
 
 - See [CMD_TRAIN.md](CMD_TRAIN.md) for training commands
 - See [ANEMLL-QUANT-CLI.md](ANEMLL-QUANT-CLI.md) for CLI reference
