@@ -209,32 +209,50 @@ def test_level2_pair_v_o(base_a: str, base_ab: str, layer: int = 0):
     head_dim = config.hidden_size // num_heads
     groups = num_heads // num_kv_heads
 
+    # Use actual projection dimensions (may differ from config expectations)
+    v_out_features = vA.out_features
+    o_in_features = oA.in_features
+
+    # Compute actual KV head_dim from v_proj output
+    actual_kv_head_dim = v_out_features // num_kv_heads
+
     print(f"\nGQA config:")
-    print(f"  num_heads:    {num_heads}")
-    print(f"  num_kv_heads: {num_kv_heads}")
-    print(f"  head_dim:     {head_dim}")
-    print(f"  groups:       {groups}")
+    print(f"  num_heads:         {num_heads}")
+    print(f"  num_kv_heads:      {num_kv_heads}")
+    print(f"  head_dim (config): {head_dim}")
+    print(f"  head_dim (actual): {actual_kv_head_dim}")
+    print(f"  groups:            {groups}")
+    print(f"  v_proj.out:        {v_out_features}")
+    print(f"  o_proj.in:         {o_in_features}")
 
     # Random input
     batch = 2
     x = torch.randn(batch, vA.in_features)
 
     with torch.no_grad():
-        # v_proj output (KV heads * head_dim)
-        vA_out = vA(x)  # [batch, kv_heads * head_dim]
+        # v_proj output
+        vA_out = vA(x)  # [batch, v_out_features]
         vB_out = vB(x)
 
-        # Expand to full heads (repeat_kv style)
-        # [batch, kv_heads, head_dim] -> [batch, num_heads, head_dim]
-        vA_kv = vA_out.view(batch, num_kv_heads, head_dim)
-        vB_kv = vB_out.view(batch, num_kv_heads, head_dim)
+        # For GQA: expand to match o_proj input
+        # v_proj output: [batch, num_kv_heads * actual_kv_head_dim]
+        # o_proj input:  [batch, num_heads * head_dim]
 
-        vA_full = vA_kv.repeat_interleave(groups, dim=1)  # [batch, num_heads, head_dim]
-        vB_full = vB_kv.repeat_interleave(groups, dim=1)
+        if v_out_features == o_in_features:
+            # MHA case or Qwen3 uses same size - no expansion needed
+            vA_flat = vA_out
+            vB_flat = vB_out
+        else:
+            # True GQA: expand KV heads
+            vA_kv = vA_out.view(batch, num_kv_heads, actual_kv_head_dim)
+            vB_kv = vB_out.view(batch, num_kv_heads, actual_kv_head_dim)
 
-        # Flatten for o_proj
-        vA_flat = vA_full.view(batch, -1)  # [batch, num_heads * head_dim]
-        vB_flat = vB_full.view(batch, -1)
+            vA_full = vA_kv.repeat_interleave(groups, dim=1)  # [batch, num_heads, head_dim]
+            vB_full = vB_kv.repeat_interleave(groups, dim=1)
+
+            # Flatten for o_proj
+            vA_flat = vA_full.view(batch, -1)  # [batch, num_heads * head_dim]
+            vB_flat = vB_full.view(batch, -1)
 
         # o_proj
         oA_out = oA(vA_flat)
@@ -286,12 +304,22 @@ def test_level3_fp4_quant(base_a: str, base_ab: str, lut_name: str = "fp4_dense"
     print("="*60)
     print(f"LUT: {lut_name}")
 
-    # Get LUT
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
-    from anemll_quant.lut_presets import get_lut_preset
+    # Define LUT presets inline (from init_model_v2.py)
+    def symmetric_lut(positive_vals):
+        """Build symmetric LUT: [-vals_reversed, vals]"""
+        import torch
+        positive = torch.tensor(positive_vals, dtype=torch.float32)
+        return torch.cat([-positive.flip(0), positive])
 
-    lut = get_lut_preset(lut_name, 16)  # 16 entries for FP4
+    lut_presets = {
+        'fp4_dense': symmetric_lut([0.0625, 0.125, 0.25, 0.375, 0.5, 0.75, 1.0, 2.0]),
+        'uniform': symmetric_lut([0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0]),
+    }
+
+    if lut_name not in lut_presets:
+        print(f"Unknown LUT '{lut_name}', using fp4_dense")
+        lut_name = 'fp4_dense'
+    lut = lut_presets[lut_name]
     print(f"LUT shape: {lut.shape}")
     print(f"LUT range: [{lut.min():.4f}, {lut.max():.4f}]")
 
