@@ -80,8 +80,8 @@ python3 scripts/init_model_v2.py \
 # PPL check after init
 echo ""
 echo ">>> Step 2b: Measuring PPL (V2 init)"
-PPL_OUTPUT=$(python3 scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device $DEVICE --dtype fp16 --max-chunks 20 2>&1)
-PPL=$(echo "$PPL_OUTPUT" | sed $'s/\x1b\\[[0-9;]*m//g' | grep "Perplexity:" | grep -oE "[0-9]+\\.[0-9]+")
+PPL_OUTPUT=$(python3 scripts/measure_perplexity.py runs/v2_awq_alpha05/v2_initial.pt --device $DEVICE --dtype fp16 --max-chunks 20 --output-ppl 2>&1)
+PPL=$(echo "$PPL_OUTPUT" | grep "^PPL=" | cut -d= -f2)
 PPL_RESULTS["v2_init"]=$PPL
 echo "    PPL (v2_init) = $PPL"
 
@@ -105,8 +105,8 @@ python3 scripts/select_best_lut_per_layer.py runs/v2_awq_alpha05/v2_initial.pt \
 # PPL check after hybrid
 echo ""
 echo ">>> Step 4b: Measuring PPL (E,G hybrid)"
-PPL_OUTPUT=$(python3 scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device $DEVICE --dtype fp16 --max-chunks 20 2>&1)
-PPL=$(echo "$PPL_OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | grep -E "^Perplexity:" | grep -oE "[0-9]+\.[0-9]+")
+PPL_OUTPUT=$(python3 scripts/measure_perplexity.py runs/v2_init_imse/ihybrid.pt --device $DEVICE --dtype fp16 --max-chunks 20 --output-ppl 2>&1)
+PPL=$(echo "$PPL_OUTPUT" | grep "^PPL=" | cut -d= -f2)
 PPL_RESULTS["hybrid"]=$PPL
 echo "    PPL (hybrid) = $PPL"
 

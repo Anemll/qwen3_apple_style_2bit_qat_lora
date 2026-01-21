@@ -1048,6 +1048,8 @@ def main():
                              'Default: auto-detect from checkpoint directory.')
     parser.add_argument('-b', '--base-dir', metavar='FOLDER',
                         help='Base folder for checkpoint path')
+    parser.add_argument('--output-ppl', action='store_true',
+                        help='Output only the perplexity value (machine-readable, no color)')
 
     args = parser.parse_args()
 
@@ -1247,19 +1249,23 @@ def main():
     RESET = "\033[0m"
 
     # Print results with save info in header
-    print()
-    print("=" * 60)
-    print("RESULTS")
-    print(f"Saved:          {results_file}")
-    print(f"Key:            {result_key}")
-    print("=" * 60)
-    print(f"{RED}{BOLD}Perplexity:     {result['perplexity']:.2f}{RESET}")
-    print(f"Cross-entropy:  {result['cross_entropy']:.4f} nats")
-    print(f"Tokens:         {result['tokens']:,}")
-    print(f"Time:           {result['time']:.1f}s ({result['tokens_per_sec']:.0f} tok/s)")
-    if args.batch_size > 0:
-        print(f"Batches:        {result['num_batches']} (B={result['batch_size']}, L={result['seq_len']})")
-    print("=" * 60)
+    if args.output_ppl:
+        # Machine-readable output: just the PPL value (no color, no formatting)
+        print(f"PPL={result['perplexity']:.4f}")
+    else:
+        print()
+        print("=" * 60)
+        print("RESULTS")
+        print(f"Saved:          {results_file}")
+        print(f"Key:            {result_key}")
+        print("=" * 60)
+        print(f"{RED}{BOLD}Perplexity:     {result['perplexity']:.2f}{RESET}")
+        print(f"Cross-entropy:  {result['cross_entropy']:.4f} nats")
+        print(f"Tokens:         {result['tokens']:,}")
+        print(f"Time:           {result['time']:.1f}s ({result['tokens_per_sec']:.0f} tok/s)")
+        if args.batch_size > 0:
+            print(f"Batches:        {result['num_batches']} (B={result['batch_size']}, L={result['seq_len']})")
+        print("=" * 60)
 
     return 0
 

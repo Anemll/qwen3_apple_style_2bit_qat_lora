@@ -82,10 +82,10 @@ for a in $ALPHAS; do
   # Step 3: Measure perplexity (capture result)
   PPL_OUTPUT=$(python scripts/measure_perplexity.py \
     $OUT_INIT/v2_initial.pt \
-    --device $DEVICE --dtype fp16 --max-chunks 20 2>&1 | tee -a "$LOG_FILE")
+    --device $DEVICE --dtype fp16 --max-chunks 20 --output-ppl 2>&1 | tee -a "$LOG_FILE")
 
-  # Extract perplexity value (look for "Perplexity:" line)
-  PPL=$(echo "$PPL_OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | grep -E "^Perplexity:" | grep -oE "[0-9]+\.[0-9]+")
+  # Extract perplexity value (--output-ppl gives "PPL=XX.XXXX")
+  PPL=$(echo "$PPL_OUTPUT" | grep "^PPL=" | cut -d= -f2)
 
   if [ -z "$PPL" ]; then
     PPL="ERROR"
