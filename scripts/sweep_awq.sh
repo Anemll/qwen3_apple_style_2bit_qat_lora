@@ -19,12 +19,14 @@
 #
 # Environment: DEVICE=tpu ./scripts/sweep_awq.sh
 #              DEVICE=cuda ./scripts/sweep_awq.sh
+#              CLEANUP=false ./scripts/sweep_awq.sh  # keep all intermediate folders
 #
 
 IM=runs/imatrix_qwen3_0.6b_random.pt
 BASE=Qwen/Qwen3-0.6B
 ALPHAS="0.0 0.25 0.5 0.75 1.0"
 DEVICE=${DEVICE:-tpu}  # tpu, cuda, mps, cpu
+CLEANUP=${CLEANUP:-true}  # true: remove intermediate folders, false: keep all
 
 # Check if iMatrix exists, create if not
 if [ ! -f "$IM" ]; then
@@ -64,7 +66,9 @@ for a in $ALPHAS; do
   echo "    Init output: $OUT_INIT"
   echo "    Log file:    $LOG_FILE"
 
-  # Step 1: Apply AWQ scales (with progress via tee)
+  # Step 1: Apply AWQ scales
+  echo ""
+  echo "    [1/3] python scripts/apply_awq_equiv_scales.py --model-id $BASE --imatrix $IM --alpha $a --output $OUT_BASE --dtype float32"
   python scripts/apply_awq_equiv_scales.py \
     --model-id $BASE \
     --imatrix $IM \
@@ -72,9 +76,9 @@ for a in $ALPHAS; do
     --output $OUT_BASE \
     --dtype float32 2>&1 | tee "$LOG_FILE"
 
-  # Step 2: Initialize V2 (with progress via tee)
-  # Use --lut fp4_dense for fast init (no per-layer search)
-  # Or use --search-lut for optimal per-layer LUT selection (slower)
+  # Step 2: Initialize V2 (--lut fp4_dense = fast, --search-lut = slow)
+  echo ""
+  echo "    [2/3] python scripts/init_model_v2.py --model-id $OUT_BASE -o $OUT_INIT -c q4a4_r32 --lut fp4_dense --imatrix $IM"
   python scripts/init_model_v2.py \
     --model-id $OUT_BASE \
     -o $OUT_INIT \
@@ -82,7 +86,9 @@ for a in $ALPHAS; do
     --lut fp4_dense \
     --imatrix $IM 2>&1 | tee -a "$LOG_FILE"
 
-  # Step 3: Measure perplexity (capture result)
+  # Step 3: Measure perplexity
+  echo ""
+  echo "    [3/3] python scripts/measure_perplexity.py $OUT_INIT/v2_initial.pt --device $DEVICE --dtype fp16 --max-chunks 20 --output-ppl"
   PPL_OUTPUT=$(python scripts/measure_perplexity.py \
     $OUT_INIT/v2_initial.pt \
     --device $DEVICE --dtype fp16 --max-chunks 20 --output-ppl 2>&1 | tee -a "$LOG_FILE")
@@ -126,5 +132,33 @@ if [ -n "$BEST_ALPHA" ]; then
   echo ""
   echo "Best: alpha=$BEST_ALPHA (PPL=$BEST_PPL)"
   echo "      runs/v2_awq_a${BEST_ALPHA}/v2_initial.pt"
+fi
+
+# Cleanup intermediate folders
+if [ "$CLEANUP" = "true" ] && [ -n "$BEST_ALPHA" ]; then
+  echo ""
+  echo "Cleaning up intermediate folders (CLEANUP=$CLEANUP)..."
+
+  for a in $ALPHAS; do
+    # Remove AWQ-scaled model folders (large, not needed after init)
+    AWQ_DIR="runs/awq_scaled_a${a}"
+    if [ -d "$AWQ_DIR" ]; then
+      echo "  Removing $AWQ_DIR"
+      rm -rf "$AWQ_DIR"
+    fi
+
+    # Remove non-best v2 init folders
+    if [ "$a" != "$BEST_ALPHA" ]; then
+      V2_DIR="runs/v2_awq_a${a}"
+      if [ -d "$V2_DIR" ]; then
+        echo "  Removing $V2_DIR (not best)"
+        rm -rf "$V2_DIR"
+      fi
+    fi
+  done
+
+  echo "  Kept: runs/v2_awq_a${BEST_ALPHA}/ (best)"
+  echo ""
+  echo "To disable cleanup: CLEANUP=false ./scripts/sweep_awq.sh"
 fi
 echo ""
