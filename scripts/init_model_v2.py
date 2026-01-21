@@ -799,24 +799,26 @@ def measure_svd_approximation_error(
         'time_seconds': time.time() - t0,
     }
 
-    # Find worst layers
+    # Find worst tensors
     sorted_by_mae = sorted(layer_stats, key=lambda x: x['mae'], reverse=True)
-    stats['worst_layers'] = sorted_by_mae[:5]
+    stats['worst_layers'] = sorted_by_mae[:10]
 
     if verbose:
         print(f"\n  SVD Approximation Error Summary:")
-        print(f"    Layers measured: {stats['num_layers']}")
-        print(f"    Average MAE:     {stats['avg_mae']:.6f}")
-        print(f"    Max MAE:         {stats['max_mae']:.6f}")
+        print(f"    Tensors measured: {stats['num_layers']}")
+        print(f"    Average MAE:      {stats['avg_mae']:.6f}")
+        print(f"    Max MAE:          {stats['max_mae']:.6f}")
         print(f"    Avg Relative MAE: {stats['avg_rel_mae']:.4f} ({stats['avg_rel_mae']*100:.2f}%)")
         if mlp_maes:
-            print(f"    MLP avg MAE:     {stats['mlp_avg_mae']:.6f}")
+            print(f"    MLP avg MAE:      {stats['mlp_avg_mae']:.6f}")
         if attn_maes:
-            print(f"    Attn avg MAE:    {stats['attn_avg_mae']:.6f}")
-        print(f"\n  Worst 3 layers by MAE:")
-        for i, layer in enumerate(stats['worst_layers'][:3]):
-            short_name = layer['name'].split('.')[-2] + '.' + layer['name'].split('.')[-1]
-            print(f"    {i+1}. {short_name}: MAE={layer['mae']:.6f}")
+            print(f"    Attn avg MAE:     {stats['attn_avg_mae']:.6f}")
+        print(f"\n  Worst 10 tensors by MAE:")
+        for i, layer in enumerate(stats['worst_layers'][:10]):
+            # Show layer number: layers.N.mlp.gate_proj (last 4 parts)
+            parts = layer['name'].split('.')
+            short_name = '.'.join(parts[-4:]) if len(parts) >= 4 else layer['name']
+            print(f"    {i+1:2d}. {short_name}: MAE={layer['mae']:.6f}")
         print(f"  Time: {stats['time_seconds']:.1f}s")
 
     return stats
