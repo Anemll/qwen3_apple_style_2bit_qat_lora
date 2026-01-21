@@ -106,7 +106,7 @@ python3 scripts/select_best_lut_per_layer.py runs/v2_awq_alpha05/v2_initial.pt \
     -o runs/v2_init_imse/ihybrid.pt \
     --metric iActMSE \
     --imatrix $IM \
-    --families E,G --no-tighten --verbose
+    --families A,B,C,D,E,F,G --no-tighten --verbose
 
 # PPL check after hybrid
 echo ""
