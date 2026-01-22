@@ -16,6 +16,7 @@ BASE=${BASE:-Qwen/Qwen3-0.6B}
 
 # iMatrix (input stats) and Y-matrix (output stats)
 IM=${IM:-runs/imatrix_qwen3_0.6b_random.pt}
+IM_FINAL=${IM_FINAL:-runs/imatrix_final_a${ALPHA_A}_y${ALPHA_ROW}.pt}
 YM=${YM:-runs/ymatrix_up_only.pt}
 # Which module outputs to collect for Y-matrix. Default: up_proj only (v→o Pass-B was harmful).
 YM_TARGETS=${YM_TARGETS:-".*\.mlp\.up_proj$"}
