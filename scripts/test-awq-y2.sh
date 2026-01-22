@@ -32,11 +32,11 @@ if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
   elif command -v sha256sum >/dev/null 2>&1; then
     echo "script sha256: $(sha256sum "$SCRIPT_PATH" | awk '{print $1}')"
   else
-    python - <<'PY'
+    python - "$SCRIPT_PATH" <<'PY'
 import hashlib,sys
 p=sys.argv[1]
 print("script sha256:", hashlib.sha256(open(p,'rb').read()).hexdigest())
-PY "$SCRIPT_PATH"
+PY
   fi
   exit 0
 fi
