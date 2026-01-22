@@ -16,7 +16,9 @@ BASE=${BASE:-Qwen/Qwen3-0.6B}
 
 # iMatrix (input stats) and Y-matrix (output stats)
 IM=${IM:-runs/imatrix_qwen3_0.6b_random.pt}
-YM=${YM:-runs/ymatrix_qwen3_0.6b_random.pt}
+YM=${YM:-runs/ymatrix_up_only.pt}
+# Which module outputs to collect for Y-matrix. Default: up_proj only (v→o Pass-B was harmful).
+YM_TARGETS=${YM_TARGETS:-".*\.mlp\.up_proj$"}
 
 # Pass A (column) and Pass B (row) strengths
 ALPHA_A=${ALPHA_A:-0.4}          # best from your sweep so far
@@ -67,9 +69,6 @@ BASE_AB="runs/awq_scaled_a${ALPHA_A}_y${ALPHA_ROW}"
 OUT_INIT="runs/v2_awq_a${ALPHA_A}_y${ALPHA_ROW}"
 HYBRID="${OUT_INIT}/ihybrid.pt"
 
-# Final iMatrix used for k-means LUT building + iActMSE scoring (computed on the FINAL base)
-IM_FINAL="runs/imatrix_final_a${ALPHA_A}_y${ALPHA_ROW}.pt"
-
 # Collect PPL results (simple vars for bash 3.x compat)
 PPL_V2_INIT="N/A"
 PPL_HYBRID="N/A"
@@ -79,8 +78,8 @@ echo "AWQ + Y-matrix pipeline"
 echo "============================================================"
 echo "BASE:       ${BASE}"
 echo "IM:         ${IM}"
-echo "IM_FINAL:   ${IM_FINAL}"
 echo "YM:         ${YM}"
+echo "YM_TARGETS:${YM_TARGETS}"
 echo "ALPHA_A:    ${ALPHA_A}"
 echo "ALPHA_ROW:  ${ALPHA_ROW}"
 echo "DEVICE:     ${DEVICE}"
@@ -99,7 +98,11 @@ if [[ ! -f "${IM}" ]]; then
   echo ">>> Step 0: iMatrix not found; creating (${TOKENS} tokens, ${SEQ_LEN} ctx)"
   cmd="python scripts/compute_imatrix.py --model ${BASE} --calib-mode ${CALIB_MODE} --tokens ${TOKENS} --seq-len ${SEQ_LEN} --batch-size ${BATCH_SIZE} --out ${IM} --trust-remote-code --verbose"
   echo "CMD: $cmd"
-  $cmd
+  if [[ "${FORCE_REYM:-0}" == "1" || ! -f "${YM}" ]]; then
+    $cmd
+  else
+    echo ">>> Step 1B: Using existing Y-matrix: ${YM}"
+  fi
   echo ""
 fi
 
@@ -117,9 +120,13 @@ echo ""
 # -------------------------
 if [[ "${ALPHA_ROW}" != "0" && "${ALPHA_ROW}" != "0.0" ]]; then
   echo ">>> Step 1B: Computing Y-matrix on Pass-A base (${TOKENS} tokens)"
-  cmd="python scripts/compute_ymatrix.py --model ${BASE_A} --calib-mode ${CALIB_MODE} --tokens ${TOKENS} --seq-len ${SEQ_LEN} --batch-size ${BATCH_SIZE} --out ${YM} --trust-remote-code --verbose"
+  cmd="python scripts/compute_ymatrix.py --model ${BASE_A} --calib-mode ${CALIB_MODE} --tokens ${TOKENS} --seq-len ${SEQ_LEN} --batch-size ${BATCH_SIZE} --targets-regex ${YM_TARGETS} --out ${YM} --trust-remote-code --verbose"
   echo "CMD: $cmd"
-  $cmd
+  if [[ "${FORCE_REYM:-0}" == "1" || ! -f "${YM}" ]]; then
+    $cmd
+  else
+    echo ">>> Step 1B: Using existing Y-matrix: ${YM}"
+  fi
   echo ""
 
   # -------------------------
@@ -128,7 +135,11 @@ if [[ "${ALPHA_ROW}" != "0" && "${ALPHA_ROW}" != "0.0" ]]; then
   echo ">>> Step 1C: Applying Pass B row-smoothing (alpha-row=${ALPHA_ROW})"
   cmd="python scripts/apply_awq_equiv_scales_y2.py --model-id ${BASE_A} --imatrix ${IM} --alpha 0.0 --ymatrix ${YM} --alpha-row ${ALPHA_ROW} --row-min-scale ${ROW_MIN} --row-max-scale ${ROW_MAX} --output ${BASE_AB} --dtype ${DTYPE} --device ${DEVICE}"
   echo "CMD: $cmd"
-  $cmd
+  if [[ "${FORCE_REYM:-0}" == "1" || ! -f "${YM}" ]]; then
+    $cmd
+  else
+    echo ">>> Step 1B: Using existing Y-matrix: ${YM}"
+  fi
   echo ""
 else
   echo ">>> Pass B disabled (ALPHA_ROW=0). Using Pass-A base as final base."
@@ -137,30 +148,10 @@ else
 fi
 
 # -------------------------
-# Step 1D: Compute iMatrix on FINAL base (BASE_AB)
-# -------------------------
-# IMPORTANT:
-#   Pass-B (and Pass-A) can change internal activation distributions even when FP-equivalent.
-#   Since Family-G k-means uses iMatrix weights to TRAIN the LUT centroids, we must compute
-#   the iMatrix on the FINAL base we will quantize (BASE_AB).
-#
-# Set FORCE_REIM=1 to recompute even if the file exists.
-if [[ "${FORCE_REIM:-0}" == "1" || ! -f "${IM_FINAL}" ]]; then
-  echo ">>> Step 1D: Computing IM_FINAL on FINAL base: ${BASE_AB}"
-  cmd="python scripts/compute_imatrix.py --model ${BASE_AB} --calib-mode ${CALIB_MODE} --tokens ${TOKENS} --seq-len ${SEQ_LEN} --batch-size ${BATCH_SIZE} --out ${IM_FINAL} --trust-remote-code --verbose"
-  echo "CMD: $cmd"
-  $cmd
-  echo ""
-else
-  echo ">>> Step 1D: Using existing IM_FINAL: ${IM_FINAL}"
-  echo ""
-fi
-
-# -------------------------
 # Step 2: Initialize V2 from the final base
 # -------------------------
 echo ">>> Step 2: init_model_v2.py from base: ${BASE_AB}"
-cmd="python scripts/init_model_v2.py --model-id ${BASE_AB} --output ${OUT_INIT} --config ${V2_CONFIG} --search-lut --imatrix ${IM_FINAL} --svd-error"
+cmd="python scripts/init_model_v2.py --model-id ${BASE_AB} --output ${OUT_INIT} --config ${V2_CONFIG} --search-lut --imatrix ${IM} --svd-error"
 echo "CMD: $cmd"
 $cmd
 echo ""
