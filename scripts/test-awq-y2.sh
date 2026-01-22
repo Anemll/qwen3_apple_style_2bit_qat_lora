@@ -136,10 +136,10 @@ run_ppl () {
     echo "N/A"; return 0
   elif [[ "$EnablePPL" == "true" ]]; then
     python scripts/measure_perplexity.py "$ckpt" --device "$PPL_DEVICE" --dtype fp16 --output-ppl 2>/dev/null \
-      | awk -F= '/^PPL=/'"{print $2; exit}"
+      | awk -F= '/^PPL=/{print $2; exit}'
   elif [[ "$EnablePPL" =~ ^[0-9]+$ ]]; then
     python scripts/measure_perplexity.py "$ckpt" --device "$PPL_DEVICE" --dtype fp16 --output-ppl --max-chunks "$EnablePPL" 2>/dev/null \
-      | awk -F= '/^PPL=/'"{print $2; exit}"
+      | awk -F= '/^PPL=/{print $2; exit}'
   else
     echo "N/A"; return 0
   fi
