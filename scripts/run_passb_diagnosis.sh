@@ -215,16 +215,21 @@ fi
 
 # Log checksums for reproducibility
 log "  Checksums:"
+CKSUM_A=""
 if [[ -f "$BASE_A/model.safetensors" ]]; then
-  sha256sum "$BASE_A/model.safetensors" | head -c 16 | xargs -I{} log "    Base A:  {}..."
+  CKSUM_A=$(sha256sum "$BASE_A/model.safetensors" | cut -c1-16)
 elif [[ -f "$BASE_A/pytorch_model.bin" ]]; then
-  sha256sum "$BASE_A/pytorch_model.bin" | head -c 16 | xargs -I{} log "    Base A:  {}..."
+  CKSUM_A=$(sha256sum "$BASE_A/pytorch_model.bin" | cut -c1-16)
 fi
+[[ -n "$CKSUM_A" ]] && log "    Base A:  ${CKSUM_A}..."
+
+CKSUM_AB=""
 if [[ -f "$BASE_AB/model.safetensors" ]]; then
-  sha256sum "$BASE_AB/model.safetensors" | head -c 16 | xargs -I{} log "    Base AB: {}..."
+  CKSUM_AB=$(sha256sum "$BASE_AB/model.safetensors" | cut -c1-16)
 elif [[ -f "$BASE_AB/pytorch_model.bin" ]]; then
-  sha256sum "$BASE_AB/pytorch_model.bin" | head -c 16 | xargs -I{} log "    Base AB: {}..."
+  CKSUM_AB=$(sha256sum "$BASE_AB/pytorch_model.bin" | cut -c1-16)
 fi
+[[ -n "$CKSUM_AB" ]] && log "    Base AB: ${CKSUM_AB}..."
 
 echo "" >> "$RESULTS_FILE"
 echo "Phase     | Variant                   | PPL          | Notes" >> "$RESULTS_FILE"
