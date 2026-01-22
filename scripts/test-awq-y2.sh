@@ -67,6 +67,9 @@ BASE_AB="runs/awq_scaled_a${ALPHA_A}_y${ALPHA_ROW}"
 OUT_INIT="runs/v2_awq_a${ALPHA_A}_y${ALPHA_ROW}"
 HYBRID="${OUT_INIT}/ihybrid.pt"
 
+# Final iMatrix used for k-means LUT building + iActMSE scoring (computed on the FINAL base)
+IM_FINAL="runs/imatrix_final_a${ALPHA_A}_y${ALPHA_ROW}.pt"
+
 # Collect PPL results (simple vars for bash 3.x compat)
 PPL_V2_INIT="N/A"
 PPL_HYBRID="N/A"
@@ -76,6 +79,7 @@ echo "AWQ + Y-matrix pipeline"
 echo "============================================================"
 echo "BASE:       ${BASE}"
 echo "IM:         ${IM}"
+echo "IM_FINAL:   ${IM_FINAL}"
 echo "YM:         ${YM}"
 echo "ALPHA_A:    ${ALPHA_A}"
 echo "ALPHA_ROW:  ${ALPHA_ROW}"
@@ -133,10 +137,30 @@ else
 fi
 
 # -------------------------
+# Step 1D: Compute iMatrix on FINAL base (BASE_AB)
+# -------------------------
+# IMPORTANT:
+#   Pass-B (and Pass-A) can change internal activation distributions even when FP-equivalent.
+#   Since Family-G k-means uses iMatrix weights to TRAIN the LUT centroids, we must compute
+#   the iMatrix on the FINAL base we will quantize (BASE_AB).
+#
+# Set FORCE_REIM=1 to recompute even if the file exists.
+if [[ "${FORCE_REIM:-0}" == "1" || ! -f "${IM_FINAL}" ]]; then
+  echo ">>> Step 1D: Computing IM_FINAL on FINAL base: ${BASE_AB}"
+  cmd="python scripts/compute_imatrix.py --model ${BASE_AB} --calib-mode ${CALIB_MODE} --tokens ${TOKENS} --seq-len ${SEQ_LEN} --batch-size ${BATCH_SIZE} --out ${IM_FINAL} --trust-remote-code --verbose"
+  echo "CMD: $cmd"
+  $cmd
+  echo ""
+else
+  echo ">>> Step 1D: Using existing IM_FINAL: ${IM_FINAL}"
+  echo ""
+fi
+
+# -------------------------
 # Step 2: Initialize V2 from the final base
 # -------------------------
 echo ">>> Step 2: init_model_v2.py from base: ${BASE_AB}"
-cmd="python scripts/init_model_v2.py --model-id ${BASE_AB} --output ${OUT_INIT} --config ${V2_CONFIG} --search-lut --imatrix ${IM} --svd-error"
+cmd="python scripts/init_model_v2.py --model-id ${BASE_AB} --output ${OUT_INIT} --config ${V2_CONFIG} --search-lut --imatrix ${IM_FINAL} --svd-error"
 echo "CMD: $cmd"
 $cmd
 echo ""
@@ -177,7 +201,7 @@ fi
 # IMPORTANT: must use the SAME base (BASE_AB) for W_ref!
 # -------------------------
 echo ">>> Step 4: select_best_lut_per_layer (families=${FAMILIES})"
-cmd="python scripts/select_best_lut_per_layer.py ${OUT_INIT}/v2_initial.pt --model-id ${BASE_AB} --output ${HYBRID} --families ${FAMILIES} --metric iActMSE --imatrix ${IM} --workers ${WORKERS}"
+cmd="python scripts/select_best_lut_per_layer.py ${OUT_INIT}/v2_initial.pt --model-id ${BASE_AB} --output ${HYBRID} --families ${FAMILIES} --metric iActMSE --imatrix ${IM_FINAL} --workers ${WORKERS}"
 echo "CMD: $cmd"
 $cmd
 echo ""
