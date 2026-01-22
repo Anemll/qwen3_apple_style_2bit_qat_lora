@@ -349,14 +349,15 @@ if [[ "$SKIP_PHASE3" != "true" ]]; then
 
   for RANK in $RANKS; do
     V2_AB_RANK="$DIAG_DIR/v2_ab_r${RANK}"
-    CONFIG_RANK="q4a4_r${RANK}"
 
     if [[ ! -f "$V2_AB_RANK/v2_initial.pt" ]]; then
       log "  init_model_v2 on Base AB (rank=$RANK)..."
       python scripts/init_model_v2.py \
         --model-id "$BASE_AB" \
         --output "$V2_AB_RANK" \
-        --config "$CONFIG_RANK" \
+        --config q4a4 \
+        --mlp-rank "$RANK" \
+        --attn-rank "$RANK" \
         --lut fp4_dense \
         --imatrix "$IM_AB" \
         --svd-error
