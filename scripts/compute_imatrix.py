@@ -72,6 +72,43 @@ def _resolve_device(s: str) -> torch.device:
     return torch.device(s)
 
 
+def _load_tokenizer(model_id: str, trust_remote_code: bool):
+    """Load tokenizer with mistral regex fix when supported."""
+    try:
+        return AutoTokenizer.from_pretrained(
+            model_id,
+            trust_remote_code=trust_remote_code,
+            use_fast=False,
+            fix_mistral_regex=True,
+        )
+    except TypeError:
+        # Older transformers may not support fix_mistral_regex.
+        # Use slow tokenizer path to avoid the known fast-tokenizer regex issue.
+        return AutoTokenizer.from_pretrained(
+            model_id,
+            trust_remote_code=trust_remote_code,
+            use_fast=False,
+        )
+
+
+def _load_causal_lm(model_id: str, dtype: torch.dtype, trust_remote_code: bool):
+    """Load model preferring modern dtype arg with backward fallback."""
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            model_id,
+            dtype=dtype,
+            trust_remote_code=trust_remote_code,
+            low_cpu_mem_usage=True,
+        )
+    except TypeError:
+        return AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=dtype,
+            trust_remote_code=trust_remote_code,
+            low_cpu_mem_usage=True,
+        )
+
+
 def _is_linear_like(m: torch.nn.Module) -> bool:
     # We want modules with a 2D float weight and float inputs (hook will verify).
     w = getattr(m, "weight", None)
@@ -254,15 +291,10 @@ def main() -> int:
         print(f"[imatrix] calib_mode={args.calib_mode} tokens≈{args.tokens} seq_len={args.seq_len} bs={args.batch_size}")
 
     # Load tokenizer + model
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
+    tokenizer = _load_tokenizer(args.model, trust_remote_code=args.trust_remote_code)
     _set_tokenizer_padding(tokenizer)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=dtype,
-        trust_remote_code=args.trust_remote_code,
-        low_cpu_mem_usage=True,
-    )
+    model = _load_causal_lm(args.model, dtype=dtype, trust_remote_code=args.trust_remote_code)
     model.eval()
     model.to(device)
 

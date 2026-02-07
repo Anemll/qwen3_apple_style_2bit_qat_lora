@@ -191,8 +191,10 @@ Author: ANEMLL Team
 """
 
 import argparse
+import gc
 import json
 import os
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -205,6 +207,168 @@ import torch.nn as nn
 # Add repo root to path
 REPO_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_DIR))
+
+
+def _load_tokenizer_safe(model_id: str, trust_remote_code: bool = True):
+    """
+    Load tokenizer with mistral-regex fix when supported.
+
+    Some transformers versions expose `fix_mistral_regex`; older versions do not.
+    """
+    from transformers import AutoTokenizer
+
+    try:
+        return AutoTokenizer.from_pretrained(
+            model_id,
+            trust_remote_code=trust_remote_code,
+            use_fast=False,
+            fix_mistral_regex=True,
+        )
+    except TypeError:
+        # Fallback for older transformers versions.
+        return AutoTokenizer.from_pretrained(
+            model_id,
+            trust_remote_code=trust_remote_code,
+            use_fast=False,
+        )
+
+
+def _load_causal_lm_safe(
+    model_id: str,
+    dtype: torch.dtype,
+    trust_remote_code: bool = True,
+):
+    """
+    Load causal LM preferring modern `dtype=` with backward fallback.
+    """
+    from transformers import AutoModelForCausalLM
+
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            model_id,
+            dtype=dtype,
+            trust_remote_code=trust_remote_code,
+        )
+    except TypeError as e:
+        # Only fallback when this transformers version does not recognize `dtype=`.
+        msg = str(e)
+        if "dtype" not in msg and "unexpected keyword argument" not in msg:
+            raise
+        return AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=dtype,
+            trust_remote_code=trust_remote_code,
+        )
+
+
+def _format_bytes(n: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    x = float(max(0, n))
+    for unit in units:
+        if x < 1024.0 or unit == units[-1]:
+            return f"{x:.1f}{unit}"
+        x /= 1024.0
+    return f"{n}B"
+
+
+def _estimate_state_dict_bytes(state_dict: Dict[str, Any]) -> int:
+    total = 0
+    for value in state_dict.values():
+        if torch.is_tensor(value):
+            total += value.numel() * value.element_size()
+    return int(total)
+
+
+def _ensure_free_space(path: Path, required_bytes: int, reserve_bytes: int = 512 * 1024 * 1024) -> None:
+    """
+    Check available space before writing a large checkpoint.
+    """
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(parent)
+    available = int(usage.free)
+    needed = int(required_bytes + reserve_bytes)
+    if available < needed:
+        raise RuntimeError(
+            "Insufficient disk space for checkpoint save: "
+            f"available={_format_bytes(available)}, "
+            f"required~{_format_bytes(required_bytes)} + reserve={_format_bytes(reserve_bytes)}. "
+            f"Free space on '{parent}' and retry."
+        )
+
+
+def _safe_torch_save(obj: Any, path: Path, required_bytes_hint: Optional[int] = None) -> None:
+    """
+    Atomic save with cleanup and a legacy-serialization fallback.
+    """
+    tmp_path = path.with_name(path.name + ".tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    if required_bytes_hint is not None:
+        _ensure_free_space(path, required_bytes_hint)
+
+    try:
+        torch.save(obj, tmp_path)
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if tmp_path.exists():
+            tmp_path.unlink()
+        # PyTorch zip writer can fail late; retry with legacy serializer.
+        if "pytorchstreamwriter" in msg or "inline_container" in msg or "file write failed" in msg:
+            if required_bytes_hint is not None:
+                _ensure_free_space(path, required_bytes_hint)
+            torch.save(obj, tmp_path, _use_new_zipfile_serialization=False)
+        else:
+            raise
+
+    os.replace(tmp_path, path)
+
+
+def _create_checkpoint_alias(target_path: Path, alias_path: Path) -> str:
+    """
+    Create alias path for compatibility without duplicating multi-GB checkpoint data.
+    Returns alias type: hardlink/symlink/copy.
+    """
+    if alias_path.exists() or alias_path.is_symlink():
+        alias_path.unlink()
+
+    try:
+        os.link(target_path, alias_path)
+        return "hardlink"
+    except OSError:
+        pass
+
+    try:
+        # Relative symlink keeps the directory relocatable.
+        os.symlink(target_path.name, alias_path)
+        return "symlink"
+    except OSError:
+        shutil.copy2(target_path, alias_path)
+        return "copy"
+
+
+def _release_memory(device: Optional[torch.device] = None) -> None:
+    """
+    Best-effort memory release for long-running init flows.
+    """
+    gc.collect()
+
+    try:
+        dev_type = (device.type if isinstance(device, torch.device) else str(device or "")).lower()
+    except Exception:
+        dev_type = ""
+
+    # Clear CUDA allocator cache when relevant.
+    if dev_type in ("", "cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Clear MPS cache if available.
+    if dev_type in ("", "mps") and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -470,20 +634,14 @@ def load_base_model(
     Returns:
         (model, tokenizer) tuple
     """
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
     if verbose:
         print(f"\n[Step 2] Loading base model: {model_id}")
         print(f"  dtype: {dtype}")
 
     t0 = time.time()
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        trust_remote_code=True,
-    )
+    tokenizer = _load_tokenizer_safe(model_id, trust_remote_code=True)
+    model = _load_causal_lm_safe(model_id, dtype=dtype, trust_remote_code=True)
 
     # Count parameters before moving to device
     total_params = sum(p.numel() for p in model.parameters())
@@ -690,7 +848,6 @@ def measure_svd_approximation_error(
     Returns:
         Dict with per-layer and aggregate MAE statistics
     """
-    from transformers import AutoModelForCausalLM
     from qat_lora.ane_qat_linear_v2 import AnemllQATLinearV2
 
     if verbose:
@@ -702,9 +859,9 @@ def measure_svd_approximation_error(
     if verbose:
         print(f"  Loading baseline weights from {model_id}...")
 
-    baseline = AutoModelForCausalLM.from_pretrained(
+    baseline = _load_causal_lm_safe(
         model_id,
-        torch_dtype=torch.float32,
+        dtype=torch.float32,
         trust_remote_code=True,
     )
 
@@ -715,6 +872,7 @@ def measure_svd_approximation_error(
             W_ref_map[name] = module.weight.data.clone()
 
     del baseline
+    _release_memory()
 
     if verbose:
         print(f"  Loaded {len(W_ref_map)} baseline weight tensors")
@@ -783,6 +941,9 @@ def measure_svd_approximation_error(
             short_name = name.split('.')[-2] + '.' + name.split('.')[-1] if '.' in name else name
             print(f"    {short_name}: MAE={mae:.6f} (rel={rel_mae:.4f})")
 
+        # Avoid retaining large temporary tensors between layers.
+        del W_ref, Q, S, W_eff
+
     # Aggregate statistics
     all_maes = [s['mae'] for s in layer_stats]
     all_rel_maes = [s['rel_mae'] for s in layer_stats]
@@ -820,6 +981,11 @@ def measure_svd_approximation_error(
             short_name = '.'.join(parts[-4:]) if len(parts) >= 4 else layer['name']
             print(f"    {i+1:2d}. {short_name}: MAE={layer['mae']:.6f}")
         print(f"  Time: {stats['time_seconds']:.1f}s")
+
+    # Free baseline map before returning potentially large stats payload.
+    W_ref_map.clear()
+    del W_ref_map
+    _release_memory()
 
     return stats
 
@@ -957,12 +1123,18 @@ def search_optimal_group_sizes(
                     best_group_size = gs
 
                 # Clean up
+                del Q, S, W_eff
                 del temp_v2
 
             except Exception as e:
                 if verbose:
                     print(f"    [WARN] group_size={gs} failed for {name}: {e}")
                 group_maes[gs] = float('inf')
+
+        # Release per-layer temporaries before moving to the next layer.
+        del W_ref
+        if (layer_idx + 1) % 8 == 0:
+            _release_memory(device)
 
         layer_result = {
             'name': name,
@@ -1344,12 +1516,18 @@ def search_optimal_luts(
                     best_lut_name = lut_name
 
                 # Clean up
+                del Q, S, W_eff, err2
                 del temp_v2
 
             except Exception as e:
                 if verbose:
                     print(f"    [WARN] LUT '{lut_name}' failed for {name}: {e}")
                 lut_mses[lut_name] = float('inf')
+
+        # Release per-layer temporaries before moving to the next layer.
+        del W_ref
+        if (layer_idx + 1) % 8 == 0:
+            _release_memory(device)
 
         layer_result = {
             'name': name,
@@ -1939,6 +2117,9 @@ def tighten_and_measure_ppl(
         tighten_stats['total_params'] += qc['total']
         mse_deltas.append(qc['mse_delta'])
 
+        if (layer_idx + 1) % 8 == 0:
+            _release_memory(orig_device)
+
     # Model stays on CPU after tightening (fine for saving, training script moves to device)
 
     if mse_deltas:
@@ -1951,6 +2132,11 @@ def tighten_and_measure_ppl(
         print(f"  Avg MSE delta: {tighten_stats['avg_mse_delta']:+.2e}")
 
     results['tighten'] = tighten_stats
+
+    # Baseline map is no longer needed after tighten.
+    W_ref_map.clear()
+    del W_ref_map
+    _release_memory(device)
 
     # --- Step 8c: Measure perplexity (if not skipped) ---
     if not skip_ppl:
@@ -1987,6 +2173,8 @@ def tighten_and_measure_ppl(
         if verbose:
             print(f"\n  Quick PPL: {ppl_result['perplexity']:.2f}")
             print(f"  Cross-entropy: {ppl_result['cross_entropy']:.4f} nats")
+        del estimator, ppl_result
+        _release_memory(device)
 
     total_time = time.time() - t0
     results['time_seconds'] = total_time
@@ -2042,7 +2230,11 @@ def save_checkpoint(
 
     # Save model state dict
     checkpoint_path = output_path / "v2_initial.pt"
-    torch.save(model.state_dict(), checkpoint_path)
+    state_dict = model.state_dict()
+    estimated_bytes = _estimate_state_dict_bytes(state_dict)
+    _safe_torch_save(state_dict, checkpoint_path, required_bytes_hint=estimated_bytes)
+    del state_dict
+    _release_memory()
     paths['checkpoint'] = str(checkpoint_path)
 
     # Get checkpoint size
@@ -2199,6 +2391,25 @@ def init_v2_model(
         verbose=verbose,
     )
 
+    # Disk-space preflight before expensive replacement/search steps.
+    # V2 checkpoints can be much larger than base FP32 weights due to extra
+    # quantization tensors (_Q, _indices, scales, LUT buffers).
+    base_param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    estimated_v2_ckpt_bytes = int(base_param_bytes * 3.6)
+    checkpoint_target = Path(output_dir) / "v2_initial.pt"
+    try:
+        _ensure_free_space(checkpoint_target, required_bytes=estimated_v2_ckpt_bytes)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"{e} (preflight estimate for V2 init checkpoint: {_format_bytes(estimated_v2_ckpt_bytes)})"
+        ) from e
+    if verbose:
+        free_bytes = shutil.disk_usage(Path(output_dir)).free
+        print(
+            f"  Disk preflight: free={_format_bytes(free_bytes)}, "
+            f"estimated_v2_ckpt~{_format_bytes(estimated_v2_ckpt_bytes)}"
+        )
+
     # Capture original weights if detailed output is requested
     original_weights = {}
     if detailed:
@@ -2238,6 +2449,8 @@ def init_v2_model(
             if 'metadata' in imatrix_data:
                 meta = imatrix_data['metadata']
                 print(f"  Source: {meta.get('model_id', 'N/A')}, tokens={meta.get('num_tokens', 'N/A')}")
+        del imatrix_data
+        _release_memory(device)
 
     # Step 4a: LUT selection (search or fixed)
     # Option 1: Use fixed LUT for all layers (--lut fp4_dense)
@@ -2428,6 +2641,11 @@ def init_v2_model(
     )
     metrics['steps']['freeze'] = freeze_stats
 
+    # Detailed original FP32 copies are no longer needed after freeze.
+    if detailed and original_weights:
+        original_weights.clear()
+        _release_memory(device)
+
     # Step 6: Save (BEFORE tightening - this is the untightened initial checkpoint)
     save_paths = save_checkpoint(
         model=model,
@@ -2441,21 +2659,31 @@ def init_v2_model(
     )
     metrics['paths'] = save_paths
 
+    # Search artifacts are no longer needed after save.
+    imatrix = None
+    lut_candidates = None
+    _release_memory(device)
+
     # Step 7+8: Tighten Q, Validate, and/or Measure PPL (if either is enabled)
     need_tightened_model = validate or measure_ppl
     if need_tightened_model:
+        # Free the initial model before loading a fresh tightened model.
+        # This avoids holding two ~1B models in memory simultaneously.
+        model.to("cpu")
+        del model
+        _release_memory(device)
+
         # Load fresh model with SAME config as initialization
         # IMPORTANT: Config must match or _compute_full_scales() will give wrong values!
         if verbose:
             print(f"\n[Step 7] Loading fresh model for tightening (same config as init)...")
 
-        from transformers import AutoModelForCausalLM
         from qat_lora.ane_qat_linear_v2 import AnemllQuantConfigV2, replace_linear_with_anemll_v2, AnemllQATLinearV2
 
         # Load fresh base model
-        tightened_model = AutoModelForCausalLM.from_pretrained(
+        tightened_model = _load_causal_lm_safe(
             model_id,
-            torch_dtype=torch.float32,
+            dtype=torch.float32,
             trust_remote_code=True,
         )
 
@@ -2511,6 +2739,10 @@ def init_v2_model(
         if q_loaded > 0 and verbose:
             print(f"  Manually loaded {q_loaded} _Q buffers")
 
+        # Full checkpoint dict no longer needed after manual _Q load.
+        del state_dict
+        _release_memory(device)
+
         # Move to device
         tightened_model.to(device)
 
@@ -2550,19 +2782,27 @@ def init_v2_model(
         # Save tightened checkpoint (both names for compatibility)
         tightened_path = Path(output_dir) / "v2_tightened.pt"
         tightq_path = Path(output_dir) / "tightQ_all.pt"
-        torch.save(tightened_model.state_dict(), tightened_path)
-        torch.save(tightened_model.state_dict(), tightq_path)
+        tightened_state = tightened_model.state_dict()
+        tightened_bytes = _estimate_state_dict_bytes(tightened_state)
+        _safe_torch_save(tightened_state, tightened_path, required_bytes_hint=tightened_bytes)
+        alias_kind = _create_checkpoint_alias(tightened_path, tightq_path)
+        del tightened_state
+        _release_memory(device)
         save_paths['tightened'] = str(tightened_path)
         save_paths['tightq_all'] = str(tightq_path)
         if verbose:
             ckpt_size_mb = tightened_path.stat().st_size / 1024 / 1024
             print(f"\n  Saved tightened checkpoints:")
             print(f"    {tightened_path} ({ckpt_size_mb:.1f} MB)")
-            print(f"    {tightq_path} ({ckpt_size_mb:.1f} MB)")
+            print(f"    {tightq_path} ({ckpt_size_mb:.1f} MB, {alias_kind})")
 
         # Clean up
-        del tightened_model, state_dict
+        del tightened_model
+        _release_memory(device)
     else:
+        # No further model use after checkpoint save.
+        del model
+        _release_memory(device)
         if verbose:
             print(f"\n[Step 7-8] Tightening/Validation/PPL SKIPPED")
             print(f"  Use --inference-eval for validation, --ppl for perplexity")
