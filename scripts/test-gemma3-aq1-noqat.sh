@@ -50,6 +50,67 @@ run_cmd() {
 
 PY="$(pick_python)"
 
+# Tiny stage-level PPL screening to localize where quality collapses.
+run_fast_ppl_check() {
+  local label="$1"   # step1|step3|step4
+  local mode="$2"    # baseline|checkpoint
+  local target="$3"  # model path (baseline) or checkpoint path
+  local model_path="$4"
+
+  local cmd=("${PY}" scripts/measure_perplexity.py)
+  if [[ "${mode}" == "baseline" ]]; then
+    cmd+=(--baseline --model "${model_path}")
+  else
+    cmd+=("${target}" --model "${model_path}")
+  fi
+  cmd+=(
+    --device "${FAST_PPL_DEVICE}"
+    --dtype "${FAST_PPL_DTYPE}"
+    --batch-size "${FAST_PPL_BATCH_SIZE}"
+    --seq-len "${FAST_PPL_SEQ_LEN}"
+    --max-chunks "${FAST_PPL_MAX_CHUNKS}"
+    --output-ppl
+  )
+  if [[ -n "${FAST_PPL_TEXT_FILE}" ]]; then
+    cmd+=(--text-file "${FAST_PPL_TEXT_FILE}")
+  fi
+
+  echo ">>> Fast PPL (${label})"
+  echo "CMD: ${cmd[*]}"
+  local ppl_output
+  local ppl_value="N/A"
+  if ppl_output="$("${cmd[@]}" 2>&1)"; then
+    ppl_value="$(printf '%s\n' "${ppl_output}" | awk -F= '/^PPL=/{print $2; exit}')"
+    if [[ -z "${ppl_value}" ]]; then
+      ppl_value="N/A"
+      echo "  Warning: Fast PPL parse failed."
+    else
+      echo "  Fast PPL (${label}) = ${ppl_value}"
+      if [[ -n "${FAST_PPL_ABORT_ABOVE}" && "${FAST_PPL_FAIL_FAST}" != "false" ]]; then
+        if "${PY}" - "${ppl_value}" "${FAST_PPL_ABORT_ABOVE}" <<'PY'
+import sys
+p=float(sys.argv[1]); t=float(sys.argv[2])
+raise SystemExit(0 if p > t else 1)
+PY
+        then
+          echo "  ERROR: Fast PPL ${ppl_value} > threshold ${FAST_PPL_ABORT_ABOVE}; stopping."
+          exit 2
+        fi
+      fi
+    fi
+  else
+    local rc=$?
+    echo "  Warning: Fast PPL command failed (exit=${rc})."
+    printf '%s\n' "${ppl_output}" | sed 's/^/    /'
+  fi
+
+  case "${label}" in
+    step1) FAST_PPL_STEP1="${ppl_value}" ;;
+    step3) FAST_PPL_STEP3="${ppl_value}" ;;
+    step4) FAST_PPL_STEP4="${ppl_value}" ;;
+  esac
+}
+
 # -------------------------
 # Config (override via env)
 # -------------------------
@@ -97,7 +158,31 @@ ENABLE_EXPORT="${ENABLE_EXPORT:-false}"
 EXPORT_SNAP_ANE="${EXPORT_SNAP_ANE:-true}"
 RECOMPUTE_INDICES="${RECOMPUTE_INDICES:-true}"
 
+FAST_PPL_CHECK="${FAST_PPL_CHECK:-true}"
+FAST_PPL_DEVICE="${FAST_PPL_DEVICE:-cpu}"
+FAST_PPL_DTYPE="${FAST_PPL_DTYPE:-fp32}"
+FAST_PPL_MAX_CHUNKS="${FAST_PPL_MAX_CHUNKS:-2}"
+FAST_PPL_BATCH_SIZE="${FAST_PPL_BATCH_SIZE:-1}"
+FAST_PPL_SEQ_LEN="${FAST_PPL_SEQ_LEN:-256}"
+FAST_PPL_TEXT_FILE="${FAST_PPL_TEXT_FILE:-}"
+FAST_PPL_ABORT_ABOVE="${FAST_PPL_ABORT_ABOVE:-}"
+FAST_PPL_FAIL_FAST="${FAST_PPL_FAIL_FAST:-false}"
+FAST_PPL_STEP1="N/A"
+FAST_PPL_STEP3="N/A"
+FAST_PPL_STEP4="N/A"
+
+ENABLE_LOG_FILE="${ENABLE_LOG_FILE:-true}"
+LOG_DIR="${LOG_DIR:-${RUN_ROOT}}"
+LOG_FILE="${LOG_FILE:-${LOG_DIR}/gemma3_aq1_noqat_$(date +%Y%m%d_%H%M%S).log}"
+SUMMARY_FILE="${SUMMARY_FILE:-${LOG_DIR}/gemma3_aq1_noqat_latest.summary}"
+
 mkdir -p "${RUN_ROOT}"
+mkdir -p "${LOG_DIR}"
+
+if is_true "${ENABLE_LOG_FILE}"; then
+  # Mirror all output to a file for remote debugging / cross-machine sharing.
+  exec > >(tee -a "${LOG_FILE}") 2>&1
+fi
 
 ALPHA_TAG="$(echo "${AWQ_ALPHA}" | tr '.' 'p')"
 FP16_MODEL_DIR="${RUN_ROOT}/model_fp16scaled"
@@ -138,6 +223,9 @@ echo "ENABLE_PPL:      ${ENABLE_PPL} (device=${PPL_DEVICE})"
 echo "ENABLE_INFERENCE:${ENABLE_INFERENCE}"
 echo "INFER_RUNTIME:   device=${INFER_DEVICE}, dtype=${INFER_DTYPE}"
 echo "ENABLE_EXPORT:   ${ENABLE_EXPORT}"
+echo "FAST_PPL_CHECK:  ${FAST_PPL_CHECK} (dev=${FAST_PPL_DEVICE}, dtype=${FAST_PPL_DTYPE}, chunks=${FAST_PPL_MAX_CHUNKS}, batch=${FAST_PPL_BATCH_SIZE}, seq=${FAST_PPL_SEQ_LEN})"
+echo "LOG_FILE:        ${LOG_FILE}"
+echo "SUMMARY_FILE:    ${SUMMARY_FILE}"
 echo "============================================================"
 echo ""
 
@@ -160,6 +248,11 @@ else
   echo ">>> Step 1: Skipped FP16 residual scaling"
 fi
 echo ""
+
+if is_true "${FAST_PPL_CHECK}"; then
+  run_fast_ppl_check "step1" "baseline" "-" "${SOURCE_MODEL}"
+  echo ""
+fi
 
 # -------------------------
 # Step 2: iMatrix
@@ -198,6 +291,11 @@ else
   echo ">>> Step 3: Reusing existing AWQ-scaled model: ${AWQ_MODEL_DIR}"
 fi
 echo ""
+
+if is_true "${FAST_PPL_CHECK}"; then
+  run_fast_ppl_check "step3" "baseline" "-" "${AWQ_MODEL_DIR}"
+  echo ""
+fi
 
 # -------------------------
 # Step 4: AQ1 init (no QAT training)
@@ -289,6 +387,11 @@ else
 fi
 echo ""
 
+if is_true "${FAST_PPL_CHECK}"; then
+  run_fast_ppl_check "step4" "checkpoint" "${INIT_CKPT}" "${AWQ_MODEL_DIR}"
+  echo ""
+fi
+
 # -------------------------
 # Step 5: Optional perplexity
 # -------------------------
@@ -373,7 +476,28 @@ echo "iMatrix:      ${IMATRIX_PATH}"
 echo "AWQ model:    ${AWQ_MODEL_DIR}"
 echo "AQ1 checkpoint:${INIT_CKPT}"
 echo "Perplexity:   ${PPL_VALUE}"
+if is_true "${FAST_PPL_CHECK}"; then
+  echo "Fast PPL s1/s3/s4: ${FAST_PPL_STEP1} / ${FAST_PPL_STEP3} / ${FAST_PPL_STEP4}"
+fi
 if is_true "${ENABLE_EXPORT}"; then
   echo "HF export:    ${EXPORT_DIR}"
 fi
 echo "============================================================"
+
+{
+  echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "run_root=${RUN_ROOT}"
+  echo "base_model=${BASE_MODEL}"
+  echo "awq_model=${AWQ_MODEL_DIR}"
+  echo "aq1_checkpoint=${INIT_CKPT}"
+  echo "ppl=${PPL_VALUE}"
+  echo "fast_ppl_step1=${FAST_PPL_STEP1}"
+  echo "fast_ppl_step3=${FAST_PPL_STEP3}"
+  echo "fast_ppl_step4=${FAST_PPL_STEP4}"
+  echo "infer_device=${INFER_DEVICE}"
+  echo "infer_dtype=${INFER_DTYPE}"
+  echo "enable_inference=${ENABLE_INFERENCE}"
+  echo "enable_export=${ENABLE_EXPORT}"
+  echo "log_file=${LOG_FILE}"
+} > "${SUMMARY_FILE}"
+echo "Wrote summary: ${SUMMARY_FILE}"

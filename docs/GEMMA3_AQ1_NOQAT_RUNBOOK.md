@@ -63,6 +63,53 @@ ENABLE_PPL=true bash scripts/test-gemma3-aq1-noqat.sh
 ENABLE_PPL=20 bash scripts/test-gemma3-aq1-noqat.sh
 ```
 
+## 5b) Fast stage-by-stage PPL screening (recommended for debugging)
+
+This runs tiny PPL checks after:
+
+- Step 1 (FP16-scaled model)
+- Step 3 (AWQ-scaled model)
+- Step 4 (AQ1 init checkpoint)
+
+Example:
+
+```bash
+FAST_PPL_CHECK=true FAST_PPL_DEVICE=cpu FAST_PPL_DTYPE=fp32 \
+FAST_PPL_MAX_CHUNKS=2 FAST_PPL_BATCH_SIZE=1 FAST_PPL_SEQ_LEN=256 \
+ENABLE_PPL=false FORCE_REINIT=1 \
+bash scripts/test-gemma3-aq1-noqat.sh
+```
+
+Optional fail-fast threshold:
+
+```bash
+FAST_PPL_CHECK=true FAST_PPL_ABORT_ABOVE=120 FAST_PPL_FAIL_FAST=true \
+ENABLE_PPL=false FORCE_REINIT=1 \
+bash scripts/test-gemma3-aq1-noqat.sh
+```
+
+## 5c) Logging to file (for remote sharing)
+
+The pipeline now writes:
+
+- Full log: `${RUN_ROOT}/gemma3_aq1_noqat_<timestamp>.log`
+- Compact summary: `${RUN_ROOT}/gemma3_aq1_noqat_latest.summary`
+
+Explicit path example:
+
+```bash
+ENABLE_LOG_FILE=true LOG_DIR=runs/gemma3_aq1_noqat \
+FAST_PPL_CHECK=true ENABLE_PPL=false FORCE_REINIT=1 \
+bash scripts/test-gemma3-aq1-noqat.sh
+```
+
+Then share:
+
+```bash
+tail -n 120 runs/gemma3_aq1_noqat/gemma3_aq1_noqat_latest.summary
+tail -n 400 runs/gemma3_aq1_noqat/gemma3_aq1_noqat_*.log
+```
+
 ## 6) Inference-only check after checkpoint exists
 
 ```bash
