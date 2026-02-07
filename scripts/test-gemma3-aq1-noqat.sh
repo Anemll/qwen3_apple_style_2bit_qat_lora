@@ -80,6 +80,9 @@ SEARCH_LUT="${SEARCH_LUT:-false}"
 FIXED_LUT="${FIXED_LUT:-fp4_dense}"
 ENABLE_SVD_ERROR="${ENABLE_SVD_ERROR:-true}"
 FORCE_REINIT="${FORCE_REINIT:-0}"
+INIT_MLP_RANK="${INIT_MLP_RANK:-32}"
+INIT_ATTN_RANK="${INIT_ATTN_RANK:-32}"
+INIT_SEARCH_GROUP="${INIT_SEARCH_GROUP:-}"
 
 ENABLE_PPL="${ENABLE_PPL:-false}"     # false|true|N
 PPL_DTYPE="${PPL_DTYPE:-fp16}"
@@ -124,6 +127,7 @@ echo "PY:              ${PY}"
 echo "BASE_MODEL:      ${BASE_MODEL}"
 echo "RUN_ROOT:        ${RUN_ROOT}"
 echo "AQ1_CONFIG:      ${AQ1_CONFIG}"
+echo "INIT_RANKS:      mlp=${INIT_MLP_RANK}, attn=${INIT_ATTN_RANK}"
 echo "USE_FP16_SCALING:${USE_FP16_SCALING} (alpha=${FP16_ALPHA})"
 echo "AWQ_ALPHA:       ${AWQ_ALPHA}"
 echo "IM_PROGRESS:     every ${IMATRIX_PROGRESS_EVERY} step(s)"
@@ -195,15 +199,79 @@ echo ""
 # -------------------------
 # Step 4: AQ1 init (no QAT training)
 # -------------------------
-if [[ "${FORCE_REINIT}" == "1" || ! -f "${INIT_CKPT}" ]]; then
+REINIT_REASON=""
+if [[ "${FORCE_REINIT}" != "1" && -f "${INIT_CKPT}" ]]; then
+  INIT_CFG="${INIT_DIR}/config.json"
+  if [[ ! -f "${INIT_CFG}" ]]; then
+    REINIT_REASON="missing config.json for existing checkpoint"
+  else
+    # Verify reused checkpoint matches requested quant config/ranks/model.
+    cfg_row="$("${PY}" - "${INIT_CFG}" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+model_id = cfg.get("model_id", "")
+mlp_rank = cfg.get("mlp_scale_rank", cfg.get("scale_rank"))
+attn_rank = cfg.get("attn_scale_rank", mlp_rank)
+mlp_bits = cfg.get("mlp_lut_bits", cfg.get("lut_bits"))
+attn_bits = cfg.get("attn_lut_bits", mlp_bits)
+print(f"{model_id}\t{mlp_rank}\t{attn_rank}\t{mlp_bits}\t{attn_bits}")
+PY
+)"
+    IFS=$'\t' read -r cfg_model_id cfg_mlp_rank cfg_attn_rank cfg_mlp_bits cfg_attn_bits <<< "${cfg_row}"
+
+    exp_mlp_bits=""
+    exp_attn_bits=""
+    case "${AQ1_CONFIG}" in
+      q2a4) exp_mlp_bits="2"; exp_attn_bits="4" ;;
+      q2a2) exp_mlp_bits="2"; exp_attn_bits="2" ;;
+      q4a4|q4a4_r32|q4_r32) exp_mlp_bits="4"; exp_attn_bits="4" ;;
+    esac
+
+    mismatch=0
+    if [[ "${cfg_model_id}" != "${AWQ_MODEL_DIR}" ]]; then
+      REINIT_REASON+=" model_id(${cfg_model_id} != ${AWQ_MODEL_DIR});"
+      mismatch=1
+    fi
+    if [[ "${cfg_mlp_rank}" != "${INIT_MLP_RANK}" ]]; then
+      REINIT_REASON+=" mlp_rank(${cfg_mlp_rank} != ${INIT_MLP_RANK});"
+      mismatch=1
+    fi
+    if [[ "${cfg_attn_rank}" != "${INIT_ATTN_RANK}" ]]; then
+      REINIT_REASON+=" attn_rank(${cfg_attn_rank} != ${INIT_ATTN_RANK});"
+      mismatch=1
+    fi
+    if [[ -n "${exp_mlp_bits}" && "${cfg_mlp_bits}" != "${exp_mlp_bits}" ]]; then
+      REINIT_REASON+=" mlp_lut_bits(${cfg_mlp_bits} != ${exp_mlp_bits});"
+      mismatch=1
+    fi
+    if [[ -n "${exp_attn_bits}" && "${cfg_attn_bits}" != "${exp_attn_bits}" ]]; then
+      REINIT_REASON+=" attn_lut_bits(${cfg_attn_bits} != ${exp_attn_bits});"
+      mismatch=1
+    fi
+
+    if [[ "${mismatch}" == "0" ]]; then
+      REINIT_REASON=""
+    fi
+  fi
+fi
+
+if [[ "${FORCE_REINIT}" == "1" || ! -f "${INIT_CKPT}" || -n "${REINIT_REASON}" ]]; then
   echo ">>> Step 4: Initialize AQ1 V2 checkpoint"
+  if [[ -n "${REINIT_REASON}" ]]; then
+    echo "    Reinit reason:${REINIT_REASON}"
+  fi
   init_cmd=(
     "${PY}" scripts/init_model_v2.py
     --model-id "${AWQ_MODEL_DIR}"
     --output "${INIT_DIR}"
     --config "${AQ1_CONFIG}"
     --imatrix "${IMATRIX_PATH}"
+    --mlp-rank "${INIT_MLP_RANK}"
+    --attn-rank "${INIT_ATTN_RANK}"
   )
+  if [[ -n "${INIT_SEARCH_GROUP}" ]]; then
+    init_cmd+=(--search-group "${INIT_SEARCH_GROUP}")
+  fi
   if is_true "${SEARCH_LUT}"; then
     init_cmd+=(--search-lut)
   else
@@ -253,7 +321,6 @@ if is_true "${ENABLE_INFERENCE}"; then
   echo ">>> Step 6: Run test_inference prompt"
   run_cmd "${PY}" scripts/test_inference.py "${INIT_CKPT}" \
     --model-id "${AWQ_MODEL_DIR}" \
-    --config "${AQ1_CONFIG}" \
     --prompt "${PROMPT}" \
     --max-tokens "${MAX_NEW_TOKENS}" \
     --no-thinking

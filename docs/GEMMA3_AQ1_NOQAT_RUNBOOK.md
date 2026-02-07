@@ -42,6 +42,13 @@ TOKENS=8192 MAX_NEW_TOKENS=64 ENABLE_PPL=false \
 bash scripts/test-gemma3-aq1-noqat.sh
 ```
 
+## 4b) Rank override (recommended for Gemma3-1B)
+
+```bash
+INIT_MLP_RANK=32 INIT_ATTN_RANK=32 FORCE_REINIT=1 \
+bash scripts/test-gemma3-aq1-noqat.sh
+```
+
 ## 5) Enable perplexity
 
 - Full run:
@@ -61,7 +68,6 @@ ENABLE_PPL=20 bash scripts/test-gemma3-aq1-noqat.sh
 ```bash
 python3 scripts/test_inference.py runs/gemma3_aq1_noqat/v2_q2a4_init/v2_initial.pt \
   --model-id runs/gemma3_aq1_noqat/model_awq_a0p5 \
-  --config q2a4 \
   --prompt "Who invented the iPad?" \
   --max-tokens 160 \
   --no-thinking
