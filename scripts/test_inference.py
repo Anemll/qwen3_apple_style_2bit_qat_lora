@@ -42,6 +42,40 @@ CONFIG_PRESETS = {
 }
 
 
+def _load_tokenizer_safe(model_id: str, trust_remote_code: bool = True):
+    """Load tokenizer with mistral-regex fix when supported."""
+    try:
+        return AutoTokenizer.from_pretrained(
+            model_id,
+            trust_remote_code=trust_remote_code,
+            use_fast=False,
+            fix_mistral_regex=True,
+        )
+    except TypeError:
+        # Older transformers may not support fix_mistral_regex.
+        return AutoTokenizer.from_pretrained(
+            model_id,
+            trust_remote_code=trust_remote_code,
+            use_fast=False,
+        )
+
+
+def _load_causal_lm_safe(model_id: str, dtype: torch.dtype, trust_remote_code: bool = True):
+    """Load model preferring modern dtype argument, with backward fallback."""
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            model_id,
+            dtype=dtype,
+            trust_remote_code=trust_remote_code,
+        )
+    except TypeError:
+        return AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=dtype,
+            trust_remote_code=trust_remote_code,
+        )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Test QAT model inference')
     parser.add_argument('checkpoint', type=str, help='Path to checkpoint .pt file or directory')
@@ -172,12 +206,8 @@ def load_model(args):
     print(f"Loading base model: {model_id}")
 
     # Load base model
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        trust_remote_code=True,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = _load_causal_lm_safe(model_id, dtype=dtype, trust_remote_code=True)
+    tokenizer = _load_tokenizer_safe(model_id, trust_remote_code=True)
 
     # Replace with QAT layers based on version
     print(f"Replacing linears (q{lut_bits}_a{attn_lut_bits}, {version})...")
