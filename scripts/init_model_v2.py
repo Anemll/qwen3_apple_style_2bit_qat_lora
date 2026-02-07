@@ -1676,11 +1676,11 @@ def replace_linear_layers_with_optimal_luts(
 
     replaced_count = 0
     lut_used = {}
+    lut_fallback_count = 0
 
     for layer_idx, (name, linear_module) in enumerate(layers_to_replace):
         # Get optimal LUT for this layer
         lut_name = optimal_lut_map.get(name, 'uniform')
-        custom_lut = lut_candidates.get(lut_name)
 
         # Determine layer type and use appropriate config
         is_mlp = 'mlp' in name
@@ -1690,6 +1690,17 @@ def replace_linear_layers_with_optimal_luts(
         else:  # Attention
             lut_size = 2 ** attn_lut_bits
             scale_rank = attn_scale_rank
+
+        # Use custom LUT only when it exists and matches this layer's LUT size.
+        # For mixed presets (e.g., q2a4), 2-bit layers should fall back to the
+        # module's default LUT4 construction unless an explicit LUT4 custom LUT
+        # is provided.
+        custom_lut = lut_candidates.get(lut_name)
+        using_default_uniform = False
+        if custom_lut is not None and int(custom_lut.numel()) != int(lut_size):
+            using_default_uniform = True
+            lut_fallback_count += 1
+            custom_lut = None
 
         # Create config
         config = AnemllQuantConfigV2(
@@ -1723,24 +1734,30 @@ def replace_linear_layers_with_optimal_luts(
         setattr(parent, layer_name, v2_layer)
 
         replaced_count += 1
-        lut_used[lut_name] = lut_used.get(lut_name, 0) + 1
+        effective_lut_name = lut_name
+        if using_default_uniform:
+            effective_lut_name = 'uniform(default)'
+        lut_used[effective_lut_name] = lut_used.get(effective_lut_name, 0) + 1
 
         # Progress
         if verbose and (layer_idx % 40 == 0 or layer_idx == len(layers_to_replace) - 1):
             short_name = name.split('.')[-2] + '.' + name.split('.')[-1] if '.' in name else name
-            print(f"    [{layer_idx+1}/{len(layers_to_replace)}] {short_name} (lut={lut_name})")
+            print(f"    [{layer_idx+1}/{len(layers_to_replace)}] {short_name} (lut={effective_lut_name})")
 
     elapsed = time.time() - t0
 
     stats = {
         'replaced_count': replaced_count,
         'luts_used': lut_used,
+        'lut_fallback_to_default_uniform': lut_fallback_count,
         'time_seconds': elapsed,
     }
 
     if verbose:
         print(f"\n  Replaced {replaced_count} layers in {elapsed:.1f}s")
         print(f"  LUTs used: {lut_used}")
+        if lut_fallback_count > 0:
+            print(f"  Fallback to default uniform LUT: {lut_fallback_count} layers")
 
     return stats
 
@@ -2465,14 +2482,19 @@ def init_v2_model(
         if verbose:
             print(f"\n[Step 4a] Using fixed LUT: {default_lut} (no search)")
 
-        # Build optimal_lut_map with fixed LUT for all MLP/Attn layers
+        # Build optimal_lut_map with fixed LUT for 4-bit layers only.
+        # 2-bit layers keep default uniform LUT4.
         optimal_lut_map = {}
         for name, module in model.named_modules():
             if isinstance(module, nn.Linear):
                 if 'lm_head' in name or 'embed' in name:
                     continue
-                if 'mlp' in name or 'self_attn' in name or 'attention' in name:
-                    optimal_lut_map[name] = default_lut
+                is_mlp = 'mlp' in name
+                is_attn = 'self_attn' in name or 'attention' in name
+                if is_mlp:
+                    optimal_lut_map[name] = default_lut if preset.mlp_lut_bits == 4 else 'uniform'
+                elif is_attn:
+                    optimal_lut_map[name] = default_lut if preset.attn_lut_bits == 4 else 'uniform'
 
         if verbose:
             print(f"  Applied to {len(optimal_lut_map)} layers")

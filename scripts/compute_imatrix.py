@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as _dt
+import math
 import os
 import re
 import time
@@ -48,6 +49,17 @@ except Exception as e:
 
 def _now_iso() -> str:
     return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _format_eta(seconds: float) -> str:
+    if not math.isfinite(seconds) or seconds < 0:
+        return "?"
+    s = int(round(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h > 0:
+        return f"{h:d}:{m:02d}:{sec:02d}"
+    return f"{m:02d}:{sec:02d}"
 
 
 def _resolve_dtype(s: str) -> torch.dtype:
@@ -272,6 +284,8 @@ def main() -> int:
     ap.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True to HF")
     ap.add_argument("--include", default=None, help="Regex to include module names")
     ap.add_argument("--exclude", default=None, help="Regex to exclude module names")
+    ap.add_argument("--progress-every", type=int, default=0,
+                    help="Print progress every N steps (0: off unless --verbose)")
     ap.add_argument("--verbose", action="store_true", help="Verbose logging")
     args = ap.parse_args()
 
@@ -348,6 +362,9 @@ def main() -> int:
     tokens_target = int(args.tokens)
     step_tokens = args.batch_size * args.seq_len
     steps = max((tokens_target + step_tokens - 1) // step_tokens, 1)
+    progress_every = int(args.progress_every)
+    if progress_every <= 0 and args.verbose:
+        progress_every = 20
 
     t0 = time.time()
     tokens_done = 0
@@ -400,10 +417,22 @@ def main() -> int:
             _ = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
 
             tokens_done += int(input_ids.numel())
-            if args.verbose and (step == 0 or (step + 1) % 20 == 0 or step + 1 == steps):
+            should_log = (
+                progress_every > 0 and (
+                    step == 0 or (step + 1) % progress_every == 0 or step + 1 == steps
+                )
+            )
+            if should_log:
                 dt = time.time() - t0
                 tok_s = tokens_done / max(dt, 1e-9)
-                print(f"[imatrix] step {step+1}/{steps} tokens={tokens_done} ({tok_s:.1f} tok/s)")
+                pct = 100.0 * float(step + 1) / float(steps)
+                eta = max(float(tokens_target - tokens_done), 0.0) / max(tok_s, 1e-9)
+                print(
+                    f"[imatrix] step {step+1}/{steps} ({pct:5.1f}%) "
+                    f"tokens={tokens_done}/{tokens_target} "
+                    f"({tok_s:.1f} tok/s, eta {_format_eta(eta)})",
+                    flush=True,
+                )
 
     # Remove hooks
     for h in hooks:

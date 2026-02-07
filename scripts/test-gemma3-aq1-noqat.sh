@@ -68,6 +68,7 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 CALIB_MODE="${CALIB_MODE:-random_ids}"
 IMATRIX_DEVICE="${IMATRIX_DEVICE:-auto}"
 IMATRIX_DTYPE="${IMATRIX_DTYPE:-bf16}"
+IMATRIX_PROGRESS_EVERY="${IMATRIX_PROGRESS_EVERY:-10}"
 FORCE_REIMATRIX="${FORCE_REIMATRIX:-0}"
 
 AWQ_ALPHA="${AWQ_ALPHA:-0.5}"
@@ -125,6 +126,7 @@ echo "RUN_ROOT:        ${RUN_ROOT}"
 echo "AQ1_CONFIG:      ${AQ1_CONFIG}"
 echo "USE_FP16_SCALING:${USE_FP16_SCALING} (alpha=${FP16_ALPHA})"
 echo "AWQ_ALPHA:       ${AWQ_ALPHA}"
+echo "IM_PROGRESS:     every ${IMATRIX_PROGRESS_EVERY} step(s)"
 echo "SEARCH_LUT:      ${SEARCH_LUT} (fixed_lut=${FIXED_LUT})"
 echo "ENABLE_PPL:      ${ENABLE_PPL} (device=${PPL_DEVICE})"
 echo "ENABLE_INFERENCE:${ENABLE_INFERENCE}"
@@ -166,6 +168,7 @@ if [[ "${FORCE_REIMATRIX}" == "1" || ! -f "${IMATRIX_PATH}" ]]; then
     --calib-mode "${CALIB_MODE}" \
     --device "${IMATRIX_DEVICE}" \
     --dtype "${IMATRIX_DTYPE}" \
+    --progress-every "${IMATRIX_PROGRESS_EVERY}" \
     --trust-remote-code
 else
   echo ">>> Step 2: Reusing existing iMatrix: ${IMATRIX_PATH}"
