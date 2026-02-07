@@ -90,6 +90,8 @@ PPL_DTYPE="${PPL_DTYPE:-fp16}"
 ENABLE_INFERENCE="${ENABLE_INFERENCE:-true}"
 PROMPT="${PROMPT:-Explain what quantization-aware initialization does in one short paragraph.}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-160}"
+INFER_DEVICE="${INFER_DEVICE:-auto}"
+INFER_DTYPE="${INFER_DTYPE:-auto}"
 
 ENABLE_EXPORT="${ENABLE_EXPORT:-false}"
 EXPORT_SNAP_ANE="${EXPORT_SNAP_ANE:-true}"
@@ -134,6 +136,7 @@ echo "IM_PROGRESS:     every ${IMATRIX_PROGRESS_EVERY} step(s)"
 echo "SEARCH_LUT:      ${SEARCH_LUT} (fixed_lut=${FIXED_LUT})"
 echo "ENABLE_PPL:      ${ENABLE_PPL} (device=${PPL_DEVICE})"
 echo "ENABLE_INFERENCE:${ENABLE_INFERENCE}"
+echo "INFER_RUNTIME:   device=${INFER_DEVICE}, dtype=${INFER_DTYPE}"
 echo "ENABLE_EXPORT:   ${ENABLE_EXPORT}"
 echo "============================================================"
 echo ""
@@ -304,12 +307,20 @@ else
   if [[ "${ENABLE_PPL}" =~ ^[0-9]+$ ]]; then
     ppl_cmd+=(--max-chunks "${ENABLE_PPL}")
   fi
-  PPL_VALUE="$("${ppl_cmd[@]}" 2>&1 | awk -F= '/^PPL=/{print $2; exit}')"
-  if [[ -z "${PPL_VALUE}" ]]; then
-    PPL_VALUE="N/A"
-    echo "  Warning: Could not parse PPL from measure_perplexity output."
+  if ppl_output="$("${ppl_cmd[@]}" 2>&1)"; then
+    PPL_VALUE="$(printf '%s\n' "${ppl_output}" | awk -F= '/^PPL=/{print $2; exit}')"
+    if [[ -z "${PPL_VALUE}" ]]; then
+      PPL_VALUE="N/A"
+      echo "  Warning: Could not parse PPL from measure_perplexity output."
+    else
+      echo "  PPL=${PPL_VALUE}"
+    fi
   else
-    echo "  PPL=${PPL_VALUE}"
+    ppl_rc=$?
+    PPL_VALUE="N/A"
+    echo "  Warning: perplexity command failed (exit=${ppl_rc}). Continuing to inference."
+    echo "  Perplexity output:"
+    printf '%s\n' "${ppl_output}" | sed 's/^/    /'
   fi
 fi
 echo ""
@@ -323,6 +334,8 @@ if is_true "${ENABLE_INFERENCE}"; then
     --model-id "${AWQ_MODEL_DIR}" \
     --prompt "${PROMPT}" \
     --max-tokens "${MAX_NEW_TOKENS}" \
+    --device "${INFER_DEVICE}" \
+    --dtype "${INFER_DTYPE}" \
     --no-thinking
 else
   echo ">>> Step 6: Skipped inference (ENABLE_INFERENCE=false)"

@@ -89,6 +89,12 @@ def parse_args():
                         help='Interactive mode')
     parser.add_argument('--max-tokens', type=int, default=512,
                         help='Max new tokens (default: 512)')
+    parser.add_argument('--device', type=str, default='auto',
+                        choices=['auto', 'cpu', 'mps', 'cuda'],
+                        help='Inference device override (default: auto)')
+    parser.add_argument('--dtype', type=str, default='auto',
+                        choices=['auto', 'float32', 'float16', 'bfloat16'],
+                        help='Inference dtype override (default: auto)')
     parser.add_argument('--temperature', type=float, default=0.6,
                         help='Sampling temperature (default: 0.6)')
     parser.add_argument('--repetition-penalty', type=float, default=1.1,
@@ -151,16 +157,39 @@ def load_config(checkpoint_path):
 
 def load_model(args):
     """Load model with QAT layers and checkpoint."""
-    # Detect device
-    if torch.backends.mps.is_available():
+    # Resolve device
+    if args.device == 'auto':
+        if torch.backends.mps.is_available():
+            device = torch.device('mps')
+        elif torch.cuda.is_available():
+            device = torch.device('cuda')
+        else:
+            device = torch.device('cpu')
+    elif args.device == 'mps':
+        if not torch.backends.mps.is_available():
+            raise RuntimeError("Requested --device mps but MPS is not available")
         device = torch.device('mps')
-        dtype = torch.float32  # MPS works better with float32
-    elif torch.cuda.is_available():
+    elif args.device == 'cuda':
+        if not torch.cuda.is_available():
+            raise RuntimeError("Requested --device cuda but CUDA is not available")
         device = torch.device('cuda')
-        dtype = torch.bfloat16
     else:
         device = torch.device('cpu')
+
+    # Resolve dtype
+    if args.dtype == 'auto':
+        if device.type == 'mps':
+            dtype = torch.float32  # MPS path is most stable in fp32 here
+        elif device.type == 'cuda':
+            dtype = torch.bfloat16
+        else:
+            dtype = torch.float32
+    elif args.dtype == 'float32':
         dtype = torch.float32
+    elif args.dtype == 'float16':
+        dtype = torch.float16
+    else:
+        dtype = torch.bfloat16
 
     print(f"Device: {device}, dtype: {dtype}")
 

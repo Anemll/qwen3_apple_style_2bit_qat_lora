@@ -70,7 +70,23 @@ python3 scripts/test_inference.py runs/gemma3_aq1_noqat/v2_q2a4_init/v2_initial.
   --model-id runs/gemma3_aq1_noqat/model_awq_a0p5 \
   --prompt "Who invented the iPad?" \
   --max-tokens 160 \
+  --device cpu \
+  --dtype float32 \
   --no-thinking
+```
+
+For backend isolation, run the same prompt on both CPU and MPS:
+
+```bash
+python3 scripts/test_inference.py runs/gemma3_aq1_noqat/v2_q2a4_init/v2_initial.pt \
+  --model-id runs/gemma3_aq1_noqat/model_awq_a0p5 \
+  --prompt "Explain what quantization-aware initialization does in one short paragraph." \
+  --max-tokens 160 --device cpu --dtype float32 --no-thinking
+
+python3 scripts/test_inference.py runs/gemma3_aq1_noqat/v2_q2a4_init/v2_initial.pt \
+  --model-id runs/gemma3_aq1_noqat/model_awq_a0p5 \
+  --prompt "Explain what quantization-aware initialization does in one short paragraph." \
+  --max-tokens 160 --device mps --dtype float32 --no-thinking
 ```
 
 ## 7) Optional HF export
