@@ -8,6 +8,7 @@ import csv
 import html
 import json
 import re
+import subprocess
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -16,20 +17,25 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RESULTS = REPO_ROOT / "aq1_autoresearch" / "results.tsv"
 DEFAULT_CAMPAIGN = REPO_ROOT / "aq1_autoresearch" / "campaign.md"
-DEFAULT_RUNNER_STATE = REPO_ROOT / "runs" / "aq1_auto" / "qwen06b-init-ppl" / "auto6h_20260310_run8" / "runner_state.json"
 DEFAULT_PERPLEXITY_JSON = REPO_ROOT / "results" / "perplexity.json"
 DEFAULT_SVG = REPO_ROOT / "aq1_autoresearch" / "progress_report.svg"
 DEFAULT_MD = REPO_ROOT / "aq1_autoresearch" / "progress_report.md"
 REPORT_TITLE = "AQ1 ANE-Native Quantization Experiments"
 REPORT_SUBTITLE = "Apple Neural Engine native quantization search; full perplexity is the keep metric and quick-only points are screens"
 REPORT_MD_TITLE = "# AQ1 ANE-Native Quantization Summary"
+RUNNER_MARKERS = {
+    "aq1_autoresearch/build_candidate.py": "candidate build",
+    "scripts/measure_perplexity.py": "full perplexity",
+    "scripts/snap_and_test_v2.py": "snap",
+    "aq1_autoresearch/cleanup_run.py": "cleanup",
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render AQ1 progress SVG + markdown summary")
     parser.add_argument("--results-tsv", default=str(DEFAULT_RESULTS))
     parser.add_argument("--campaign", default=str(DEFAULT_CAMPAIGN))
-    parser.add_argument("--runner-state", default=str(DEFAULT_RUNNER_STATE))
+    parser.add_argument("--runner-state", default="")
     parser.add_argument("--perplexity-json", default=str(DEFAULT_PERPLEXITY_JSON))
     parser.add_argument("--output-svg", default=str(DEFAULT_SVG))
     parser.add_argument("--output-md", default=str(DEFAULT_MD))
@@ -85,6 +91,55 @@ def load_runner_state(path: Path) -> dict[str, Any] | None:
             return json.load(f)
     except Exception:
         return None
+
+
+def find_active_runner_paths() -> tuple[Path | None, str | None]:
+    try:
+        result = subprocess.run(
+            ["ps", "ax", "-o", "command="],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        return None, None
+
+    output_root: Path | None = None
+    phase: str | None = None
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if "aq1_autoresearch/auto_runner.py" in line and "--output-root " in line:
+            tail = line.split("--output-root ", 1)[1]
+            root_value = tail.split(" --", 1)[0].strip()
+            output_root = Path(root_value)
+            if not output_root.is_absolute():
+                output_root = (REPO_ROOT / output_root).resolve()
+        for marker, label in RUNNER_MARKERS.items():
+            if marker in line:
+                phase = label
+    runner_state_path = output_root / "runner_state.json" if output_root else None
+    return runner_state_path, phase
+
+
+def discover_runner_state_path(campaign: dict[str, str]) -> Path | None:
+    active_path, _ = find_active_runner_paths()
+    if active_path and active_path.exists():
+        return active_path
+
+    output_root = campaign.get("output_root")
+    if output_root:
+        campaign_root = Path(output_root)
+        if not campaign_root.is_absolute():
+            campaign_root = (REPO_ROOT / campaign_root).resolve()
+        candidates = sorted(campaign_root.glob("*/runner_state.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        if candidates:
+            return candidates[0]
+
+    candidates = sorted(REPO_ROOT.glob("runs/**/runner_state.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    if candidates:
+        return candidates[0]
+    return None
 
 
 def load_campaign_metadata(path: Path) -> dict[str, str]:
@@ -537,14 +592,17 @@ def main() -> int:
     args = parse_args()
     results_tsv = Path(args.results_tsv).expanduser().resolve()
     campaign_path = Path(args.campaign).expanduser().resolve()
-    runner_state_path = Path(args.runner_state).expanduser().resolve()
     perplexity_json_path = Path(args.perplexity_json).expanduser().resolve()
     output_svg = Path(args.output_svg).expanduser().resolve()
     output_md = Path(args.output_md).expanduser().resolve()
 
     rows = load_rows(results_tsv)
     campaign = load_campaign_metadata(campaign_path)
-    runner_state = load_runner_state(runner_state_path)
+    active_runner_state_path, active_phase = find_active_runner_paths()
+    runner_state_path = Path(args.runner_state).expanduser().resolve() if args.runner_state else None
+    if runner_state_path is None or not runner_state_path.exists():
+        runner_state_path = discover_runner_state_path(campaign)
+    runner_state = load_runner_state(runner_state_path) if runner_state_path else None
     original_ref = load_original_reference(perplexity_json_path)
 
     output_svg.parent.mkdir(parents=True, exist_ok=True)
@@ -552,6 +610,18 @@ def main() -> int:
     output_md.write_text(summarize(rows, campaign, runner_state, original_ref), encoding="utf-8")
     print(f"wrote {output_svg}")
     print(f"wrote {output_md}")
+    if active_runner_state_path and runner_state_path and active_runner_state_path == runner_state_path and runner_state is not None:
+        print(
+            "active_run=true "
+            f"path={runner_state_path.parent} "
+            f"phase={active_phase or 'unknown'} "
+            f"completed={runner_state.get('completed_experiments', 0)} "
+            f"last_status={runner_state.get('last_status', 'unknown')}"
+        )
+    elif runner_state_path and runner_state is not None:
+        print(f"active_run=false latest_runner_state={runner_state_path}")
+    else:
+        print("active_run=false")
     return 0
 
 
