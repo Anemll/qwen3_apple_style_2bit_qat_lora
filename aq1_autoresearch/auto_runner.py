@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +31,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--budget-growth-pct", type=float, default=5.0)
     parser.add_argument("--full-ppl-chunks", type=int, default=20)
     parser.add_argument("--quick-screen-margin", type=float, default=1.0)
-    parser.add_argument("--max-experiments", type=int, default=24)
+    parser.add_argument("--max-experiments", type=int, default=64)
+    parser.add_argument("--retain-checkpoints", choices=["none", "keep"], default="none")
+    parser.add_argument("--checkpoint-commits", action="store_true")
+    parser.add_argument("--checkpoint-dir", default="aq1_autoresearch/checkpoints")
     return parser.parse_args()
 
 
@@ -42,6 +46,13 @@ def run_cmd(cmd: list[str], log_path: Path) -> int:
         result = subprocess.run(cmd, cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT)
         log.write(f"\n[exit {result.returncode}]\n")
         return result.returncode
+
+
+def log_event(log_path: Path, message: str) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"{stamp} {message}\n")
 
 
 def git_commit_id() -> str:
@@ -56,11 +67,12 @@ def git_commit_id() -> str:
     return f"{head}-dirty" if dirty else head
 
 
-def load_existing_metrics(results_tsv: Path) -> tuple[float, float]:
+def load_existing_metrics(results_tsv: Path) -> tuple[float, float, str | None]:
     best_full = float("inf")
     baseline_quick = float("inf")
+    best_run: str | None = None
     if not results_tsv.exists():
-        return best_full, baseline_quick
+        return best_full, baseline_quick, best_run
     with open(results_tsv, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter="\t")
         for row in reader:
@@ -69,10 +81,13 @@ def load_existing_metrics(results_tsv: Path) -> tuple[float, float]:
             status = (row.get("status") or "").strip()
             change_family = (row.get("change_family") or "").strip()
             if full and status == "keep":
-                best_full = min(best_full, float(full))
+                full_value = float(full)
+                if full_value < best_full:
+                    best_full = full_value
+                    best_run = (row.get("run_dir") or "").strip() or None
             if quick and change_family == "baseline":
                 baseline_quick = min(baseline_quick, float(quick))
-    return best_full, baseline_quick
+    return best_full, baseline_quick, best_run
 
 
 def fmt(value: Any) -> str:
@@ -121,118 +136,184 @@ def append_results_row(
 
 
 def experiment_specs() -> list[dict[str, Any]]:
-    return [
-        {
-            "family": "mixedbit",
-            "name": "mix_attn_eff_b5_g16",
-            "group_size": 16,
-            "scope": "attn",
-            "selection": "efficiency",
-            "upgrade_bits": 5,
+    specs: list[dict[str, Any]] = []
+
+    def add_mixedbit(
+        *,
+        family: str,
+        scope: str,
+        selection: str,
+        group_size: int,
+        budget_growth_pct: float,
+        upgrade_bits: int | None = None,
+        max_upgrade_bits: int | None = None,
+    ) -> None:
+        budget_tag = str(budget_growth_pct).replace(".", "p")
+        if family == "mixedbit":
+            assert upgrade_bits is not None
+            name = f"mix_{scope}_{selection[:3]}_b{upgrade_bits}_g{group_size}_p{budget_tag}"
+            description = (
+                f"{scope} {upgrade_bits}-bit upgrades ranked by "
+                f"{'absolute local MAE gain' if selection == 'absolute' else 'local improvement per extra bit'} "
+                f"at group_size={group_size} within a {budget_growth_pct:.2f}% payload budget"
+            )
+        else:
+            assert max_upgrade_bits is not None
+            name = f"tier_{scope}_{selection[:3]}_b{max_upgrade_bits}_g{group_size}_p{budget_tag}"
+            description = (
+                f"{scope} tiered 4->{max_upgrade_bits}-bit upgrades via greedy "
+                f"{'absolute local MAE gain' if selection == 'absolute' else 'efficiency'} "
+                f"at group_size={group_size} within a {budget_growth_pct:.2f}% payload budget"
+            )
+
+        spec: dict[str, Any] = {
+            "family": family,
+            "name": name,
+            "group_size": group_size,
+            "scope": scope,
+            "selection": selection,
+            "budget_growth_pct": budget_growth_pct,
             "change_family": "mixedbit",
-            "description": "attention-only 5-bit upgrades ranked by local improvement per extra bit",
-        },
-        {
-            "family": "mixedbit",
-            "name": "mix_all_eff_b5_g16",
-            "group_size": 16,
-            "scope": "all",
-            "selection": "efficiency",
-            "upgrade_bits": 5,
-            "change_family": "mixedbit",
-            "description": "global 5-bit upgrades ranked by local improvement per extra bit",
-        },
-        {
-            "family": "mixedbit",
-            "name": "mix_mlp_eff_b5_g16",
-            "group_size": 16,
-            "scope": "mlp",
-            "selection": "efficiency",
-            "upgrade_bits": 5,
-            "change_family": "mixedbit",
-            "description": "MLP-only 5-bit upgrades ranked by local improvement per extra bit",
-        },
-        {
-            "family": "mixedbit",
-            "name": "mix_attn_abs_b5_g16",
-            "group_size": 16,
-            "scope": "attn",
-            "selection": "absolute",
-            "upgrade_bits": 5,
-            "change_family": "mixedbit",
-            "description": "attention-only 5-bit upgrades ranked by absolute local MAE gain",
-        },
-        {
-            "family": "mixedbit",
-            "name": "mix_attn_eff_b6_g16",
-            "group_size": 16,
-            "scope": "attn",
-            "selection": "efficiency",
-            "upgrade_bits": 6,
-            "change_family": "mixedbit",
-            "description": "attention-only 6-bit upgrades within the same global size budget",
-        },
-        {
-            "family": "mlp_permute",
-            "name": "perm_combined_desc_g16",
-            "group_size": 16,
-            "permute_strategy": "combined_desc",
-            "change_family": "folded_permute",
-            "description": "folded MLP channel permutation by combined norm, descending",
-        },
-        {
-            "family": "mlp_permute",
-            "name": "perm_combined_hilo_g16",
-            "group_size": 16,
-            "permute_strategy": "combined_hilo",
-            "change_family": "folded_permute",
-            "description": "folded MLP channel permutation by combined norm, hi/lo interleave",
-        },
-        {
-            "family": "mlp_permute",
-            "name": "perm_down_desc_g16",
-            "group_size": 16,
-            "permute_strategy": "down_desc",
-            "change_family": "folded_permute",
-            "description": "folded MLP channel permutation using down_proj column norms, descending",
-        },
-        {
-            "family": "mlp_permute",
-            "name": "perm_down_hilo_g16",
-            "group_size": 16,
-            "permute_strategy": "down_hilo",
-            "change_family": "folded_permute",
-            "description": "folded MLP channel permutation using down_proj column norms, hi/lo interleave",
-        },
-        {
-            "family": "mixedbit",
-            "name": "mix_attn_eff_b5_g32",
-            "group_size": 32,
-            "scope": "attn",
-            "selection": "efficiency",
-            "upgrade_bits": 5,
-            "change_family": "mixedbit",
-            "description": "attention-only 5-bit upgrades with group_size=32",
-        },
-        {
-            "family": "mlp_permute",
-            "name": "perm_combined_desc_g32",
-            "group_size": 32,
-            "permute_strategy": "combined_desc",
-            "change_family": "folded_permute",
-            "description": "folded MLP channel permutation by combined norm at group_size=32",
-        },
-        {
-            "family": "mixedbit",
-            "name": "mix_all_eff_b6_g16",
-            "group_size": 16,
-            "scope": "all",
-            "selection": "efficiency",
-            "upgrade_bits": 6,
-            "change_family": "mixedbit",
-            "description": "global 6-bit upgrades within the same global size budget",
-        },
+            "description": description,
+        }
+        if upgrade_bits is not None:
+            spec["upgrade_bits"] = upgrade_bits
+        if max_upgrade_bits is not None:
+            spec["max_upgrade_bits"] = max_upgrade_bits
+        specs.append(spec)
+
+    priority_specs = [
+        ("mixedbit_tiered", "all", "efficiency", 16, 5.0, None, 6),
+        ("mixedbit_tiered", "attn", "efficiency", 16, 5.0, None, 6),
+        ("mixedbit_tiered", "all", "efficiency", 16, 3.5, None, 6),
+        ("mixedbit", "all", "efficiency", 16, 3.5, 5, None),
+        ("mixedbit", "all", "absolute", 16, 5.0, 5, None),
+        ("mixedbit_tiered", "all", "absolute", 16, 5.0, None, 6),
+        ("mixedbit", "attn", "efficiency", 16, 3.5, 5, None),
+        ("mixedbit_tiered", "mlp", "efficiency", 16, 5.0, None, 6),
+        ("mixedbit_tiered", "all", "efficiency", 8, 5.0, None, 6),
+        ("mixedbit", "all", "efficiency", 8, 5.0, 5, None),
     ]
+    for family, scope, selection, group_size, budget_growth_pct, upgrade_bits, max_upgrade_bits in priority_specs:
+        add_mixedbit(
+            family=family,
+            scope=scope,
+            selection=selection,
+            group_size=group_size,
+            budget_growth_pct=budget_growth_pct,
+            upgrade_bits=upgrade_bits,
+            max_upgrade_bits=max_upgrade_bits,
+        )
+
+    for group_size in (16, 8, 32):
+        for budget_growth_pct in (2.5, 3.5, 5.0):
+            for scope in ("all", "attn", "mlp"):
+                for selection in ("efficiency", "absolute"):
+                    add_mixedbit(
+                        family="mixedbit",
+                        scope=scope,
+                        selection=selection,
+                        group_size=group_size,
+                        budget_growth_pct=budget_growth_pct,
+                        upgrade_bits=5,
+                    )
+
+    for group_size in (16, 8, 32):
+        for budget_growth_pct in (2.5, 3.5, 5.0):
+            for scope in ("all", "attn", "mlp"):
+                for selection in ("efficiency", "absolute"):
+                    add_mixedbit(
+                        family="mixedbit_tiered",
+                        scope=scope,
+                        selection=selection,
+                        group_size=group_size,
+                        budget_growth_pct=budget_growth_pct,
+                        max_upgrade_bits=6,
+                    )
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for spec in specs:
+        if spec["name"] in seen:
+            continue
+        deduped.append(spec)
+        seen.add(spec["name"])
+    return deduped
+
+
+def relative_repo_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path.resolve())
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
+
+def commit_checkpoint(
+    *,
+    checkpoint_dir: Path,
+    output_root: Path,
+    results_tsv: Path,
+    run_dir: Path,
+    spec: dict[str, Any],
+    summary: dict[str, Any],
+    status: str,
+    retention: str,
+    runner_log: Path,
+    final: bool = False,
+) -> None:
+    campaign_dir = checkpoint_dir / output_root.name
+    record = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "output_root": str(output_root),
+        "run_dir": str(run_dir),
+        "status": status,
+        "retention": retention,
+        "final": final,
+        "spec": spec,
+        "summary": summary,
+    }
+    if final:
+        record["best_run"] = summary.get("best_run")
+        snapshot_path = campaign_dir / "final.json"
+    else:
+        snapshot_path = campaign_dir / f"{run_dir.name}.json"
+    latest_path = campaign_dir / "latest.json"
+    write_json(snapshot_path, record)
+    write_json(latest_path, record)
+
+    paths = [relative_repo_path(results_tsv), relative_repo_path(snapshot_path), relative_repo_path(latest_path)]
+    subprocess.run(["git", "add", "--", *paths], cwd=REPO_ROOT, check=True)
+    staged = subprocess.run(["git", "diff", "--cached", "--quiet", "--", *paths], cwd=REPO_ROOT).returncode != 0
+    if not staged:
+        return
+
+    metric = summary.get("full_perplexity")
+    if metric is None:
+        metric = summary.get("quick_perplexity")
+    if metric is None:
+        metric = summary.get("score")
+    suffix = f" p={fmt(metric)}" if metric is not None else ""
+    subject = f"AQ1 checkpoint: {output_root.name} final" if final else f"AQ1 checkpoint: {run_dir.name}{suffix}"
+    result = subprocess.run(
+        ["git", "commit", "-m", subject, "--", *paths],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        log_event(runner_log, f"checkpoint commit created: {subject}")
+    else:
+        log_event(runner_log, f"checkpoint commit failed: {subject}")
+        if result.stdout.strip():
+            log_event(runner_log, result.stdout.strip())
+        if result.stderr.strip():
+            log_event(runner_log, result.stderr.strip())
 
 
 def main() -> int:
@@ -243,26 +324,41 @@ def main() -> int:
     baseline_run_dir = Path(args.baseline_run_dir).expanduser().resolve()
     baseline_checkpoint = baseline_run_dir / "v2_tightened.pt"
     baseline_quick_log = collect_run_summary(run_dir=baseline_run_dir)
-    best_full, baseline_quick = load_existing_metrics(results_tsv)
+    best_full, baseline_quick, best_run = load_existing_metrics(results_tsv)
     if baseline_quick == float("inf"):
         baseline_quick = baseline_quick_log.get("quick_perplexity") or float("inf")
 
-    runner_log = output_root / "runner_state.json"
+    runner_state = output_root / "runner_state.json"
+    runner_log = output_root / "runner.log"
+    checkpoint_dir = Path(args.checkpoint_dir).expanduser().resolve()
     started_at = time.time()
     commit = git_commit_id()
     specs = experiment_specs()[: args.max_experiments]
+    completed_experiments = 0
+    log_event(
+        runner_log,
+        f"starting run commit={commit} specs={len(specs)} hours={args.hours} retain={args.retain_checkpoints}",
+    )
 
     for idx, spec in enumerate(specs, start=1):
         elapsed = time.time() - started_at
         if elapsed >= args.hours * 3600:
+            log_event(runner_log, f"stopping: reached time budget after {completed_experiments} experiments")
             break
 
         run_dir = output_root / f"exp_{idx:03d}_{spec['name']}"
         if run_dir.exists():
             run_dir = output_root / f"exp_{idx:03d}_{spec['name']}_{int(time.time())}"
         run_dir.mkdir(parents=True, exist_ok=True)
+        completed_experiments += 1
 
-        cache_json = output_root / f"mixedbit_cache_g{spec['group_size']}_{spec.get('scope', 'all')}_b{spec.get('upgrade_bits', 5)}.json"
+        cache_tag = (
+            f"tiered_b{spec.get('max_upgrade_bits', 6)}"
+            if spec["family"] == "mixedbit_tiered"
+            else f"b{spec.get('upgrade_bits', 5)}"
+        )
+        cache_json = output_root / f"mixedbit_cache_g{spec['group_size']}_{spec.get('scope', 'all')}_{cache_tag}.json"
+        spec_budget = float(spec.get("budget_growth_pct", args.budget_growth_pct))
         build_cmd = [
             REPO_PYTHON,
             "aq1_autoresearch/build_candidate.py",
@@ -275,23 +371,25 @@ def main() -> int:
             "--group-size",
             str(spec["group_size"]),
         ]
-        if spec["family"] == "mixedbit":
+        if spec["family"] in {"mixedbit", "mixedbit_tiered"}:
             build_cmd.extend(
                 [
                     "--baseline-checkpoint",
                     str(baseline_checkpoint),
                     "--budget-growth-pct",
-                    str(args.budget_growth_pct),
+                    str(spec_budget),
                     "--scope",
                     spec["scope"],
                     "--selection",
                     spec["selection"],
-                    "--upgrade-bits",
-                    str(spec["upgrade_bits"]),
                     "--cache-json",
                     str(cache_json),
                 ]
             )
+            if spec["family"] == "mixedbit":
+                build_cmd.extend(["--upgrade-bits", str(spec["upgrade_bits"])])
+            else:
+                build_cmd.extend(["--max-upgrade-bits", str(spec["max_upgrade_bits"])])
         else:
             build_cmd.extend(["--permute-strategy", spec["permute_strategy"]])
 
@@ -299,8 +397,11 @@ def main() -> int:
         status = "crash"
         snap_ok = "skipped"
         retention = "discard"
+        log_event(runner_log, f"experiment {idx:03d} starting {run_dir.name}: {spec['description']}")
 
-        if run_cmd(build_cmd, init_log) == 0:
+        build_exit = run_cmd(build_cmd, init_log)
+        log_event(runner_log, f"experiment {idx:03d} build exit={build_exit}")
+        if build_exit == 0:
             quick_summary = collect_run_summary(run_dir=run_dir)
             quick = quick_summary.get("quick_perplexity")
             screen_fail = baseline_quick != float("inf") and quick is not None and quick > baseline_quick + args.quick_screen_margin
@@ -319,7 +420,8 @@ def main() -> int:
                     "--max-chunks",
                     str(args.full_ppl_chunks),
                 ]
-                run_cmd(ppl_cmd, run_dir / "perplexity.log")
+                ppl_exit = run_cmd(ppl_cmd, run_dir / "perplexity.log")
+                log_event(runner_log, f"experiment {idx:03d} full-ppl exit={ppl_exit}")
 
                 snap_cmd = [
                     REPO_PYTHON,
@@ -331,15 +433,20 @@ def main() -> int:
                     "--output",
                     str(run_dir / "snapped_fp16.pt"),
                 ]
-                run_cmd(snap_cmd, run_dir / "snap.log")
+                snap_exit = run_cmd(snap_cmd, run_dir / "snap.log")
+                log_event(runner_log, f"experiment {idx:03d} snap exit={snap_exit}")
                 snap_ok = "true" if (run_dir / "snapped_fp16.pt").exists() else "false"
             else:
                 snap_ok = "skipped"
+                log_event(
+                    runner_log,
+                    f"experiment {idx:03d} screened out quick_ppl={fmt(quick)} baseline_quick={fmt(baseline_quick)}",
+                )
 
             summary = collect_run_summary(
                 run_dir=run_dir,
                 baseline_run_dir=str(baseline_run_dir),
-                max_size_growth_pct=args.budget_growth_pct,
+                max_size_growth_pct=spec_budget,
             )
 
             if screen_fail:
@@ -355,9 +462,10 @@ def main() -> int:
                     and full_ppl < best_full
                 )
                 status = "keep" if is_keep else "discard"
-                retention = "keep" if is_keep else "discard"
+                retention = "keep" if is_keep and args.retain_checkpoints == "keep" else "discard"
                 if is_keep:
                     best_full = float(full_ppl)
+                    best_run = str(run_dir)
 
             append_results_row(
                 results_tsv=results_tsv,
@@ -369,6 +477,24 @@ def main() -> int:
                 change_family=spec["change_family"],
                 description=spec["description"],
             )
+            log_event(
+                runner_log,
+                f"experiment {idx:03d} result status={status} full={fmt(summary.get('full_perplexity'))} "
+                f"quick={fmt(summary.get('quick_perplexity'))} size_ok={fmt(summary.get('size_ok'))}",
+            )
+
+            if args.checkpoint_commits and status == "keep":
+                commit_checkpoint(
+                    checkpoint_dir=checkpoint_dir,
+                    output_root=output_root,
+                    results_tsv=results_tsv,
+                    run_dir=run_dir,
+                    spec=spec,
+                    summary=summary,
+                    status=status,
+                    retention=retention,
+                    runner_log=runner_log,
+                )
 
             cleanup_cmd = [
                 REPO_PYTHON,
@@ -378,9 +504,10 @@ def main() -> int:
                 "--status",
                 "keep" if retention == "keep" else "discard",
             ]
-            if retention != "keep":
+            if args.retain_checkpoints == "none" or retention != "keep":
                 cleanup_cmd.extend(["--retain-checkpoint", "none"])
-            run_cmd(cleanup_cmd, run_dir / "cleanup.log")
+            cleanup_exit = run_cmd(cleanup_cmd, run_dir / "cleanup.log")
+            log_event(runner_log, f"experiment {idx:03d} cleanup exit={cleanup_exit} retention={retention}")
         else:
             summary = collect_run_summary(run_dir=run_dir)
             append_results_row(
@@ -393,16 +520,42 @@ def main() -> int:
                 change_family=spec["change_family"],
                 description=spec["description"],
             )
+            log_event(runner_log, f"experiment {idx:03d} crashed during build")
 
         write_state = {
             "last_run": str(run_dir),
             "last_status": status,
             "best_full_perplexity": None if best_full == float("inf") else best_full,
+            "best_run": best_run,
+            "completed_experiments": completed_experiments,
             "elapsed_hours": (time.time() - started_at) / 3600.0,
         }
-        with open(runner_log, "w", encoding="utf-8") as f:
+        with open(runner_state, "w", encoding="utf-8") as f:
             json.dump(write_state, f, indent=2, sort_keys=True)
 
+    if args.checkpoint_commits:
+        final_summary = {
+            "best_full_perplexity": None if best_full == float("inf") else best_full,
+            "best_run": best_run,
+            "completed_experiments": completed_experiments,
+            "elapsed_hours": (time.time() - started_at) / 3600.0,
+        }
+        commit_checkpoint(
+            checkpoint_dir=checkpoint_dir,
+            output_root=output_root,
+            results_tsv=results_tsv,
+            run_dir=output_root,
+            spec={"kind": "final"},
+            summary=final_summary,
+            status="final",
+            retention=args.retain_checkpoints,
+            runner_log=runner_log,
+            final=True,
+        )
+    log_event(
+        runner_log,
+        f"finished run experiments={completed_experiments} best_full={fmt(None if best_full == float('inf') else best_full)}",
+    )
     return 0
 
 

@@ -49,6 +49,12 @@ def load_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def pick_saved_fields(saved: dict[str, Any] | None, keys: list[str]) -> dict[str, Any]:
+    if not saved:
+        return {}
+    return {key: saved.get(key) for key in keys if key in saved}
+
+
 def maybe_import_torch() -> Any | None:
     try:
         import torch  # type: ignore
@@ -458,9 +464,11 @@ def collect_run_summary(
     init_metrics_path = run_dir / "init_metrics.json"
     loss_csv = run_dir / "loss.csv"
     config_json = run_dir / "config.json"
+    score_json = run_dir / "score.json"
 
     init_metrics = load_json(init_metrics_path) if init_metrics_path.exists() else None
     config = load_json(config_json) if config_json.exists() else None
+    saved_summary = load_json(score_json) if score_json.exists() else None
 
     rows: list[dict[str, float | None]] = []
     elapsed_sec = None
@@ -480,6 +488,10 @@ def collect_run_summary(
     candidate_checkpoint = find_run_candidate_checkpoint(run_dir, requested_checkpoint=checkpoint)
     if candidate_checkpoint and candidate_checkpoint.exists() and candidate_checkpoint not in checkpoints:
         checkpoints.insert(0, candidate_checkpoint)
+    elif candidate_checkpoint is None and saved_summary:
+        saved_checkpoint = saved_summary.get("candidate_checkpoint")
+        if saved_checkpoint:
+            candidate_checkpoint = Path(str(saved_checkpoint))
 
     quick = load_quick_ppl(run_dir, init_metrics)
     if elapsed_sec is None:
@@ -503,19 +515,54 @@ def collect_run_summary(
         score = last_train_loss
 
     artifact_type = detect_artifact_type(run_dir, init_metrics, loss_csv.exists())
-    size_summary = estimate_quantized_payload(candidate_checkpoint, float_storage_bits=float_storage_bits)
-    size_budget = compare_size_to_baseline(
-        candidate_checkpoint,
-        candidate_size=size_summary,
-        baseline_run_dir=baseline_run_dir,
-        max_size_growth_pct=max_size_growth_pct,
-        float_storage_bits=float_storage_bits,
-    )
+    if candidate_checkpoint and candidate_checkpoint.exists():
+        size_summary = estimate_quantized_payload(candidate_checkpoint, float_storage_bits=float_storage_bits)
+        size_budget = compare_size_to_baseline(
+            candidate_checkpoint,
+            candidate_size=size_summary,
+            baseline_run_dir=baseline_run_dir,
+            max_size_growth_pct=max_size_growth_pct,
+            float_storage_bits=float_storage_bits,
+        )
+    else:
+        size_summary = pick_saved_fields(
+            saved_summary,
+            [
+                "size_estimate_mode",
+                "size_estimate_error",
+                "float_storage_bits",
+                "quant_layer_count",
+                "quant_weight_count",
+                "projected_index_bits",
+                "projected_scale_bits",
+                "projected_lut_bits",
+                "projected_payload_bits",
+                "projected_payload_bytes",
+                "projected_payload_mib",
+                "avg_bits_per_weight",
+                "family_avg_bits_per_weight",
+            ],
+        )
+        size_budget = pick_saved_fields(
+            saved_summary,
+            [
+                "baseline_checkpoint",
+                "baseline_projected_payload_mib",
+                "baseline_avg_bits_per_weight",
+                "size_ratio_vs_baseline",
+                "size_growth_pct_vs_baseline",
+                "size_budget_growth_pct",
+                "size_budget_payload_mib",
+                "size_budget_avg_bits_per_weight",
+                "size_ok",
+                "size_budget_error",
+            ],
+        )
 
     result = {
         "run_dir": str(run_dir),
         "artifact_type": artifact_type,
-        "candidate_checkpoint": str(candidate_checkpoint) if candidate_checkpoint else None,
+        "candidate_checkpoint": str(candidate_checkpoint) if candidate_checkpoint else saved_summary.get("candidate_checkpoint") if saved_summary else None,
         "checkpoints": [str(p) for p in checkpoints],
         "score": score,
         "full_perplexity": full_perplexity,

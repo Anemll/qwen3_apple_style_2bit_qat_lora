@@ -37,7 +37,7 @@ PRESET = PRESETS["q4a4"]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build one AQ1 experiment candidate")
-    parser.add_argument("--family", choices=["mixedbit", "mlp_permute"], required=True)
+    parser.add_argument("--family", choices=["mixedbit", "mixedbit_tiered", "mlp_permute"], required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--model-id", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--group-size", type=int, default=16)
@@ -47,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scope", choices=["all", "mlp", "attn"], default="all")
     parser.add_argument("--selection", choices=["efficiency", "absolute"], default="efficiency")
     parser.add_argument("--upgrade-bits", type=int, default=5)
+    parser.add_argument("--max-upgrade-bits", type=int, default=6)
     parser.add_argument(
         "--permute-strategy",
         choices=["combined_desc", "combined_hilo", "down_desc", "down_hilo"],
@@ -142,6 +143,54 @@ def layer_payload_bits(module: nn.Linear, lut_bits: int, scale_rank: int, float_
     return index_bits + scale_bits + lut_bits_total
 
 
+def load_or_compute_layer_stats(
+    model: nn.Module,
+    group_size: int,
+    scope: str,
+    bit_options: list[int],
+    cache_json: Path | None,
+) -> list[dict[str, Any]]:
+    normalized_bits = sorted({int(bits) for bits in bit_options})
+    cache_key = f"{scope}|{group_size}|{','.join(str(bits) for bits in normalized_bits)}"
+
+    if cache_json and cache_json.exists():
+        cached = json.loads(cache_json.read_text(encoding="utf-8"))
+        if cached.get("cache_key") == cache_key and isinstance(cached.get("candidates"), list):
+            return cached["candidates"]
+
+    candidates: list[dict[str, Any]] = []
+    for name, module, kind in iter_quant_linears(model, scope=scope):
+        scale_rank = PRESET.attn_rank if kind == "attn" else PRESET.mlp_rank
+        mae_by_bits: dict[str, float] = {}
+        payload_bits_by_bits: dict[str, int] = {}
+        for lut_bits in normalized_bits:
+            mae_by_bits[str(lut_bits)] = local_quant_mae(
+                module,
+                lut_bits=lut_bits,
+                scale_rank=scale_rank,
+                group_size=group_size,
+            )
+            payload_bits_by_bits[str(lut_bits)] = layer_payload_bits(
+                module,
+                lut_bits=lut_bits,
+                scale_rank=scale_rank,
+            )
+        candidates.append(
+            {
+                "name": name,
+                "kind": kind,
+                "scale_rank": scale_rank,
+                "mae_by_bits": mae_by_bits,
+                "payload_bits_by_bits": payload_bits_by_bits,
+            }
+        )
+
+    if cache_json:
+        cache_json.parent.mkdir(parents=True, exist_ok=True)
+        write_json(cache_json, {"cache_key": cache_key, "candidates": candidates})
+    return candidates
+
+
 def build_mixedbit_overrides(
     model: nn.Module,
     baseline_checkpoint: Path,
@@ -159,36 +208,31 @@ def build_mixedbit_overrides(
         raise RuntimeError(f"failed to estimate baseline size from {baseline_checkpoint}")
 
     extra_budget_bits = int(baseline_bits * (budget_growth_pct / 100.0))
-    cache_key = f"{scope}|{group_size}|{upgrade_bits}"
-    candidates: list[dict[str, Any]] | None = None
-
-    if cache_json and cache_json.exists():
-        cached = json.loads(cache_json.read_text(encoding="utf-8"))
-        if cached.get("cache_key") == cache_key:
-            candidates = cached.get("candidates")
-
-    if candidates is None:
-        candidates = []
-        for name, module, kind in iter_quant_linears(model, scope=scope):
-            scale_rank = PRESET.attn_rank if kind == "attn" else PRESET.mlp_rank
-            base_mae = local_quant_mae(module, lut_bits=4, scale_rank=scale_rank, group_size=group_size)
-            upgrade_mae = local_quant_mae(module, lut_bits=upgrade_bits, scale_rank=scale_rank, group_size=group_size)
-            improvement = base_mae - upgrade_mae
-            extra_bits = layer_payload_bits(module, upgrade_bits, scale_rank) - layer_payload_bits(module, 4, scale_rank)
-            candidates.append(
-                {
-                    "name": name,
-                    "kind": kind,
-                    "base_mae": base_mae,
-                    "upgrade_mae": upgrade_mae,
-                    "improvement": improvement,
-                    "extra_bits": extra_bits,
-                    "efficiency": (improvement / extra_bits) if extra_bits > 0 else 0.0,
-                }
-            )
-        if cache_json:
-            cache_json.parent.mkdir(parents=True, exist_ok=True)
-            write_json(cache_json, {"cache_key": cache_key, "candidates": candidates})
+    raw_candidates = load_or_compute_layer_stats(
+        model=model,
+        group_size=group_size,
+        scope=scope,
+        bit_options=[4, upgrade_bits],
+        cache_json=cache_json,
+    )
+    candidates: list[dict[str, Any]] = []
+    for row in raw_candidates:
+        base_mae = row["mae_by_bits"]["4"]
+        upgrade_mae = row["mae_by_bits"][str(upgrade_bits)]
+        extra_bits = row["payload_bits_by_bits"][str(upgrade_bits)] - row["payload_bits_by_bits"]["4"]
+        improvement = base_mae - upgrade_mae
+        candidates.append(
+            {
+                "name": row["name"],
+                "kind": row["kind"],
+                "scale_rank": row["scale_rank"],
+                "base_mae": base_mae,
+                "upgrade_mae": upgrade_mae,
+                "improvement": improvement,
+                "extra_bits": extra_bits,
+                "efficiency": (improvement / extra_bits) if extra_bits > 0 else 0.0,
+            }
+        )
 
     if selection == "absolute":
         ranked = sorted(candidates, key=lambda row: row["improvement"], reverse=True)
@@ -208,7 +252,7 @@ def build_mixedbit_overrides(
     layer_overrides = {
         row["name"]: {
             "lut_bits": upgrade_bits,
-            "scale_rank": PRESET.attn_rank if row["kind"] == "attn" else PRESET.mlp_rank,
+            "scale_rank": row["scale_rank"],
             "group_size": group_size,
         }
         for row in selected
@@ -231,6 +275,128 @@ def build_mixedbit_overrides(
 
     if verbose:
         print(f"[mixedbit] Selected {len(selected)} layers, used {used_bits:,}/{extra_budget_bits:,} extra bits")
+
+    return layer_overrides, metadata
+
+
+def build_tiered_mixedbit_overrides(
+    model: nn.Module,
+    baseline_checkpoint: Path,
+    budget_growth_pct: float,
+    group_size: int,
+    scope: str,
+    selection: str,
+    max_upgrade_bits: int,
+    cache_json: Path | None,
+    verbose: bool,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    baseline_size = estimate_quantized_payload(baseline_checkpoint)
+    baseline_bits = baseline_size.get("projected_payload_bits")
+    if baseline_bits is None:
+        raise RuntimeError(f"failed to estimate baseline size from {baseline_checkpoint}")
+    if max_upgrade_bits < 5:
+        raise RuntimeError(f"expected max_upgrade_bits >= 5, got {max_upgrade_bits}")
+
+    extra_budget_bits = int(baseline_bits * (budget_growth_pct / 100.0))
+    candidates = load_or_compute_layer_stats(
+        model=model,
+        group_size=group_size,
+        scope=scope,
+        bit_options=list(range(4, max_upgrade_bits + 1)),
+        cache_json=cache_json,
+    )
+
+    current_bits = {row["name"]: 4 for row in candidates}
+    current_mae = {row["name"]: float(row["mae_by_bits"]["4"]) for row in candidates}
+    payload_bits = {row["name"]: {int(bits): int(value) for bits, value in row["payload_bits_by_bits"].items()} for row in candidates}
+    mae_by_bits = {row["name"]: {int(bits): float(value) for bits, value in row["mae_by_bits"].items()} for row in candidates}
+    row_by_name = {row["name"]: row for row in candidates}
+
+    selected_actions: list[dict[str, Any]] = []
+    used_bits = 0
+    while True:
+        remaining_bits = extra_budget_bits - used_bits
+        best_action: dict[str, Any] | None = None
+
+        for row in candidates:
+            name = row["name"]
+            cur_bits = current_bits[name]
+            next_bits = cur_bits + 1
+            if next_bits > max_upgrade_bits:
+                continue
+
+            extra_bits = payload_bits[name][next_bits] - payload_bits[name][cur_bits]
+            if extra_bits <= 0 or extra_bits > remaining_bits:
+                continue
+
+            improvement = current_mae[name] - mae_by_bits[name][next_bits]
+            if improvement <= 0:
+                continue
+
+            score = improvement if selection == "absolute" else improvement / extra_bits
+            action = {
+                "name": name,
+                "kind": row["kind"],
+                "from_bits": cur_bits,
+                "to_bits": next_bits,
+                "improvement": improvement,
+                "extra_bits": extra_bits,
+                "score": score,
+            }
+            if best_action is None or (action["score"], action["improvement"]) > (
+                best_action["score"],
+                best_action["improvement"],
+            ):
+                best_action = action
+
+        if best_action is None:
+            break
+
+        name = best_action["name"]
+        current_bits[name] = best_action["to_bits"]
+        current_mae[name] = mae_by_bits[name][best_action["to_bits"]]
+        used_bits += best_action["extra_bits"]
+        selected_actions.append(best_action)
+
+    layer_overrides = {
+        name: {
+            "lut_bits": bits,
+            "scale_rank": row_by_name[name]["scale_rank"],
+            "group_size": group_size,
+        }
+        for name, bits in current_bits.items()
+        if bits > 4
+    }
+
+    selected_names = sorted(layer_overrides)
+    bit_histogram: dict[int, int] = {}
+    for bits in layer_overrides.values():
+        lut_bits = int(bits["lut_bits"])
+        bit_histogram[lut_bits] = bit_histogram.get(lut_bits, 0) + 1
+
+    metadata = {
+        "family": "mixedbit_tiered",
+        "scope": scope,
+        "selection": selection,
+        "max_upgrade_bits": max_upgrade_bits,
+        "budget_growth_pct": budget_growth_pct,
+        "baseline_payload_mib": baseline_size.get("projected_payload_mib"),
+        "baseline_avg_bits_per_weight": baseline_size.get("avg_bits_per_weight"),
+        "extra_budget_bits": extra_budget_bits,
+        "used_extra_bits": used_bits,
+        "selected_layers": len(selected_names),
+        "selected_names": selected_names,
+        "selected_lut_histogram": bit_histogram,
+        "upgrade_actions": selected_actions[:32],
+    }
+
+    if verbose:
+        hist = ", ".join(f"{bits}-bit:{count}" for bits, count in sorted(bit_histogram.items()))
+        print(
+            f"[mixedbit_tiered] Selected {len(selected_names)} layers, used "
+            f"{used_bits:,}/{extra_budget_bits:,} extra bits"
+            + (f" ({hist})" if hist else "")
+        )
 
     return layer_overrides, metadata
 
@@ -361,21 +527,34 @@ def main() -> int:
         verbose=verbose,
     )
 
-    if args.family == "mixedbit":
+    if args.family in {"mixedbit", "mixedbit_tiered"}:
         if not args.baseline_checkpoint:
-            raise SystemExit("--baseline-checkpoint is required for mixedbit experiments")
+            raise SystemExit("--baseline-checkpoint is required for mixed-bit experiments")
         cache_json = Path(args.cache_json).expanduser().resolve() if args.cache_json else None
-        layer_overrides, family_meta = build_mixedbit_overrides(
-            model=model,
-            baseline_checkpoint=Path(args.baseline_checkpoint).expanduser().resolve(),
-            budget_growth_pct=args.budget_growth_pct,
-            group_size=args.group_size,
-            scope=args.scope,
-            selection=args.selection,
-            upgrade_bits=args.upgrade_bits,
-            cache_json=cache_json,
-            verbose=verbose,
-        )
+        if args.family == "mixedbit":
+            layer_overrides, family_meta = build_mixedbit_overrides(
+                model=model,
+                baseline_checkpoint=Path(args.baseline_checkpoint).expanduser().resolve(),
+                budget_growth_pct=args.budget_growth_pct,
+                group_size=args.group_size,
+                scope=args.scope,
+                selection=args.selection,
+                upgrade_bits=args.upgrade_bits,
+                cache_json=cache_json,
+                verbose=verbose,
+            )
+        else:
+            layer_overrides, family_meta = build_tiered_mixedbit_overrides(
+                model=model,
+                baseline_checkpoint=Path(args.baseline_checkpoint).expanduser().resolve(),
+                budget_growth_pct=args.budget_growth_pct,
+                group_size=args.group_size,
+                scope=args.scope,
+                selection=args.selection,
+                max_upgrade_bits=args.max_upgrade_bits,
+                cache_json=cache_json,
+                verbose=verbose,
+            )
         experiment_metadata.update(family_meta)
     else:
         experiment_metadata.update(apply_mlp_hidden_permutations(model, strategy=args.permute_strategy, verbose=verbose))
