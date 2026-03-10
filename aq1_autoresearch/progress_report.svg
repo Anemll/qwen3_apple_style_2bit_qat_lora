@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="860" viewBox="0 0 1280 860">
+<rect width="100%" height="100%" fill="#fbf7ef"/>
+<rect x="0" y="0" width="100%" height="100%" fill="url(#bg)"/>
+<defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#fff9ef"/><stop offset="100%" stop-color="#f3efe6"/></linearGradient></defs>
+<text x="90" y="46" font-family="Menlo, monospace" font-size="28" font-weight="700" fill="#1d2733">AQ1 ANE-Native Quantization Experiments</text>
+<text x="90" y="72" font-family="Menlo, monospace" font-size="14" fill="#5b6470">Apple Neural Engine native quantization search; full perplexity is the keep metric and quick-only points are screens</text>
+<text x="90" y="94" font-family="Menlo, monospace" font-size="13" fill="#5b6470">model Qwen/Qwen3-0.6B | target q4a4 | baseline 4.7337 bpw | ceiling 4.9704 bpw</text>
+<text x="1240" y="46" text-anchor="end" font-family="Menlo, monospace" font-size="13" fill="#5b6470">live run: 10 done, best 28.03, elapsed 1.20h</text>
+<line x1="90" y1="765.0" x2="1240" y2="765.0" stroke="#d9d2c8" stroke-width="1"/>
+<text x="80" y="769.0" text-anchor="end" font-family="Menlo, monospace" font-size="12" fill="#5b6470">27.4</text>
+<line x1="90" y1="662.0" x2="1240" y2="662.0" stroke="#d9d2c8" stroke-width="1"/>
+<text x="80" y="666.0" text-anchor="end" font-family="Menlo, monospace" font-size="12" fill="#5b6470">28.8</text>
+<line x1="90" y1="559.0" x2="1240" y2="559.0" stroke="#d9d2c8" stroke-width="1"/>
+<text x="80" y="563.0" text-anchor="end" font-family="Menlo, monospace" font-size="12" fill="#5b6470">30.2</text>
+<line x1="90" y1="456.0" x2="1240" y2="456.0" stroke="#d9d2c8" stroke-width="1"/>
+<text x="80" y="460.0" text-anchor="end" font-family="Menlo, monospace" font-size="12" fill="#5b6470">31.7</text>
+<line x1="90" y1="353.0" x2="1240" y2="353.0" stroke="#d9d2c8" stroke-width="1"/>
+<text x="80" y="357.0" text-anchor="end" font-family="Menlo, monospace" font-size="12" fill="#5b6470">33.1</text>
+<line x1="90" y1="250.0" x2="1240" y2="250.0" stroke="#d9d2c8" stroke-width="1"/>
+<text x="80" y="254.0" text-anchor="end" font-family="Menlo, monospace" font-size="12" fill="#5b6470">34.5</text>
+<line x1="90.0" y1="250" x2="90.0" y2="765" stroke="#ece6dc" stroke-width="1"/>
+<text x="90.0" y="789" text-anchor="middle" font-family="Menlo, monospace" font-size="12" fill="#5b6470">0</text>
+<line x1="274.0" y1="250" x2="274.0" y2="765" stroke="#ece6dc" stroke-width="1"/>
+<text x="274.0" y="789" text-anchor="middle" font-family="Menlo, monospace" font-size="12" fill="#5b6470">4</text>
+<line x1="412.0" y1="250" x2="412.0" y2="765" stroke="#ece6dc" stroke-width="1"/>
+<text x="412.0" y="789" text-anchor="middle" font-family="Menlo, monospace" font-size="12" fill="#5b6470">7</text>
+<line x1="596.0" y1="250" x2="596.0" y2="765" stroke="#ece6dc" stroke-width="1"/>
+<text x="596.0" y="789" text-anchor="middle" font-family="Menlo, monospace" font-size="12" fill="#5b6470">11</text>
+<line x1="734.0" y1="250" x2="734.0" y2="765" stroke="#ece6dc" stroke-width="1"/>
+<text x="734.0" y="789" text-anchor="middle" font-family="Menlo, monospace" font-size="12" fill="#5b6470">14</text>
+<line x1="918.0" y1="250" x2="918.0" y2="765" stroke="#ece6dc" stroke-width="1"/>
+<text x="918.0" y="789" text-anchor="middle" font-family="Menlo, monospace" font-size="12" fill="#5b6470">18</text>
+<line x1="1056.0" y1="250" x2="1056.0" y2="765" stroke="#ece6dc" stroke-width="1"/>
+<text x="1056.0" y="789" text-anchor="middle" font-family="Menlo, monospace" font-size="12" fill="#5b6470">21</text>
+<line x1="1240.0" y1="250" x2="1240.0" y2="765" stroke="#ece6dc" stroke-width="1"/>
+<text x="1240.0" y="789" text-anchor="middle" font-family="Menlo, monospace" font-size="12" fill="#5b6470">25</text>
+<rect x="90" y="250" width="1150" height="515" fill="none" stroke="#1d2733" stroke-width="1.5"/>
+<line x1="90" y1="368.3" x2="1240" y2="368.3" stroke="#5f6b76" stroke-width="1.5" stroke-dasharray="6 6"/>
+<text x="1240" y="360.3" text-anchor="end" font-family="Menlo, monospace" font-size="12" fill="#5f6b76">baseline 32.86</text>
+<line x1="90" y1="765.0" x2="1240" y2="765.0" stroke="#2f855a" stroke-width="1.5" stroke-dasharray="3 5"/>
+<text x="1240" y="757.0" text-anchor="end" font-family="Menlo, monospace" font-size="12" fill="#2f855a">original 22.38</text>
+<path d="M 90.0 368.3 L 136.0 597.7 L 182.0 597.7 L 228.0 597.7 L 274.0 712.4 L 320.0 716.8 L 366.0 716.8 L 412.0 716.8 L 458.0 716.8 L 504.0 716.8 L 550.0 716.8 L 596.0 716.8 L 642.0 716.8 L 688.0 716.8 L 734.0 716.8 L 780.0 716.8 L 826.0 721.2 L 872.0 721.2 L 918.0 721.2 L 964.0 721.2 L 1010.0 721.2 L 1056.0 721.2 L 1102.0 721.2 L 1148.0 721.2 L 1194.0 721.2 L 1240.0 721.2" fill="none" stroke="#0f1720" stroke-width="3"/>
+<circle cx="90.0" cy="368.3" r="6" fill="#0c7c59" stroke="#ffffff" stroke-width="1.5"/>
+<text x="98.0" y="360.3" font-family="Menlo, monospace" font-size="11" font-weight="700" fill="#114b5f">#00</text>
+<circle cx="136.0" cy="597.7" r="6" fill="#0c7c59" stroke="#ffffff" stroke-width="1.5"/>
+<text x="144.0" y="589.7" font-family="Menlo, monospace" font-size="11" font-weight="700" fill="#114b5f">#01</text>
+<line x1="178.0" y1="304.4" x2="186.0" y2="312.4" stroke="#c46a00" stroke-width="2"/>
+<line x1="178.0" y1="312.4" x2="186.0" y2="304.4" stroke="#c46a00" stroke-width="2"/>
+<circle cx="228.0" cy="558.3" r="4.5" fill="#0c7c59" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="274.0" cy="712.4" r="6" fill="#0c7c59" stroke="#ffffff" stroke-width="1.5"/>
+<text x="282.0" y="704.4" font-family="Menlo, monospace" font-size="11" font-weight="700" fill="#114b5f">#04</text>
+<circle cx="320.0" cy="716.8" r="6" fill="#0c7c59" stroke="#ffffff" stroke-width="1.5"/>
+<text x="328.0" y="708.8" font-family="Menlo, monospace" font-size="11" font-weight="700" fill="#114b5f">#05</text>
+<circle cx="366.0" cy="668.6" r="4.5" fill="#d55d3f" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="412.0" cy="645.2" r="4.5" fill="#d55d3f" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="458.0" cy="711.7" r="4.5" fill="#d55d3f" stroke="#ffffff" stroke-width="1.5"/>
+<path d="M 499.0 243.0 L 504.0 248.0 L 509.0 243.0 Z" fill="#8b1e1e"/>
+<path d="M 545.0 243.0 L 550.0 248.0 L 555.0 243.0 Z" fill="#8b1e1e"/>
+<path d="M 591.0 243.0 L 596.0 248.0 L 601.0 243.0 Z" fill="#8b1e1e"/>
+<path d="M 637.0 243.0 L 642.0 248.0 L 647.0 243.0 Z" fill="#8b1e1e"/>
+<circle cx="688.0" cy="568.5" r="4.5" fill="#d55d3f" stroke="#ffffff" stroke-width="1.5"/>
+<path d="M 729.0 243.0 L 734.0 248.0 L 739.0 243.0 Z" fill="#8b1e1e"/>
+<circle cx="780.0" cy="711.7" r="4.5" fill="#d55d3f" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="826.0" cy="721.2" r="6" fill="#0c7c59" stroke="#ffffff" stroke-width="1.5"/>
+<text x="834.0" y="713.2" font-family="Menlo, monospace" font-size="11" font-weight="700" fill="#114b5f">#16</text>
+<circle cx="872.0" cy="707.3" r="4.5" fill="#d55d3f" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="918.0" cy="714.6" r="4.5" fill="#d55d3f" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="964.0" cy="716.1" r="4.5" fill="#d55d3f" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="1010.0" cy="683.9" r="4.5" fill="#d55d3f" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="1056.0" cy="683.9" r="4.5" fill="#d55d3f" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="1102.0" cy="716.1" r="4.5" fill="#d55d3f" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="1148.0" cy="668.6" r="4.5" fill="#d55d3f" stroke="#ffffff" stroke-width="1.5"/>
+<line x1="1190.0" y1="593.3" x2="1198.0" y2="601.3" stroke="#c46a00" stroke-width="2"/>
+<line x1="1190.0" y1="601.3" x2="1198.0" y2="593.3" stroke="#c46a00" stroke-width="2"/>
+<line x1="1236.0" y1="591.8" x2="1244.0" y2="599.8" stroke="#c46a00" stroke-width="2"/>
+<line x1="1236.0" y1="599.8" x2="1244.0" y2="591.8" stroke="#c46a00" stroke-width="2"/>
+<circle cx="826.0" cy="721.2" r="7.5" fill="#114b5f" stroke="#ffffff" stroke-width="2"/>
+<text x="836.0" y="711.2" font-family="Menlo, monospace" font-size="12" font-weight="700" fill="#114b5f">28.03</text>
+<line x1="864.0" y1="280.0" x2="826.0" y2="721.2" stroke="#114b5f" stroke-width="1.5" stroke-dasharray="5 4" opacity="0.7"/>
+<rect x="840" y="108" width="400" height="172" rx="14" ry="14" fill="#fffaf0" stroke="#114b5f" stroke-width="2"/>
+<text x="858" y="134" font-family="Menlo, monospace" font-size="15" font-weight="700" fill="#114b5f">Best New Result</text>
+<text x="858" y="158" font-family="Menlo, monospace" font-size="12.5" font-weight="700" fill="#1d2733">exp_001_tier_all_eff_b6_g16_p5p0</text>
+<text x="858" y="174" font-family="Menlo, monospace" font-size="12.5" font-weight="400" fill="#374151">PPL 28.03 | gain vs q4 4.83</text>
+<text x="858" y="190" font-family="Menlo, monospace" font-size="12.5" font-weight="400" fill="#374151">gap to original 5.65</text>
+<text x="858" y="206" font-family="Menlo, monospace" font-size="12.5" font-weight="400" fill="#374151">260.90 MiB | 4.9694 bpw</text>
+<text x="858" y="222" font-family="Menlo, monospace" font-size="12.5" font-weight="400" fill="#374151">all tiered 4-&gt;6-bit upgrades via greedy</text>
+<text x="858" y="238" font-family="Menlo, monospace" font-size="12.5" font-weight="400" fill="#374151">efficiency at group_size=16 within a 5.00%</text>
+<text x="858" y="254" font-family="Menlo, monospace" font-size="12.5" font-weight="400" fill="#374151">payload budget</text>
+<rect x="90" y="108" width="730" height="140" rx="14" ry="14" fill="#fffaf0" stroke="#4a5568" stroke-width="1.6"/>
+<text x="108" y="134" font-family="Menlo, monospace" font-size="15" font-weight="700" fill="#1d2733">Improvement Steps</text>
+<text x="108" y="152" font-family="Menlo, monospace" font-size="11.5" fill="#5b6470">Each line is a new best. Labels on the plot use the same #index.</text>
+<text x="108" y="174" font-family="Menlo, monospace" font-size="11.5" fill="#374151">#00 32.86 | seed | init_v2 q4a4 group_size=32 search_lut fp4_dense-all</text>
+<text x="108" y="190" font-family="Menlo, monospace" font-size="11.5" fill="#374151">#01 29.72 | +3.14 | group_size=16 with search_lut</text>
+<text x="108" y="206" font-family="Menlo, monospace" font-size="11.5" fill="#374151">#04 28.15 | +1.57 | attention-only 5-bit upgrades ranked by local...</text>
+<text x="108" y="222" font-family="Menlo, monospace" font-size="11.5" fill="#374151">#05 28.09 | +0.06 | global 5-bit upgrades ranked by local improvement per...</text>
+<text x="108" y="238" font-family="Menlo, monospace" font-size="11.5" fill="#374151">#16 28.03 | +0.06 | all tiered 4-&gt;6-bit upgrades via greedy efficiency at...</text>
+<g transform="translate(90,818)"><circle cx="0" cy="0" r="5" fill="#0c7c59"/></g>
+<text x="104" y="822" font-family="Menlo, monospace" font-size="12" fill="#5b6470">new kept best</text>
+<g transform="translate(265,818)"><circle cx="0" cy="0" r="5" fill="#d55d3f"/></g>
+<text x="279" y="822" font-family="Menlo, monospace" font-size="12" fill="#5b6470">full eval, discarded</text>
+<g transform="translate(440,818)"><path d="M -5 -5 L 5 5 M -5 5 L 5 -5" stroke="#c46a00" stroke-width="2"/></g>
+<text x="454" y="822" font-family="Menlo, monospace" font-size="12" fill="#5b6470">quick-only screen</text>
+<g transform="translate(615,818)"><path d="M 0 -5 L 5 3 L -5 3 Z" fill="#8b1e1e"/></g>
+<text x="629" y="822" font-family="Menlo, monospace" font-size="12" fill="#5b6470">off-scale failure</text>
+<g transform="translate(790,818)"><line x1="-7" y1="0" x2="7" y2="0" stroke="#0f1720" stroke-width="3"/></g>
+<text x="804" y="822" font-family="Menlo, monospace" font-size="12" fill="#5b6470">running best</text>
+<g transform="translate(965,818)"><line x1="-7" y1="0" x2="7" y2="0" stroke="#2f855a" stroke-width="2" stroke-dasharray="3 5"/></g>
+<text x="979" y="822" font-family="Menlo, monospace" font-size="12" fill="#5b6470">original model</text>
+<text x="1240" y="822" text-anchor="end" font-family="Menlo, monospace" font-size="12" fill="#8b1e1e">5 off-scale failures clipped</text>
+<text x="665.0" y="842" text-anchor="middle" font-family="Menlo, monospace" font-size="13" fill="#1d2733">experiment order</text>
+<text x="24" y="507.5" transform="rotate(-90 24 507.5)" text-anchor="middle" font-family="Menlo, monospace" font-size="13" fill="#1d2733">perplexity (lower is better)</text>
+</svg>

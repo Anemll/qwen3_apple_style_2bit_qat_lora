@@ -38,14 +38,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_cmd(cmd: list[str], log_path: Path) -> int:
+def run_cmd(cmd: list[str], log_path: Path) -> tuple[int, float]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    started_at = time.time()
     with open(log_path, "a", encoding="utf-8") as log:
         log.write(f"$ {' '.join(cmd)}\n")
         log.flush()
         result = subprocess.run(cmd, cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT)
         log.write(f"\n[exit {result.returncode}]\n")
-        return result.returncode
+        return result.returncode, time.time() - started_at
 
 
 def log_event(log_path: Path, message: str) -> None:
@@ -109,7 +110,9 @@ def append_results_row(
     retention: str,
     change_family: str,
     description: str,
+    timing: dict[str, Any] | None = None,
 ) -> None:
+    timing = timing or {}
     row = [
         fmt(commit),
         fmt(summary.get("run_dir")),
@@ -130,6 +133,15 @@ def append_results_row(
         retention,
         change_family,
         description,
+        fmt(timing.get("experiment_wall_sec")),
+        fmt(timing.get("proxy_wall_sec")),
+        fmt(timing.get("proxy_wall_pct")),
+        fmt(timing.get("full_ppl_sec")),
+        fmt(timing.get("full_ppl_pct")),
+        fmt(timing.get("snap_sec")),
+        fmt(timing.get("snap_pct")),
+        fmt(timing.get("cleanup_sec")),
+        fmt(timing.get("cleanup_pct")),
     ]
     with open(results_tsv, "a", encoding="utf-8") as f:
         f.write("\t".join(row) + "\n")
@@ -397,10 +409,23 @@ def main() -> int:
         status = "crash"
         snap_ok = "skipped"
         retention = "discard"
+        timing = {
+            "experiment_wall_sec": None,
+            "proxy_wall_sec": None,
+            "proxy_wall_pct": None,
+            "full_ppl_sec": None,
+            "full_ppl_pct": None,
+            "snap_sec": None,
+            "snap_pct": None,
+            "cleanup_sec": None,
+            "cleanup_pct": None,
+        }
+        experiment_started_at = time.time()
         log_event(runner_log, f"experiment {idx:03d} starting {run_dir.name}: {spec['description']}")
 
-        build_exit = run_cmd(build_cmd, init_log)
-        log_event(runner_log, f"experiment {idx:03d} build exit={build_exit}")
+        build_exit, build_sec = run_cmd(build_cmd, init_log)
+        timing["proxy_wall_sec"] = build_sec
+        log_event(runner_log, f"experiment {idx:03d} build exit={build_exit} sec={fmt(build_sec)}")
         if build_exit == 0:
             quick_summary = collect_run_summary(run_dir=run_dir)
             quick = quick_summary.get("quick_perplexity")
@@ -420,8 +445,9 @@ def main() -> int:
                     "--max-chunks",
                     str(args.full_ppl_chunks),
                 ]
-                ppl_exit = run_cmd(ppl_cmd, run_dir / "perplexity.log")
-                log_event(runner_log, f"experiment {idx:03d} full-ppl exit={ppl_exit}")
+                ppl_exit, ppl_sec = run_cmd(ppl_cmd, run_dir / "perplexity.log")
+                timing["full_ppl_sec"] = ppl_sec
+                log_event(runner_log, f"experiment {idx:03d} full-ppl exit={ppl_exit} sec={fmt(ppl_sec)}")
 
                 snap_cmd = [
                     REPO_PYTHON,
@@ -433,8 +459,9 @@ def main() -> int:
                     "--output",
                     str(run_dir / "snapped_fp16.pt"),
                 ]
-                snap_exit = run_cmd(snap_cmd, run_dir / "snap.log")
-                log_event(runner_log, f"experiment {idx:03d} snap exit={snap_exit}")
+                snap_exit, snap_sec = run_cmd(snap_cmd, run_dir / "snap.log")
+                timing["snap_sec"] = snap_sec
+                log_event(runner_log, f"experiment {idx:03d} snap exit={snap_exit} sec={fmt(snap_sec)}")
                 snap_ok = "true" if (run_dir / "snapped_fp16.pt").exists() else "false"
             else:
                 snap_ok = "skipped"
@@ -467,34 +494,11 @@ def main() -> int:
                     best_full = float(full_ppl)
                     best_run = str(run_dir)
 
-            append_results_row(
-                results_tsv=results_tsv,
-                commit=commit,
-                summary=summary,
-                snap_ok=snap_ok,
-                status=status,
-                retention=retention,
-                change_family=spec["change_family"],
-                description=spec["description"],
-            )
             log_event(
                 runner_log,
                 f"experiment {idx:03d} result status={status} full={fmt(summary.get('full_perplexity'))} "
                 f"quick={fmt(summary.get('quick_perplexity'))} size_ok={fmt(summary.get('size_ok'))}",
             )
-
-            if args.checkpoint_commits and status == "keep":
-                commit_checkpoint(
-                    checkpoint_dir=checkpoint_dir,
-                    output_root=output_root,
-                    results_tsv=results_tsv,
-                    run_dir=run_dir,
-                    spec=spec,
-                    summary=summary,
-                    status=status,
-                    retention=retention,
-                    runner_log=runner_log,
-                )
 
             cleanup_cmd = [
                 REPO_PYTHON,
@@ -506,21 +510,61 @@ def main() -> int:
             ]
             if args.retain_checkpoints == "none" or retention != "keep":
                 cleanup_cmd.extend(["--retain-checkpoint", "none"])
-            cleanup_exit = run_cmd(cleanup_cmd, run_dir / "cleanup.log")
-            log_event(runner_log, f"experiment {idx:03d} cleanup exit={cleanup_exit} retention={retention}")
+            cleanup_exit, cleanup_sec = run_cmd(cleanup_cmd, run_dir / "cleanup.log")
+            timing["cleanup_sec"] = cleanup_sec
+            log_event(
+                runner_log,
+                f"experiment {idx:03d} cleanup exit={cleanup_exit} retention={retention} sec={fmt(cleanup_sec)}",
+            )
         else:
             summary = collect_run_summary(run_dir=run_dir)
-            append_results_row(
+            log_event(runner_log, f"experiment {idx:03d} crashed during build")
+
+        timing["experiment_wall_sec"] = time.time() - experiment_started_at
+        total_wall = timing["experiment_wall_sec"] or 0.0
+        for sec_key, pct_key in (
+            ("proxy_wall_sec", "proxy_wall_pct"),
+            ("full_ppl_sec", "full_ppl_pct"),
+            ("snap_sec", "snap_pct"),
+            ("cleanup_sec", "cleanup_pct"),
+        ):
+            sec_value = timing.get(sec_key)
+            if sec_value is not None and total_wall > 0:
+                timing[pct_key] = 100.0 * float(sec_value) / total_wall
+
+        append_results_row(
+            results_tsv=results_tsv,
+            commit=commit,
+            summary=summary,
+            snap_ok=snap_ok,
+            status=status,
+            retention=retention,
+            change_family=spec["change_family"],
+            description=spec["description"],
+            timing=timing,
+        )
+
+        if args.checkpoint_commits and status == "keep":
+            commit_checkpoint(
+                checkpoint_dir=checkpoint_dir,
+                output_root=output_root,
                 results_tsv=results_tsv,
-                commit=commit,
+                run_dir=run_dir,
+                spec=spec,
                 summary=summary,
-                snap_ok=snap_ok,
                 status=status,
                 retention=retention,
-                change_family=spec["change_family"],
-                description=spec["description"],
+                runner_log=runner_log,
             )
-            log_event(runner_log, f"experiment {idx:03d} crashed during build")
+
+        log_event(
+            runner_log,
+            f"experiment {idx:03d} wall_sec={fmt(timing['experiment_wall_sec'])} "
+            f"proxy={fmt(timing['proxy_wall_sec'])}/{fmt(timing['proxy_wall_pct'])}% "
+            f"full={fmt(timing['full_ppl_sec'])}/{fmt(timing['full_ppl_pct'])}% "
+            f"snap={fmt(timing['snap_sec'])}/{fmt(timing['snap_pct'])}% "
+            f"cleanup={fmt(timing['cleanup_sec'])}/{fmt(timing['cleanup_pct'])}%",
+        )
 
         write_state = {
             "last_run": str(run_dir),
