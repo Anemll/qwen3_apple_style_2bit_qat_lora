@@ -637,6 +637,7 @@ def main() -> int:
         num_chunks=args.quick_ppl_chunks,
         verbose=verbose,
         skip_ppl=False,
+        allow_name_prefixes=allow_name_prefixes,
     )
     metrics["steps"]["perplexity"] = tighten_results
     metrics["total_time_seconds"] = tighten_results.get("time_seconds")

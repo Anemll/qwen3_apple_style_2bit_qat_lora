@@ -49,6 +49,13 @@ def maybe_float(value: str | None) -> float | None:
     return float(value)
 
 
+
+
+def fmt_maybe(value: float | None, fmt: str = "{:.2f}") -> str:
+    if value is None:
+        return "n/a"
+    return fmt.format(value)
+
 def load_rows(results_tsv: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with open(results_tsv, newline="", encoding="utf-8") as f:
@@ -161,7 +168,7 @@ def load_campaign_metadata(path: Path) -> dict[str, str]:
     return metadata
 
 
-def load_original_reference(path: Path) -> dict[str, Any] | None:
+def load_original_reference(path: Path, model_id: str) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
@@ -170,7 +177,7 @@ def load_original_reference(path: Path) -> dict[str, Any] | None:
     except Exception:
         return None
 
-    entry = data.get("baseline:Qwen/Qwen3-0.6B")
+    entry = data.get(f"baseline:{model_id}")
     if not isinstance(entry, dict) or entry.get("perplexity") is None:
         return None
     return {
@@ -520,8 +527,8 @@ def summarize(
         f"- Baseline full perplexity: {baseline:.2f}",
         f"- Best full perplexity: {best:.2f} ({best_row['run_name']})",
         f"- Improvement vs baseline: {improvement:.2f} ({improvement_pct:.2f}%)",
-        f"- Best payload / avg bits: {best_row['size_mib']:.2f} MiB / {best_row['avg_bits']:.4f} bits per weight",
-        f"- Original model perplexity: {original_ppl:.2f} (Qwen/Qwen3-0.6B, CPU fp32, same max_chunks=20)" if original_ppl is not None else "- Original model perplexity: unavailable",
+        f"- Best payload / avg bits: {fmt_maybe(best_row['size_mib'], '{:.2f}')} MiB / {fmt_maybe(best_row['avg_bits'], '{:.4f}')} bits per weight",
+        f"- Original model perplexity: {original_ppl:.2f} ({campaign.get('model_id', 'unknown')}, full PPL)" if original_ppl is not None else "- Original model perplexity: unavailable",
         f"- Quantized baseline delta vs original: +{quant_penalty:.2f}" if quant_penalty is not None else "- Quantized baseline delta vs original: unavailable",
         f"- Best run delta vs original: +{best_gap:.2f}" if best_gap is not None else "- Best run delta vs original: unavailable",
         f"- Recovered quantization gap: {improvement:.2f} / {quant_penalty:.2f} ({recovered_pct:.2f}%)" if recovered_pct is not None else "- Recovered quantization gap: unavailable",
@@ -554,22 +561,23 @@ def summarize(
         delta_orig = row["full"] - original_ppl if original_ppl is not None else None
         lines.append(
             f"- {row['full']:.2f} | {row['run_name']} | {row['description']} | "
-            f"{row['size_mib']:.2f} MiB | {row['avg_bits']:.4f} bits | delta q4 {delta_q4:+.2f}"
+            f"{fmt_maybe(row['size_mib'], '{:.2f}')} MiB | {fmt_maybe(row['avg_bits'], '{:.4f}')} bits | delta q4 {delta_q4:+.2f}"
             + (f" | delta orig {delta_orig:+.2f}" if delta_orig is not None else "")
         )
 
-    lines.extend(
-        [
-            "",
-            "## Current Read",
-            "",
-            "- g16 is clearly better than g32 in this search so far.",
-            "- Mixed-bit allocation beats pure 4-bit everywhere and beats the earlier fixed group-size sweep.",
-            "- Global allocation beats attention-only or MLP-only variants; the budget wants to be shared across the network.",
-            "- Tiered 4->6-bit allocation is now slightly ahead of flat 5-bit allocation.",
-            "- Folded MLP permutations are a dead end in this setup; they blow up quick perplexity without helping size.",
-        ]
-    )
+    lines.extend(["", "## Current Read", ""])
+    if len(rows) <= 1:
+        lines.append("- Initial baseline only; no comparative AQ1 candidates yet.")
+    else:
+        lines.extend(
+            [
+                "- g16 is clearly better than g32 in this search so far.",
+                "- Mixed-bit allocation beats pure 4-bit everywhere and beats the earlier fixed group-size sweep.",
+                "- Global allocation beats attention-only or MLP-only variants; the budget wants to be shared across the network.",
+                "- Tiered 4->6-bit allocation is now slightly ahead of flat 5-bit allocation.",
+                "- Folded MLP permutations are a dead end in this setup; they blow up quick perplexity without helping size.",
+            ]
+        )
 
     if runner_state:
         lines.extend(
@@ -603,7 +611,8 @@ def main() -> int:
     if runner_state_path is None or not runner_state_path.exists():
         runner_state_path = discover_runner_state_path(campaign)
     runner_state = load_runner_state(runner_state_path) if runner_state_path else None
-    original_ref = load_original_reference(perplexity_json_path)
+    model_id = campaign.get("model_id", "Qwen/Qwen3-0.6B")
+    original_ref = load_original_reference(perplexity_json_path, model_id)
 
     output_svg.parent.mkdir(parents=True, exist_ok=True)
     render_svg(rows, campaign, runner_state, original_ref, output_svg)

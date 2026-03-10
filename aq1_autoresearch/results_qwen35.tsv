@@ -1,0 +1,2 @@
+commit	run_dir	artifact_type	candidate_checkpoint	score	full_perplexity	quick_perplexity	projected_payload_mib	avg_bits_per_weight	size_ok	best_eval_loss	final_eval_loss	elapsed_sec	snap_ok	inference_ok	status	retention	change_family	description	experiment_wall_sec	proxy_wall_sec	proxy_wall_pct	full_ppl_sec	full_ppl_pct	snap_sec	snap_pct	cleanup_sec	cleanup_pct
+local-qwen35	runs/qwen35_0p8b_init	init	runs/qwen35_0p8b_init/v2_initial.pt	17.83	17.83	16.61			true			2854.7	true	n/a	keep	keep	baseline	init_v2 q4a4 group_size=16				2854.7				

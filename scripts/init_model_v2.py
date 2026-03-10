@@ -624,7 +624,11 @@ def measure_svd_approximation_error(
     mlp_maes = []
     attn_maes = []
 
-    v2_layers = [(name, m) for name, m in model.named_modules() if isinstance(m, AnemllQATLinearV2) and name_allowed(name, allow_name_prefixes)]
+    v2_layers = [
+        (name, m)
+        for name, m in model.named_modules()
+        if isinstance(m, AnemllQATLinearV2) and name_allowed(name, allow_name_prefixes)
+    ]
 
     for layer_idx, (name, module) in enumerate(v2_layers):
         # Get W_ref
@@ -1637,6 +1641,7 @@ def tighten_and_measure_ppl(
     num_chunks: int = 14,
     verbose: bool = True,
     skip_ppl: bool = False,
+    allow_name_prefixes: list[str] | None = None,
 ) -> Dict[str, Any]:
     """
     Tighten Q with baseline weights and optionally measure perplexity.
@@ -2270,6 +2275,7 @@ def init_v2_model(
             num_chunks=ppl_chunks,
             verbose=verbose,
             skip_ppl=not measure_ppl,  # Only measure PPL if requested
+            allow_name_prefixes=allow_name_prefixes,
         )
 
         # Step 7b: Validate on tightened model (if enabled)
