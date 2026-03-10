@@ -64,7 +64,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
-from qat_lora.model_utils import select_hf_model_class, infer_text_module_prefixes
+from qat_lora.model_utils import select_hf_model_class, infer_text_module_prefixes, collect_linear_attention_o_proj
 
 # Quantization config presets (same as train_v2_simple.py)
 CONFIG_PRESETS = {
@@ -864,6 +864,7 @@ def load_checkpoint(
     )
 
     allow_name_prefixes = infer_text_module_prefixes(model, verbose=False)
+    deny_name_prefixes = collect_linear_attention_o_proj(model)
     replace_linear_with_layer_overrides(
         model,
         mlp_config=mlp_config,
@@ -873,6 +874,7 @@ def load_checkpoint(
         verbose=False,
         skip_init=True,  # Skip SVD init since we load checkpoint immediately after
         allow_name_prefixes=allow_name_prefixes,
+        deny_name_prefixes=deny_name_prefixes,
     )
 
     if layer_overrides:

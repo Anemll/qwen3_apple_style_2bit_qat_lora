@@ -1722,7 +1722,7 @@ def replace_linear_with_anemll_v2(
                 if prefix in (None, ""):
                     ok = True
                     break
-                if name.startswith(prefix + "."):
+                if name == prefix or name.startswith(prefix + "."):
                     ok = True
                     break
             if not ok:
@@ -1731,7 +1731,7 @@ def replace_linear_with_anemll_v2(
             for prefix in deny_name_prefixes:
                 if prefix in (None, ""):
                     continue
-                if name.startswith(prefix + "."):
+                if name == prefix or name.startswith(prefix + "."):
                     return False
         return True
 

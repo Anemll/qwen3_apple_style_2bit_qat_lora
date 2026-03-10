@@ -324,15 +324,25 @@ def get_device(force_tpu: bool = False, force_cpu: bool = False) -> Tuple[torch.
 
 
 
-def name_allowed(name: str, allow_name_prefixes: list[str] | None) -> bool:
-    if not allow_name_prefixes:
-        return True
-    for prefix in allow_name_prefixes:
-        if prefix in (None, ""):
-            return True
-        if name.startswith(prefix + "."):
-            return True
-    return False
+def name_allowed(name: str, allow_name_prefixes: list[str] | None, deny_name_prefixes: list[str] | None = None) -> bool:
+    if allow_name_prefixes:
+        allowed = False
+        for prefix in allow_name_prefixes:
+            if prefix in (None, ""):
+                allowed = True
+                break
+            if name == prefix or name.startswith(prefix + "."):
+                allowed = True
+                break
+        if not allowed:
+            return False
+    if deny_name_prefixes:
+        for prefix in deny_name_prefixes:
+            if prefix in (None, ""):
+                continue
+            if name == prefix or name.startswith(prefix + "."):
+                return False
+    return True
 
 
 MLP_PATTERN = re.compile(r"\.mlp\.(gate_proj|up_proj|down_proj)$")
@@ -534,6 +544,7 @@ def replace_linear_layers(
         quantize_lm_head=False,  # Never quantize lm_head
         verbose=verbose,
         allow_name_prefixes=allow_name_prefixes,
+        deny_name_prefixes=deny_name_prefixes,
     )
 
     elapsed = time.time() - t0
@@ -627,7 +638,7 @@ def measure_svd_approximation_error(
     v2_layers = [
         (name, m)
         for name, m in model.named_modules()
-        if isinstance(m, AnemllQATLinearV2) and name_allowed(name, allow_name_prefixes)
+        if isinstance(m, AnemllQATLinearV2) and name_allowed(name, allow_name_prefixes, deny_name_prefixes)
     ]
 
     for layer_idx, (name, module) in enumerate(v2_layers):
@@ -740,6 +751,7 @@ def search_optimal_group_sizes(
     attn_scale_rank: int = 32,
     verbose: bool = True,
     allow_name_prefixes: list[str] | None = None,
+    deny_name_prefixes: list[str] | None = None,
 ) -> Dict[str, Any]:
     """
     Search for optimal group_size for each tensor by testing different sizes
@@ -778,7 +790,7 @@ def search_optimal_group_sizes(
     linear_layers = []
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
-            if not name_allowed(name, allow_name_prefixes):
+            if not name_allowed(name, allow_name_prefixes, deny_name_prefixes):
                 continue
             # Skip lm_head and embeddings
             if 'lm_head' in name or 'embed' in name:
@@ -948,6 +960,7 @@ def replace_linear_layers_with_optimal_groups(
     quantize_attn: bool = True,
     verbose: bool = True,
     allow_name_prefixes: list[str] | None = None,
+    deny_name_prefixes: list[str] | None = None,
 ) -> Dict[str, Any]:
     """
     Replace linear layers using per-layer optimal group sizes.
@@ -1066,6 +1079,7 @@ def search_optimal_luts(
     attn_scale_rank: int = 32,
     verbose: bool = True,
     allow_name_prefixes: list[str] | None = None,
+    deny_name_prefixes: list[str] | None = None,
 ) -> Dict[str, Any]:
     """
     Search for optimal LUT per tensor by testing candidates and minimizing MAE.
@@ -1106,7 +1120,7 @@ def search_optimal_luts(
     linear_layers = []
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
-            if not name_allowed(name, allow_name_prefixes):
+            if not name_allowed(name, allow_name_prefixes, deny_name_prefixes):
                 continue
             # Skip lm_head and embeddings
             if 'lm_head' in name or 'embed' in name:
@@ -1336,6 +1350,7 @@ def replace_linear_layers_with_optimal_luts(
     quantize_attn: bool = True,
     verbose: bool = True,
     allow_name_prefixes: list[str] | None = None,
+    deny_name_prefixes: list[str] | None = None,
 ) -> Dict[str, Any]:
     """
     Replace linear layers using per-layer optimal LUTs.
@@ -1691,7 +1706,7 @@ def tighten_and_measure_ppl(
         print(f"  Loaded {len(W_ref_map)} baseline weight tensors")
 
     # --- Step 8b: Snap magnitudes to FP16 before tightening ---
-    v2_layers = [(name, m) for name, m in model.named_modules() if isinstance(m, AnemllQATLinearV2) and name_allowed(name, allow_name_prefixes)]
+    v2_layers = [(name, m) for name, m in model.named_modules() if isinstance(m, AnemllQATLinearV2) and name_allowed(name, allow_name_prefixes, deny_name_prefixes)]
 
     # Snap all rank_magnitudes to FP16 FIRST (before computing scales)
     mags_snapped = {'mlp': 0, 'attn': 0, 'total': 0}
@@ -2013,8 +2028,9 @@ def init_v2_model(
         verbose=verbose,
     )
 
-    from qat_lora.model_utils import infer_text_module_prefixes
+    from qat_lora.model_utils import infer_text_module_prefixes, collect_linear_attention_o_proj
     allow_name_prefixes = infer_text_module_prefixes(model, verbose=verbose)
+    deny_name_prefixes = collect_linear_attention_o_proj(model)
     if allow_name_prefixes:
         metrics['text_prefixes'] = allow_name_prefixes
         if verbose:
@@ -2057,6 +2073,7 @@ def init_v2_model(
             attn_scale_rank=preset.attn_rank,
             verbose=verbose,
             allow_name_prefixes=allow_name_prefixes,
+            deny_name_prefixes=deny_name_prefixes,
         )
         metrics['steps']['lut_search'] = lut_search_stats
         optimal_lut_map = lut_search_stats['optimal_lut_map']
@@ -2085,6 +2102,7 @@ def init_v2_model(
             quantize_attn=quantize_attn,
             verbose=verbose,
             allow_name_prefixes=allow_name_prefixes,
+            deny_name_prefixes=deny_name_prefixes,
         )
         metrics['steps']['replace'] = replace_stats
 
@@ -2103,6 +2121,7 @@ def init_v2_model(
             attn_scale_rank=preset.attn_rank,
             verbose=verbose,
             allow_name_prefixes=allow_name_prefixes,
+            deny_name_prefixes=deny_name_prefixes,
         )
         metrics['steps']['group_search'] = search_stats
 
@@ -2117,6 +2136,7 @@ def init_v2_model(
             quantize_attn=quantize_attn,
             verbose=verbose,
             allow_name_prefixes=allow_name_prefixes,
+            deny_name_prefixes=deny_name_prefixes,
         )
         metrics['steps']['replace'] = replace_stats
 
@@ -2141,6 +2161,7 @@ def init_v2_model(
             quantize_attn=quantize_attn,
             verbose=verbose,
             allow_name_prefixes=allow_name_prefixes,
+            deny_name_prefixes=deny_name_prefixes,
         )
         metrics['steps']['replace'] = replace_stats
         # Update group_size for saving
@@ -2155,6 +2176,7 @@ def init_v2_model(
             quantize_attn=quantize_attn,
             verbose=verbose,
             allow_name_prefixes=allow_name_prefixes,
+            deny_name_prefixes=deny_name_prefixes,
         )
         metrics['steps']['replace'] = replace_stats
 
@@ -2169,6 +2191,7 @@ def init_v2_model(
             model_id=model_id,
             verbose=verbose,
             allow_name_prefixes=allow_name_prefixes,
+            deny_name_prefixes=deny_name_prefixes,
         )
         metrics['steps']['svd_error'] = svd_error_stats
     else:
@@ -2276,6 +2299,7 @@ def init_v2_model(
             verbose=verbose,
             skip_ppl=not measure_ppl,  # Only measure PPL if requested
             allow_name_prefixes=allow_name_prefixes,
+            deny_name_prefixes=deny_name_prefixes,
         )
 
         # Step 7b: Validate on tightened model (if enabled)

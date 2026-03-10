@@ -36,6 +36,23 @@ def select_hf_model_class(model_id: str, trust_remote_code: bool = True):
     return AutoModelForCausalLM, config
 
 
+
+
+def collect_linear_attention_o_proj(model: nn.Module) -> list[str]:
+    """Collect o_proj names under linear-attention modules (skip quantization)."""
+    deny: list[str] = []
+    name_to_module = dict(model.named_modules())
+    for name, module in name_to_module.items():
+        if not name.endswith("o_proj"):
+            continue
+        parts = name.split(".")
+        for i in range(len(parts) - 1, 0, -1):
+            parent_name = ".".join(parts[:i])
+            parent = name_to_module.get(parent_name)
+            if parent is not None and getattr(parent, "is_linear_attention", False):
+                deny.append(name)
+                break
+    return deny
 def infer_text_module_prefixes(
     model: nn.Module,
     verbose: bool = False,

@@ -22,6 +22,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from aq1_autoresearch.layer_policy import replace_linear_with_layer_overrides, layer_kind
 from aq1_autoresearch.score_run import estimate_quantized_payload
 from qat_lora.ane_qat_linear_v2 import AnemllQATLinearV2, AnemllQuantConfigV2
+from qat_lora.model_utils import collect_linear_attention_o_proj
 from scripts.init_model_v2 import (
     PRESETS,
     create_v2_configs,
@@ -47,6 +48,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scope", choices=["all", "mlp", "attn"], default="all")
     parser.add_argument("--selection", choices=["efficiency", "absolute"], default="efficiency")
     parser.add_argument("--upgrade-bits", type=int, default=5)
+    parser.add_argument("--allowed-bits", default=None,
+                        help="Comma-separated allowed LUT bits (e.g. 1,2,4,6,8). Defaults to baseline+upgrade bits.")
     parser.add_argument("--max-upgrade-bits", type=int, default=6)
     parser.add_argument(
         "--permute-strategy",
@@ -67,15 +70,36 @@ def get_device() -> torch.device:
 
 
 
-def name_allowed(name: str, allow_name_prefixes: list[str] | None) -> bool:
-    if not allow_name_prefixes:
-        return True
-    for prefix in allow_name_prefixes:
-        if prefix in (None, ""):
-            return True
-        if name.startswith(prefix + "."):
-            return True
-    return False
+
+def parse_allowed_bits(raw: str | None) -> list[int] | None:
+    if raw is None:
+        return None
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        return None
+    bits = sorted({int(p) for p in parts})
+    return bits
+
+
+def name_allowed(name: str, allow_name_prefixes: list[str] | None, deny_name_prefixes: list[str] | None = None) -> bool:
+    if allow_name_prefixes:
+        allowed = False
+        for prefix in allow_name_prefixes:
+            if prefix in (None, ""):
+                allowed = True
+                break
+            if name == prefix or name.startswith(prefix + "."):
+                allowed = True
+                break
+        if not allowed:
+            return False
+    if deny_name_prefixes:
+        for prefix in deny_name_prefixes:
+            if prefix in (None, ""):
+                continue
+            if name == prefix or name.startswith(prefix + "."):
+                return False
+    return True
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
     with open(path, "w", encoding="utf-8") as f:
@@ -92,12 +116,12 @@ def serialize_layer_overrides(layer_overrides: dict[str, dict[str, Any]]) -> dic
     return out
 
 
-def iter_quant_linears(model: nn.Module, scope: str = "all", allow_name_prefixes: list[str] | None = None) -> list[tuple[str, nn.Linear, str]]:
+def iter_quant_linears(model: nn.Module, scope: str = "all", allow_name_prefixes: list[str] | None = None, deny_name_prefixes: list[str] | None = None) -> list[tuple[str, nn.Linear, str]]:
     layers: list[tuple[str, nn.Linear, str]] = []
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
             continue
-        if not name_allowed(name, allow_name_prefixes):
+        if not name_allowed(name, allow_name_prefixes, deny_name_prefixes):
             continue
         if "embed" in name or "lm_head" in name:
             continue
@@ -159,6 +183,7 @@ def load_or_compute_layer_stats(
     bit_options: list[int],
     cache_json: Path | None,
     allow_name_prefixes: list[str] | None = None,
+    deny_name_prefixes: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     normalized_bits = sorted({int(bits) for bits in bit_options})
     cache_key = f"{scope}|{group_size}|{','.join(str(bits) for bits in normalized_bits)}"
@@ -169,7 +194,12 @@ def load_or_compute_layer_stats(
             return cached["candidates"]
 
     candidates: list[dict[str, Any]] = []
-    for name, module, kind in iter_quant_linears(model, scope=scope, allow_name_prefixes=allow_name_prefixes):
+    for name, module, kind in iter_quant_linears(
+        model,
+        scope=scope,
+        allow_name_prefixes=allow_name_prefixes,
+        deny_name_prefixes=deny_name_prefixes,
+    ):
         scale_rank = PRESET.attn_rank if kind == "attn" else PRESET.mlp_rank
         mae_by_bits: dict[str, float] = {}
         payload_bits_by_bits: dict[str, int] = {}
@@ -199,8 +229,6 @@ def load_or_compute_layer_stats(
         cache_json.parent.mkdir(parents=True, exist_ok=True)
         write_json(cache_json, {"cache_key": cache_key, "candidates": candidates})
     return candidates
-
-
 def build_mixedbit_overrides(
     model: nn.Module,
     baseline_checkpoint: Path,
@@ -212,6 +240,7 @@ def build_mixedbit_overrides(
     cache_json: Path | None,
     verbose: bool,
     allow_name_prefixes: list[str] | None = None,
+    allowed_bits: list[int] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     baseline_size = estimate_quantized_payload(baseline_checkpoint)
     baseline_bits = baseline_size.get("projected_payload_bits")
@@ -219,78 +248,141 @@ def build_mixedbit_overrides(
         raise RuntimeError(f"failed to estimate baseline size from {baseline_checkpoint}")
 
     extra_budget_bits = int(baseline_bits * (budget_growth_pct / 100.0))
+    bit_options = allowed_bits or [4, upgrade_bits]
+    if 4 not in bit_options:
+        bit_options = sorted(set(bit_options + [4]))
+
     raw_candidates = load_or_compute_layer_stats(
         model=model,
         group_size=group_size,
         scope=scope,
-        bit_options=[4, upgrade_bits],
+        bit_options=bit_options,
         cache_json=cache_json,
         allow_name_prefixes=allow_name_prefixes,
+        deny_name_prefixes=deny_name_prefixes,
     )
+
+    # Build per-layer best upgrade/downgrade options
+    upgrades: list[dict[str, Any]] = []
+    downgrades: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
+
     for row in raw_candidates:
-        base_mae = row["mae_by_bits"]["4"]
-        upgrade_mae = row["mae_by_bits"][str(upgrade_bits)]
-        extra_bits = row["payload_bits_by_bits"][str(upgrade_bits)] - row["payload_bits_by_bits"]["4"]
-        improvement = base_mae - upgrade_mae
-        candidates.append(
-            {
+        base_mae = float(row["mae_by_bits"]["4"])
+        base_bits = int(row["payload_bits_by_bits"]["4"])
+        best_upgrade = None
+        best_downgrade = None
+
+        for bits_str, mae_val in row["mae_by_bits"].items():
+            bits = int(bits_str)
+            if bits == 4:
+                continue
+            mae = float(mae_val)
+            payload_bits = int(row["payload_bits_by_bits"][bits_str])
+            delta_bits = payload_bits - base_bits
+            improvement = base_mae - mae
+
+            entry = {
                 "name": row["name"],
                 "kind": row["kind"],
                 "scale_rank": row["scale_rank"],
+                "target_bits": bits,
                 "base_mae": base_mae,
-                "upgrade_mae": upgrade_mae,
+                "target_mae": mae,
                 "improvement": improvement,
-                "extra_bits": extra_bits,
-                "efficiency": (improvement / extra_bits) if extra_bits > 0 else 0.0,
+                "delta_bits": delta_bits,
+                "efficiency": (improvement / delta_bits) if delta_bits != 0 else 0.0,
             }
-        )
+            candidates.append(entry)
+            if delta_bits > 0 and improvement > 0:
+                if best_upgrade is None or entry["efficiency"] > best_upgrade["efficiency"]:
+                    best_upgrade = entry
+            if delta_bits < 0 and improvement < 0:
+                loss_per_bit = (-improvement) / abs(delta_bits)
+                entry["loss_per_bit"] = loss_per_bit
+                if best_downgrade is None or loss_per_bit < best_downgrade["loss_per_bit"]:
+                    best_downgrade = entry
+
+        if best_upgrade is not None:
+            upgrades.append(best_upgrade)
+        if best_downgrade is not None:
+            downgrades.append(best_downgrade)
 
     if selection == "absolute":
-        ranked = sorted(candidates, key=lambda row: row["improvement"], reverse=True)
+        upgrades = sorted(upgrades, key=lambda row: row["improvement"], reverse=True)
     else:
-        ranked = sorted(candidates, key=lambda row: row["efficiency"], reverse=True)
+        upgrades = sorted(upgrades, key=lambda row: row["efficiency"], reverse=True)
+    downgrades = sorted(downgrades, key=lambda row: row["loss_per_bit"])
 
-    selected: list[dict[str, Any]] = []
+    selected_upgrades: list[dict[str, Any]] = []
+    selected_downgrades: list[dict[str, Any]] = []
     used_bits = 0
-    for row in ranked:
-        if row["improvement"] <= 0 or row["extra_bits"] <= 0:
-            continue
-        if used_bits + row["extra_bits"] > extra_budget_bits:
-            continue
-        selected.append(row)
-        used_bits += row["extra_bits"]
+    used_layers: set[str] = set()
 
-    layer_overrides = {
-        row["name"]: {
-            "lut_bits": upgrade_bits,
+    for up in upgrades:
+        if up["name"] in used_layers:
+            continue
+        if used_bits + up["delta_bits"] <= extra_budget_bits:
+            selected_upgrades.append(up)
+            used_bits += up["delta_bits"]
+            used_layers.add(up["name"])
+            continue
+
+        deficit = used_bits + up["delta_bits"] - extra_budget_bits
+        if deficit <= 0:
+            continue
+
+        saved = 0
+        loss = 0.0
+        chosen: list[dict[str, Any]] = []
+        for down in downgrades:
+            if down["name"] in used_layers or down["name"] == up["name"]:
+                continue
+            if down in selected_downgrades:
+                continue
+            chosen.append(down)
+            saved += abs(down["delta_bits"])
+            loss += -down["improvement"]
+            if saved >= deficit:
+                break
+
+        if saved >= deficit and (up["improvement"] - loss) > 0:
+            for down in chosen:
+                selected_downgrades.append(down)
+                used_layers.add(down["name"])
+                used_bits -= abs(down["delta_bits"])
+            selected_upgrades.append(up)
+            used_bits += up["delta_bits"]
+            used_layers.add(up["name"])
+
+    layer_overrides = {}
+    for row in selected_upgrades + selected_downgrades:
+        layer_overrides[row["name"]] = {
+            "lut_bits": int(row["target_bits"]),
             "scale_rank": row["scale_rank"],
             "group_size": group_size,
         }
-        for row in selected
-    }
 
     metadata = {
         "family": "mixedbit",
         "scope": scope,
         "selection": selection,
         "upgrade_bits": upgrade_bits,
+        "allowed_bits": bit_options,
         "budget_growth_pct": budget_growth_pct,
         "baseline_payload_mib": baseline_size.get("projected_payload_mib"),
         "baseline_avg_bits_per_weight": baseline_size.get("avg_bits_per_weight"),
         "extra_budget_bits": extra_budget_bits,
         "used_extra_bits": used_bits,
-        "selected_layers": len(selected),
-        "selected_names": [row["name"] for row in selected],
-        "top_candidates": ranked[:12],
+        "selected_layers": len(layer_overrides),
+        "selected_names": list(layer_overrides.keys()),
+        "top_candidates": candidates[:12],
     }
 
     if verbose:
-        print(f"[mixedbit] Selected {len(selected)} layers, used {used_bits:,}/{extra_budget_bits:,} extra bits")
+        print(f"[mixedbit] Selected {len(layer_overrides)} layers, used {used_bits:,}/{extra_budget_bits:,} extra bits")
 
     return layer_overrides, metadata
-
-
 def build_tiered_mixedbit_overrides(
     model: nn.Module,
     baseline_checkpoint: Path,
@@ -318,6 +410,7 @@ def build_tiered_mixedbit_overrides(
         bit_options=list(range(4, max_upgrade_bits + 1)),
         cache_json=cache_json,
         allow_name_prefixes=allow_name_prefixes,
+        deny_name_prefixes=deny_name_prefixes,
     )
 
     current_bits = {row["name"]: 4 for row in candidates}
@@ -491,6 +584,7 @@ def build_tightened_model(
     layer_overrides: dict[str, dict[str, Any]],
     group_size: int,
     allow_name_prefixes: list[str] | None = None,
+    deny_name_prefixes: list[str] | None = None,
 ) -> nn.Module:
     mlp_config, attn_config = create_v2_configs(PRESET, group_size=group_size, verbose=False)
     model_class, _ = select_hf_model_class(model_id, trust_remote_code=True)
@@ -508,6 +602,7 @@ def build_tightened_model(
         verbose=False,
         skip_init=True,
         allow_name_prefixes=allow_name_prefixes,
+        deny_name_prefixes=deny_name_prefixes,
     )
 
     state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -527,6 +622,7 @@ def build_tightened_model(
 def main() -> int:
     args = parse_args()
     output_dir = Path(args.output).expanduser().resolve()
+    allowed_bits = parse_allowed_bits(args.allowed_bits)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = get_device()
@@ -561,6 +657,7 @@ def main() -> int:
                 cache_json=cache_json,
                 verbose=verbose,
                 allow_name_prefixes=allow_name_prefixes,
+                allowed_bits=allowed_bits,
             )
         else:
             layer_overrides, family_meta = build_tiered_mixedbit_overrides(
@@ -627,6 +724,7 @@ def main() -> int:
         layer_overrides=layer_overrides,
         group_size=args.group_size,
         allow_name_prefixes=allow_name_prefixes,
+        deny_name_prefixes=deny_name_prefixes,
     )
 
     tighten_results = tighten_and_measure_ppl(
@@ -638,6 +736,7 @@ def main() -> int:
         verbose=verbose,
         skip_ppl=False,
         allow_name_prefixes=allow_name_prefixes,
+        deny_name_prefixes=deny_name_prefixes,
     )
     metrics["steps"]["perplexity"] = tighten_results
     metrics["total_time_seconds"] = tighten_results.get("time_seconds")
