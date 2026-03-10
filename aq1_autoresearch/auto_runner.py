@@ -15,6 +15,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
+REPO_PYTHON = str((REPO_ROOT / ".venv/bin/python").resolve())
 
 from aq1_autoresearch.score_run import collect_run_summary
 
@@ -263,7 +264,7 @@ def main() -> int:
 
         cache_json = output_root / f"mixedbit_cache_g{spec['group_size']}_{spec.get('scope', 'all')}_b{spec.get('upgrade_bits', 5)}.json"
         build_cmd = [
-            sys.executable,
+            REPO_PYTHON,
             "aq1_autoresearch/build_candidate.py",
             "--family",
             spec["family"],
@@ -306,7 +307,7 @@ def main() -> int:
 
             if not screen_fail:
                 ppl_cmd = [
-                    sys.executable,
+                    REPO_PYTHON,
                     "scripts/measure_perplexity.py",
                     str(run_dir / "v2_tightened.pt"),
                     "--config",
@@ -321,7 +322,7 @@ def main() -> int:
                 run_cmd(ppl_cmd, run_dir / "perplexity.log")
 
                 snap_cmd = [
-                    sys.executable,
+                    REPO_PYTHON,
                     "scripts/snap_and_test_v2.py",
                     "--checkpoint",
                     str(run_dir / "v2_tightened.pt"),
@@ -370,7 +371,7 @@ def main() -> int:
             )
 
             cleanup_cmd = [
-                sys.executable,
+                REPO_PYTHON,
                 "aq1_autoresearch/cleanup_run.py",
                 "--run-dir",
                 str(run_dir),
