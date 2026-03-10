@@ -15,7 +15,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
-REPO_PYTHON = str((REPO_ROOT / ".venv/bin/python").resolve())
+REPO_PYTHON = str(REPO_ROOT / ".venv/bin/python")
 
 from aq1_autoresearch.score_run import collect_run_summary
 
