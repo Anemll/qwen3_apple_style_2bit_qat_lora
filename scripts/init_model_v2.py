@@ -1699,10 +1699,9 @@ def tighten_and_measure_ppl(
         if module._Q is None:
             continue
 
-        # Force CPU for tighten (TPU/XLA is slow for per-layer ops)
+        # Tighten on CPU to avoid device mismatches with CPU-loaded baseline weights.
         orig_device = module._Q.device
-        is_xla = 'xla' in str(orig_device).lower() or 'tpu' in str(orig_device).lower()
-        if is_xla:
+        if orig_device.type != 'cpu':
             module.to('cpu')
 
         # W_ref stays on CPU (already loaded on CPU)
@@ -1791,6 +1790,8 @@ def save_checkpoint(
     group_size: int,
     init_metrics: Dict[str, Any],
     optimal_lut_map: Optional[Dict[str, str]] = None,
+    layer_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+    experiment_metadata: Optional[Dict[str, Any]] = None,
     verbose: bool = True,
 ) -> Dict[str, str]:
     """
@@ -1809,6 +1810,8 @@ def save_checkpoint(
         group_size: Group size used for initialization
         init_metrics: Collected metrics from all steps
         optimal_lut_map: Per-layer optimal LUT names (from LUT search)
+        layer_overrides: Per-layer quantization overrides for mixed-bit candidates
+        experiment_metadata: Extra JSON-safe metadata to persist in config.json
         verbose: Print save progress
 
     Returns:
@@ -1861,6 +1864,12 @@ def save_checkpoint(
         config_data['optimal_lut_map'] = optimal_lut_map
     else:
         config_data['lut_search_enabled'] = False
+
+    if layer_overrides is not None:
+        config_data['layer_overrides'] = layer_overrides
+
+    if experiment_metadata is not None:
+        config_data['experiment_metadata'] = experiment_metadata
 
     config_path = output_path / "config.json"
     with open(config_path, 'w') as f:
@@ -2207,9 +2216,6 @@ def init_v2_model(
         if q_loaded > 0 and verbose:
             print(f"  Manually loaded {q_loaded} _Q buffers")
 
-        # Move to device
-        tightened_model.to(device)
-
         # Tighten Q
         tighten_results = tighten_and_measure_ppl(
             model=tightened_model,
@@ -2223,6 +2229,8 @@ def init_v2_model(
 
         # Step 7b: Validate on tightened model (if enabled)
         if validate:
+            if not measure_ppl:
+                tightened_model.to(device)
             if verbose:
                 print(f"\n[Step 7b] Validating tightened model...")
             val_results = validate_model(

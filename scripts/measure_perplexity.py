@@ -821,9 +821,25 @@ def load_checkpoint(
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from qat_lora import (
         AnemllQuantConfigV2,
-        replace_linear_with_anemll_v2,
     )
     from qat_lora.ane_qat_linear_v2 import AnemllQATLinearV2
+    from aq1_autoresearch.layer_policy import (
+        merge_layer_overrides,
+        read_layer_overrides_from_config,
+        read_layer_overrides_from_state_dict,
+        replace_linear_with_layer_overrides,
+        summarize_layer_overrides,
+    )
+
+    # Load checkpoint before layer replacement so mixed-bit shapes can drive module creation
+    raw_state = torch.load(ckpt_file, map_location='cpu', weights_only=False)
+    state_dict = raw_state['model_state_dict'] if isinstance(raw_state, dict) and 'model_state_dict' in raw_state else raw_state
+
+    default_group_size = int(config.get('group_size', 32)) if config else 32
+    layer_overrides = merge_layer_overrides(
+        read_layer_overrides_from_config(config),
+        read_layer_overrides_from_state_dict(state_dict, default_group_size=default_group_size),
+    )
 
     # Convert lut_bits to lut_size
     lut_size = 2 ** lut_bits
@@ -845,23 +861,28 @@ def load_checkpoint(
         magnitude_activation='identity',
     )
 
-    replace_linear_with_anemll_v2(
+    replace_linear_with_layer_overrides(
         model,
         mlp_config=mlp_config,
         attn_config=attn_config,
+        layer_overrides=layer_overrides,
         quantize_attn=True,
         verbose=False,
         skip_init=True,  # Skip SVD init since we load checkpoint immediately after
     )
 
+    if layer_overrides:
+        summary = summarize_layer_overrides(layer_overrides)
+        bits_str = ", ".join(f"{bits}-bit: {count}" for bits, count in sorted(summary["lut_bits"].items()))
+        rank_str = ", ".join(f"r{rank}: {count}" for rank, count in sorted(summary["scale_rank"].items()))
+        if bits_str:
+            print(f"  Layer overrides: {bits_str}")
+        if rank_str:
+            print(f"  Override ranks:  {rank_str}")
+
     # Load checkpoint
     print(f"Loading checkpoint: {ckpt_file}")
     sys.stdout.flush()
-    state_dict = torch.load(ckpt_file, map_location='cpu', weights_only=False)
-
-    # Unwrap if needed
-    if 'model_state_dict' in state_dict:
-        state_dict = state_dict['model_state_dict']
 
     # Check checkpoint dtype and warn if mismatch
     ckpt_dtypes = set()

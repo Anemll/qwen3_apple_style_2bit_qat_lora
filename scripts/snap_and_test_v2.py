@@ -25,9 +25,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from aq1_autoresearch.layer_policy import (
+    merge_layer_overrides,
+    read_layer_overrides_from_config,
+    read_layer_overrides_from_state_dict,
+    replace_linear_with_layer_overrides,
+    summarize_layer_overrides,
+)
 from qat_lora import (
     AnemllQuantConfigV2,
-    replace_linear_with_anemll_v2,
     freeze_Q_all,
     freeze_model_for_inference_v2,
     get_inference_mode_v2,
@@ -152,6 +158,22 @@ def main():
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
 
+    # Load checkpoint before replacement so mixed-bit shapes can drive module creation
+    print(f"\nLoading checkpoint from {args.checkpoint}...")
+    checkpoint = torch.load(args.checkpoint, map_location='cpu')
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+        print("  Found nested 'model_state_dict' key")
+    else:
+        state_dict = checkpoint
+        print("  Using raw state dict")
+
+    default_group_size = int(auto_config.get('group_size', 32)) if auto_config else 32
+    layer_overrides = merge_layer_overrides(
+        read_layer_overrides_from_config(auto_config),
+        read_layer_overrides_from_state_dict(state_dict, default_group_size=default_group_size),
+    )
+
     # Replace with V2 layers (matching training config)
     print("Replacing with V2 layers...")
     print(f"  MLP: lut_bits={args.lut_bits}, rank={args.scale_rank}")
@@ -169,28 +191,25 @@ def main():
         force_positive_scales=False,  # Match training config (train_v2_simple.py)
         magnitude_activation='identity',
     )
-    count = replace_linear_with_anemll_v2(
+    count = replace_linear_with_layer_overrides(
         model,
         mlp_config=mlp_config,
         attn_config=attn_config,
+        layer_overrides=layer_overrides,
         quantize_attn=True,
-        quantize_lm_head=False,
         verbose=False,
         skip_init=True,  # Skip SVD since we load checkpoint immediately after
     )
     print(f"  Replaced {count} layers")
 
-    # Load checkpoint FIRST to detect LoRA config
-    print(f"\nLoading checkpoint from {args.checkpoint}...")
-    checkpoint = torch.load(args.checkpoint, map_location='cpu')
-
-    # Handle both raw state dict and wrapped dict
-    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-        print("  Found nested 'model_state_dict' key")
-    else:
-        state_dict = checkpoint
-        print("  Using raw state dict")
+    if layer_overrides:
+        summary = summarize_layer_overrides(layer_overrides)
+        bits_str = ", ".join(f"{bits}-bit: {count}" for bits, count in sorted(summary["lut_bits"].items()))
+        rank_str = ", ".join(f"r{rank}: {count}" for rank, count in sorted(summary["scale_rank"].items()))
+        if bits_str:
+            print(f"  Layer overrides: {bits_str}")
+        if rank_str:
+            print(f"  Override ranks:  {rank_str}")
 
     # Auto-detect LoRA config from checkpoint BEFORE enabling LoRA
     ckpt_lora_keys = [k for k in state_dict.keys() if 'lora_' in k]

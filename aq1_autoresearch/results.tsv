@@ -1,0 +1,5 @@
+commit	run_dir	artifact_type	candidate_checkpoint	score	full_perplexity	quick_perplexity	projected_payload_mib	avg_bits_per_weight	size_ok	best_eval_loss	final_eval_loss	elapsed_sec	snap_ok	inference_ok	status	retention	change_family	description
+3aa268a-dirty	runs/aq1_auto/qwen06b-init-ppl/baseline	init	runs/aq1_auto/qwen06b-init-ppl/baseline/v2_tightened.pt	32.86	32.86	27.55	248.52	4.7337	true			335.5	true	n/a	keep	keep	baseline	init_v2 q4a4 group_size=32 search_lut fp4_dense-all
+3aa268a-dirty	runs/aq1_auto/qwen06b-init-ppl/exp_001	init	runs/aq1_auto/qwen06b-init-ppl/exp_001/v2_tightened.pt	29.72	29.72	25.39	248.52	4.7337	true			330.8	true	n/a	keep	keep	group_size	group_size=16 with search_lut
+3aa268a-dirty	runs/aq1_auto/qwen06b-init-ppl/exp_002	init	runs/aq1_auto/qwen06b-init-ppl/exp_002/v2_tightened.pt	33.68		33.68	248.52	4.7337	true			352.2	skipped	n/a	discard	discard	group_size	group_size=64 screened out on quick PPL
+3aa268a-dirty	runs/aq1_auto/qwen06b-init-ppl/exp_003	init	runs/aq1_auto/qwen06b-init-ppl/exp_003/v2_tightened.pt	30.26	30.26	25.77	248.52	4.7337	true			386.9	true	n/a	keep	keep	group_search	per-layer search over group_size=128,64,32,16
