@@ -95,10 +95,10 @@ def append_results_row(
     description: str,
 ) -> None:
     row = [
-        commit,
-        summary.get("run_dir"),
-        summary.get("artifact_type"),
-        summary.get("candidate_checkpoint"),
+        fmt(commit),
+        fmt(summary.get("run_dir")),
+        fmt(summary.get("artifact_type")),
+        fmt(summary.get("candidate_checkpoint")),
         fmt(summary.get("score")),
         fmt(summary.get("full_perplexity")),
         fmt(summary.get("quick_perplexity")),
