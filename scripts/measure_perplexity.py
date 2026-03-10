@@ -63,7 +63,8 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
+from qat_lora.model_utils import select_hf_model_class, infer_text_module_prefixes
 
 # Quantization config presets (same as train_v2_simple.py)
 CONFIG_PRESETS = {
@@ -811,7 +812,8 @@ def load_checkpoint(
 
     # Load base model
     print(f"Loading base model: {model_name}")
-    model = AutoModelForCausalLM.from_pretrained(
+    model_class, _ = select_hf_model_class(model_name, trust_remote_code=True)
+    model = model_class.from_pretrained(
         model_name,
         torch_dtype=dtype if dtype != torch.float32 else torch.float32,
         trust_remote_code=True,
@@ -861,6 +863,7 @@ def load_checkpoint(
         magnitude_activation='identity',
     )
 
+    allow_name_prefixes = infer_text_module_prefixes(model, verbose=False)
     replace_linear_with_layer_overrides(
         model,
         mlp_config=mlp_config,
@@ -869,6 +872,7 @@ def load_checkpoint(
         quantize_attn=True,
         verbose=False,
         skip_init=True,  # Skip SVD init since we load checkpoint immediately after
+        allow_name_prefixes=allow_name_prefixes,
     )
 
     if layer_overrides:
@@ -1002,7 +1006,8 @@ def load_baseline_model(
 ):
     """Load original HuggingFace model (no QAT)."""
     print(f"Loading baseline model: {model_name}")
-    model = AutoModelForCausalLM.from_pretrained(
+    model_class, _ = select_hf_model_class(model_name, trust_remote_code=True)
+    model = model_class.from_pretrained(
         model_name,
         torch_dtype=dtype if dtype != torch.float32 else torch.float32,
         trust_remote_code=True,

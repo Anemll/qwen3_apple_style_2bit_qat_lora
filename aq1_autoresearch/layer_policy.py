@@ -15,7 +15,7 @@ from qat_lora.ane_qat_linear_v2 import AnemllQuantConfigV2, AnemllQATLinearV2
 
 
 MLP_PATTERN = re.compile(r"\.mlp\.(gate_proj|up_proj|down_proj)$")
-ATTN_PATTERN = re.compile(r"\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$")
+ATTN_PATTERN = re.compile(r"\.(self_attn|attn|attention|linear_attn)\.(q_proj|k_proj|v_proj|o_proj)$")
 LM_HEAD_PATTERN = re.compile(r"^lm_head$")
 
 
@@ -136,13 +136,37 @@ def replace_linear_with_layer_overrides(
     quantize_lm_head: bool = False,
     verbose: bool = True,
     skip_init: bool = False,
+    allow_name_prefixes: list[str] | None = None,
+    deny_name_prefixes: list[str] | None = None,
 ) -> int:
     attn_config = attn_config or mlp_config
     layer_overrides = layer_overrides or {}
 
     replacements: list[tuple[str, nn.Linear, AnemllQuantConfigV2, torch.Tensor | None]] = []
+    def _name_allowed(name: str) -> bool:
+        if allow_name_prefixes:
+            ok = False
+            for prefix in allow_name_prefixes:
+                if prefix in (None, ""):
+                    ok = True
+                    break
+                if name.startswith(prefix + "."):
+                    ok = True
+                    break
+            if not ok:
+                return False
+        if deny_name_prefixes:
+            for prefix in deny_name_prefixes:
+                if prefix in (None, ""):
+                    continue
+                if name.startswith(prefix + "."):
+                    return False
+        return True
+
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear) or isinstance(module, AnemllQATLinearV2):
+            continue
+        if not _name_allowed(name):
             continue
         if not is_quantized_linear_name(name, quantize_attn=quantize_attn, quantize_lm_head=quantize_lm_head):
             continue

@@ -1691,6 +1691,8 @@ def replace_linear_with_anemll_v2(
     skip_init: bool = False,
     parallel_init: bool = True,
     num_workers: int = 0,
+    allow_name_prefixes: Optional[list[str]] = None,
+    deny_name_prefixes: Optional[list[str]] = None,
 ) -> int:
     """Replace MLP and optionally attention linears with AnemllQATLinearV2.
 
@@ -1706,16 +1708,38 @@ def replace_linear_with_anemll_v2(
     import os
 
     mlp_pattern = re.compile(r'\.mlp\.(gate_proj|up_proj|down_proj)$')
-    attn_pattern = re.compile(r'\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$')
+    attn_pattern = re.compile(r'\.(self_attn|attn|attention|linear_attn)\.(q_proj|k_proj|v_proj|o_proj)$')
     lm_head_pattern = re.compile(r'^lm_head$')
 
     if attn_config is None:
         attn_config = mlp_config
 
     # First pass: collect layers to replace
+    def _name_allowed(name: str) -> bool:
+        if allow_name_prefixes:
+            ok = False
+            for prefix in allow_name_prefixes:
+                if prefix in (None, ""):
+                    ok = True
+                    break
+                if name.startswith(prefix + "."):
+                    ok = True
+                    break
+            if not ok:
+                return False
+        if deny_name_prefixes:
+            for prefix in deny_name_prefixes:
+                if prefix in (None, ""):
+                    continue
+                if name.startswith(prefix + "."):
+                    return False
+        return True
+
     layers_to_replace = []
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
+            continue
+        if not _name_allowed(name):
             continue
         if isinstance(module, AnemllQATLinearV2):
             continue

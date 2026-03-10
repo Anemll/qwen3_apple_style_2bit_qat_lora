@@ -13,13 +13,13 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM
+from qat_lora.model_utils import select_hf_model_class, infer_text_module_prefixes
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from aq1_autoresearch.layer_policy import replace_linear_with_layer_overrides
+from aq1_autoresearch.layer_policy import replace_linear_with_layer_overrides, layer_kind
 from aq1_autoresearch.score_run import estimate_quantized_payload
 from qat_lora.ane_qat_linear_v2 import AnemllQATLinearV2, AnemllQuantConfigV2
 from scripts.init_model_v2 import (
@@ -66,6 +66,17 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+
+def name_allowed(name: str, allow_name_prefixes: list[str] | None) -> bool:
+    if not allow_name_prefixes:
+        return True
+    for prefix in allow_name_prefixes:
+        if prefix in (None, ""):
+            return True
+        if name.startswith(prefix + "."):
+            return True
+    return False
+
 def write_json(path: Path, data: dict[str, Any]) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, sort_keys=True)
@@ -81,18 +92,16 @@ def serialize_layer_overrides(layer_overrides: dict[str, dict[str, Any]]) -> dic
     return out
 
 
-def iter_quant_linears(model: nn.Module, scope: str = "all") -> list[tuple[str, nn.Linear, str]]:
+def iter_quant_linears(model: nn.Module, scope: str = "all", allow_name_prefixes: list[str] | None = None) -> list[tuple[str, nn.Linear, str]]:
     layers: list[tuple[str, nn.Linear, str]] = []
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
             continue
+        if not name_allowed(name, allow_name_prefixes):
+            continue
         if "embed" in name or "lm_head" in name:
             continue
-        kind = None
-        if ".mlp." in name:
-            kind = "mlp"
-        elif ".self_attn." in name:
-            kind = "attn"
+        kind = layer_kind(name)
         if kind is None:
             continue
         if scope != "all" and kind != scope:
@@ -149,6 +158,7 @@ def load_or_compute_layer_stats(
     scope: str,
     bit_options: list[int],
     cache_json: Path | None,
+    allow_name_prefixes: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     normalized_bits = sorted({int(bits) for bits in bit_options})
     cache_key = f"{scope}|{group_size}|{','.join(str(bits) for bits in normalized_bits)}"
@@ -159,7 +169,7 @@ def load_or_compute_layer_stats(
             return cached["candidates"]
 
     candidates: list[dict[str, Any]] = []
-    for name, module, kind in iter_quant_linears(model, scope=scope):
+    for name, module, kind in iter_quant_linears(model, scope=scope, allow_name_prefixes=allow_name_prefixes):
         scale_rank = PRESET.attn_rank if kind == "attn" else PRESET.mlp_rank
         mae_by_bits: dict[str, float] = {}
         payload_bits_by_bits: dict[str, int] = {}
@@ -201,6 +211,7 @@ def build_mixedbit_overrides(
     upgrade_bits: int,
     cache_json: Path | None,
     verbose: bool,
+    allow_name_prefixes: list[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     baseline_size = estimate_quantized_payload(baseline_checkpoint)
     baseline_bits = baseline_size.get("projected_payload_bits")
@@ -214,6 +225,7 @@ def build_mixedbit_overrides(
         scope=scope,
         bit_options=[4, upgrade_bits],
         cache_json=cache_json,
+        allow_name_prefixes=allow_name_prefixes,
     )
     candidates: list[dict[str, Any]] = []
     for row in raw_candidates:
@@ -289,6 +301,7 @@ def build_tiered_mixedbit_overrides(
     max_upgrade_bits: int,
     cache_json: Path | None,
     verbose: bool,
+    allow_name_prefixes: list[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     baseline_size = estimate_quantized_payload(baseline_checkpoint)
     baseline_bits = baseline_size.get("projected_payload_bits")
@@ -304,6 +317,7 @@ def build_tiered_mixedbit_overrides(
         scope=scope,
         bit_options=list(range(4, max_upgrade_bits + 1)),
         cache_json=cache_json,
+        allow_name_prefixes=allow_name_prefixes,
     )
 
     current_bits = {row["name"]: 4 for row in candidates}
@@ -476,9 +490,11 @@ def build_tightened_model(
     checkpoint_path: Path,
     layer_overrides: dict[str, dict[str, Any]],
     group_size: int,
-) -> AutoModelForCausalLM:
+    allow_name_prefixes: list[str] | None = None,
+) -> nn.Module:
     mlp_config, attn_config = create_v2_configs(PRESET, group_size=group_size, verbose=False)
-    model = AutoModelForCausalLM.from_pretrained(
+    model_class, _ = select_hf_model_class(model_id, trust_remote_code=True)
+    model = model_class.from_pretrained(
         model_id,
         torch_dtype=torch.float32,
         trust_remote_code=True,
@@ -491,6 +507,7 @@ def build_tightened_model(
         quantize_attn=True,
         verbose=False,
         skip_init=True,
+        allow_name_prefixes=allow_name_prefixes,
     )
 
     state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -527,6 +544,7 @@ def main() -> int:
         verbose=verbose,
     )
 
+    allow_name_prefixes = infer_text_module_prefixes(model, verbose=verbose)
     if args.family in {"mixedbit", "mixedbit_tiered"}:
         if not args.baseline_checkpoint:
             raise SystemExit("--baseline-checkpoint is required for mixed-bit experiments")
@@ -542,6 +560,7 @@ def main() -> int:
                 upgrade_bits=args.upgrade_bits,
                 cache_json=cache_json,
                 verbose=verbose,
+                allow_name_prefixes=allow_name_prefixes,
             )
         else:
             layer_overrides, family_meta = build_tiered_mixedbit_overrides(
@@ -554,6 +573,7 @@ def main() -> int:
                 max_upgrade_bits=args.max_upgrade_bits,
                 cache_json=cache_json,
                 verbose=verbose,
+                allow_name_prefixes=allow_name_prefixes,
             )
         experiment_metadata.update(family_meta)
     else:
@@ -606,6 +626,7 @@ def main() -> int:
         checkpoint_path=checkpoint_path,
         layer_overrides=layer_overrides,
         group_size=args.group_size,
+        allow_name_prefixes=allow_name_prefixes,
     )
 
     tighten_results = tighten_and_measure_ppl(

@@ -69,6 +69,7 @@ Author: ANEMLL Team
 
 import argparse
 import json
+import re
 import os
 import sys
 import time
@@ -322,6 +323,21 @@ def get_device(force_tpu: bool = False, force_cpu: bool = False) -> Tuple[torch.
     return torch.device('cpu'), 'cpu'
 
 
+
+def name_allowed(name: str, allow_name_prefixes: list[str] | None) -> bool:
+    if not allow_name_prefixes:
+        return True
+    for prefix in allow_name_prefixes:
+        if prefix in (None, ""):
+            return True
+        if name.startswith(prefix + "."):
+            return True
+    return False
+
+
+MLP_PATTERN = re.compile(r"\.mlp\.(gate_proj|up_proj|down_proj)$")
+ATTN_PATTERN = re.compile(r"\.(self_attn|attn|attention|linear_attn)\.(q_proj|k_proj|v_proj|o_proj)$")
+
 # =============================================================================
 # STEP 2: LOAD BASE MODEL
 # =============================================================================
@@ -347,7 +363,8 @@ def load_base_model(
     Returns:
         (model, tokenizer) tuple
     """
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+    from qat_lora.model_utils import select_hf_model_class
 
     if verbose:
         print(f"\n[Step 2] Loading base model: {model_id}")
@@ -356,7 +373,8 @@ def load_base_model(
     t0 = time.time()
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
+    model_class, _ = select_hf_model_class(model_id, trust_remote_code=True)
+    model = model_class.from_pretrained(
         model_id,
         torch_dtype=dtype,
         trust_remote_code=True,
@@ -472,6 +490,7 @@ def replace_linear_layers(
     attn_config: Any,
     quantize_attn: bool = True,
     verbose: bool = True,
+    allow_name_prefixes: list[str] | None = None,
 ) -> Dict[str, Any]:
     """
     Replace nn.Linear layers with AnemllQATLinearV2.
@@ -514,6 +533,7 @@ def replace_linear_layers(
         quantize_attn=quantize_attn,
         quantize_lm_head=False,  # Never quantize lm_head
         verbose=verbose,
+        allow_name_prefixes=allow_name_prefixes,
     )
 
     elapsed = time.time() - t0
@@ -548,6 +568,7 @@ def measure_svd_approximation_error(
     model: nn.Module,
     model_id: str,
     verbose: bool = True,
+    allow_name_prefixes: list[str] | None = None,
 ) -> Dict[str, Any]:
     """
     Calculate MAE between original weights and SVD-approximated weights.
@@ -567,7 +588,7 @@ def measure_svd_approximation_error(
     Returns:
         Dict with per-layer and aggregate MAE statistics
     """
-    from transformers import AutoModelForCausalLM
+    from qat_lora.model_utils import select_hf_model_class
     from qat_lora.ane_qat_linear_v2 import AnemllQATLinearV2
 
     if verbose:
@@ -579,7 +600,8 @@ def measure_svd_approximation_error(
     if verbose:
         print(f"  Loading baseline weights from {model_id}...")
 
-    baseline = AutoModelForCausalLM.from_pretrained(
+    model_class, _ = select_hf_model_class(model_id, trust_remote_code=True)
+    baseline = model_class.from_pretrained(
         model_id,
         torch_dtype=torch.float32,
         trust_remote_code=True,
@@ -602,7 +624,7 @@ def measure_svd_approximation_error(
     mlp_maes = []
     attn_maes = []
 
-    v2_layers = [(name, m) for name, m in model.named_modules() if isinstance(m, AnemllQATLinearV2)]
+    v2_layers = [(name, m) for name, m in model.named_modules() if isinstance(m, AnemllQATLinearV2) and name_allowed(name, allow_name_prefixes)]
 
     for layer_idx, (name, module) in enumerate(v2_layers):
         # Get W_ref
@@ -637,8 +659,8 @@ def measure_svd_approximation_error(
         rel_mae = mae / max(w_scale, 1e-8)
 
         # Determine layer type
-        is_mlp = 'mlp' in name
-        is_attn = 'self_attn' in name or 'attention' in name
+        is_mlp = bool(MLP_PATTERN.search(name))
+        is_attn = bool(ATTN_PATTERN.search(name))
 
         layer_stat = {
             'name': name,
@@ -713,6 +735,7 @@ def search_optimal_group_sizes(
     attn_lut_bits: int = 4,
     attn_scale_rank: int = 32,
     verbose: bool = True,
+    allow_name_prefixes: list[str] | None = None,
 ) -> Dict[str, Any]:
     """
     Search for optimal group_size for each tensor by testing different sizes
@@ -751,11 +774,13 @@ def search_optimal_group_sizes(
     linear_layers = []
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
+            if not name_allowed(name, allow_name_prefixes):
+                continue
             # Skip lm_head and embeddings
             if 'lm_head' in name or 'embed' in name:
                 continue
             # Only include MLP and attention layers
-            if 'mlp' in name or 'self_attn' in name or 'attention' in name:
+            if MLP_PATTERN.search(name) or ATTN_PATTERN.search(name):
                 linear_layers.append((name, module))
 
     if verbose:
@@ -774,8 +799,8 @@ def search_optimal_group_sizes(
         out_features, in_features = W_ref.shape
 
         # Determine layer type and select appropriate config
-        is_mlp = 'mlp' in name
-        is_attn = 'self_attn' in name or 'attention' in name
+        is_mlp = bool(MLP_PATTERN.search(name))
+        is_attn = bool(ATTN_PATTERN.search(name))
         layer_type = 'mlp' if is_mlp else ('attn' if is_attn else 'other')
 
         # Use appropriate LUT size and scale rank for this layer type
@@ -918,6 +943,7 @@ def replace_linear_layers_with_optimal_groups(
     attn_scale_rank: int = 32,
     quantize_attn: bool = True,
     verbose: bool = True,
+    allow_name_prefixes: list[str] | None = None,
 ) -> Dict[str, Any]:
     """
     Replace linear layers using per-layer optimal group sizes.
@@ -950,8 +976,8 @@ def replace_linear_layers_with_optimal_groups(
         if isinstance(module, nn.Linear):
             if 'lm_head' in name or 'embed' in name:
                 continue
-            is_mlp = 'mlp' in name
-            is_attn = 'self_attn' in name or 'attention' in name
+            is_mlp = bool(MLP_PATTERN.search(name))
+            is_attn = bool(ATTN_PATTERN.search(name))
             if is_mlp or (quantize_attn and is_attn):
                 layers_to_replace.append((name, module))
 
@@ -966,7 +992,7 @@ def replace_linear_layers_with_optimal_groups(
         group_size = optimal_group_map.get(name, 32)  # Default to 32 if not found
 
         # Determine layer type and use appropriate LUT size and scale rank
-        is_mlp = 'mlp' in name
+        is_mlp = bool(MLP_PATTERN.search(name))
         if is_mlp:
             lut_size = 2 ** mlp_lut_bits
             scale_rank = mlp_scale_rank
@@ -1035,6 +1061,7 @@ def search_optimal_luts(
     attn_lut_bits: int = 4,
     attn_scale_rank: int = 32,
     verbose: bool = True,
+    allow_name_prefixes: list[str] | None = None,
 ) -> Dict[str, Any]:
     """
     Search for optimal LUT per tensor by testing candidates and minimizing MAE.
@@ -1075,11 +1102,13 @@ def search_optimal_luts(
     linear_layers = []
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
+            if not name_allowed(name, allow_name_prefixes):
+                continue
             # Skip lm_head and embeddings
             if 'lm_head' in name or 'embed' in name:
                 continue
             # Only include MLP and attention layers
-            if 'mlp' in name or 'self_attn' in name or 'attention' in name:
+            if MLP_PATTERN.search(name) or ATTN_PATTERN.search(name):
                 linear_layers.append((name, module))
 
     if verbose:
@@ -1099,8 +1128,8 @@ def search_optimal_luts(
         out_features, in_features = W_ref.shape
 
         # Determine layer type and select appropriate config
-        is_mlp = 'mlp' in name
-        is_attn = 'self_attn' in name or 'attention' in name
+        is_mlp = bool(MLP_PATTERN.search(name))
+        is_attn = bool(ATTN_PATTERN.search(name))
         layer_type = 'mlp' if is_mlp else ('attn' if is_attn else 'other')
 
         # Use appropriate LUT size and scale rank for this layer type
@@ -1302,6 +1331,7 @@ def replace_linear_layers_with_optimal_luts(
     attn_scale_rank: int = 32,
     quantize_attn: bool = True,
     verbose: bool = True,
+    allow_name_prefixes: list[str] | None = None,
 ) -> Dict[str, Any]:
     """
     Replace linear layers using per-layer optimal LUTs.
@@ -1336,8 +1366,8 @@ def replace_linear_layers_with_optimal_luts(
         if isinstance(module, nn.Linear):
             if 'lm_head' in name or 'embed' in name:
                 continue
-            is_mlp = 'mlp' in name
-            is_attn = 'self_attn' in name or 'attention' in name
+            is_mlp = bool(MLP_PATTERN.search(name))
+            is_attn = bool(ATTN_PATTERN.search(name))
             if is_mlp or (quantize_attn and is_attn):
                 layers_to_replace.append((name, module))
 
@@ -1353,7 +1383,7 @@ def replace_linear_layers_with_optimal_luts(
         custom_lut = lut_candidates.get(lut_name)
 
         # Determine layer type and use appropriate config
-        is_mlp = 'mlp' in name
+        is_mlp = bool(MLP_PATTERN.search(name))
         if is_mlp:
             lut_size = 2 ** mlp_lut_bits
             scale_rank = mlp_scale_rank
@@ -1656,7 +1686,7 @@ def tighten_and_measure_ppl(
         print(f"  Loaded {len(W_ref_map)} baseline weight tensors")
 
     # --- Step 8b: Snap magnitudes to FP16 before tightening ---
-    v2_layers = [(name, m) for name, m in model.named_modules() if isinstance(m, AnemllQATLinearV2)]
+    v2_layers = [(name, m) for name, m in model.named_modules() if isinstance(m, AnemllQATLinearV2) and name_allowed(name, allow_name_prefixes)]
 
     # Snap all rank_magnitudes to FP16 FIRST (before computing scales)
     mags_snapped = {'mlp': 0, 'attn': 0, 'total': 0}
@@ -1665,9 +1695,9 @@ def tighten_and_measure_ppl(
             if hasattr(module, 'rank_magnitude') and module.rank_magnitude is not None:
                 module.rank_magnitude.data = module.rank_magnitude.data.to(torch.float16).to(torch.float32)
                 mags_snapped['total'] += 1
-                if 'mlp' in name:
+                if MLP_PATTERN.search(name):
                     mags_snapped['mlp'] += 1
-                elif 'self_attn' in name:
+                elif ATTN_PATTERN.search(name):
                     mags_snapped['attn'] += 1
 
     if verbose:
@@ -1978,6 +2008,13 @@ def init_v2_model(
         verbose=verbose,
     )
 
+    from qat_lora.model_utils import infer_text_module_prefixes
+    allow_name_prefixes = infer_text_module_prefixes(model, verbose=verbose)
+    if allow_name_prefixes:
+        metrics['text_prefixes'] = allow_name_prefixes
+        if verbose:
+            print(f"  Text prefixes: {allow_name_prefixes}")
+
     # Step 3: Create V2 configs
     # NOTE: Use defaults (force_positive_scales=False, magnitude_activation='identity')
     # for SVD compatibility
@@ -2014,6 +2051,7 @@ def init_v2_model(
             attn_lut_bits=preset.attn_lut_bits,
             attn_scale_rank=preset.attn_rank,
             verbose=verbose,
+            allow_name_prefixes=allow_name_prefixes,
         )
         metrics['steps']['lut_search'] = lut_search_stats
         optimal_lut_map = lut_search_stats['optimal_lut_map']
@@ -2041,6 +2079,7 @@ def init_v2_model(
             attn_scale_rank=preset.attn_rank,
             quantize_attn=quantize_attn,
             verbose=verbose,
+            allow_name_prefixes=allow_name_prefixes,
         )
         metrics['steps']['replace'] = replace_stats
 
@@ -2058,6 +2097,7 @@ def init_v2_model(
             attn_lut_bits=preset.attn_lut_bits,
             attn_scale_rank=preset.attn_rank,
             verbose=verbose,
+            allow_name_prefixes=allow_name_prefixes,
         )
         metrics['steps']['group_search'] = search_stats
 
@@ -2071,6 +2111,7 @@ def init_v2_model(
             attn_scale_rank=preset.attn_rank,
             quantize_attn=quantize_attn,
             verbose=verbose,
+            allow_name_prefixes=allow_name_prefixes,
         )
         metrics['steps']['replace'] = replace_stats
 
@@ -2094,6 +2135,7 @@ def init_v2_model(
             attn_config=attn_config,
             quantize_attn=quantize_attn,
             verbose=verbose,
+            allow_name_prefixes=allow_name_prefixes,
         )
         metrics['steps']['replace'] = replace_stats
         # Update group_size for saving
@@ -2107,6 +2149,7 @@ def init_v2_model(
             attn_config=attn_config,
             quantize_attn=quantize_attn,
             verbose=verbose,
+            allow_name_prefixes=allow_name_prefixes,
         )
         metrics['steps']['replace'] = replace_stats
 
@@ -2120,6 +2163,7 @@ def init_v2_model(
             model=model,
             model_id=model_id,
             verbose=verbose,
+            allow_name_prefixes=allow_name_prefixes,
         )
         metrics['steps']['svd_error'] = svd_error_stats
     else:
@@ -2154,11 +2198,12 @@ def init_v2_model(
         if verbose:
             print(f"\n[Step 7] Loading fresh model for tightening (same config as init)...")
 
-        from transformers import AutoModelForCausalLM
+        from qat_lora.model_utils import select_hf_model_class
         from qat_lora.ane_qat_linear_v2 import AnemllQuantConfigV2, replace_linear_with_anemll_v2, AnemllQATLinearV2
 
         # Load fresh base model
-        tightened_model = AutoModelForCausalLM.from_pretrained(
+        model_class, _ = select_hf_model_class(model_id, trust_remote_code=True)
+        tightened_model = model_class.from_pretrained(
             model_id,
             torch_dtype=torch.float32,
             trust_remote_code=True,

@@ -10,13 +10,65 @@ from __future__ import annotations
 
 import re
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import torch
 import torch.nn as nn
 
 from .qat_linear import QATLinear
 from .quantizer import QATQuantConfig, init_f_from_weight
+
+
+def select_hf_model_class(model_id: str, trust_remote_code: bool = True):
+    """Pick the appropriate HF model class for a model_id (CausalLM vs ConditionalGeneration)."""
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    try:
+        from transformers import AutoModelForConditionalGeneration  # newer transformers
+    except Exception:
+        AutoModelForConditionalGeneration = None
+
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+    architectures = set(config.architectures or [])
+    wants_conditional = config.model_type in {"qwen3_5"} or any("ConditionalGeneration" in arch for arch in architectures)
+    if wants_conditional and AutoModelForConditionalGeneration is not None:
+        return AutoModelForConditionalGeneration, config
+    return AutoModelForCausalLM, config
+
+
+def infer_text_module_prefixes(
+    model: nn.Module,
+    verbose: bool = False,
+) -> List[str]:
+    """Infer the most likely text backbone prefix by counting matching linear layers."""
+    import re
+
+    mlp_pattern = re.compile(r"\.mlp\.(gate_proj|up_proj|down_proj)$")
+    attn_pattern = re.compile(r"\.(self_attn|attn|attention|linear_attn)\.(q_proj|k_proj|v_proj|o_proj)$")
+
+    prefix_counts: Dict[str, int] = {}
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        if not (mlp_pattern.search(name) or attn_pattern.search(name)):
+            continue
+        prefix = name.split(".layers.", 1)[0]
+        prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+
+    if not prefix_counts:
+        return []
+
+    def _score(item: tuple[str, int]) -> tuple[int, int]:
+        prefix, count = item
+        bonus = 2 if any(tok in prefix for tok in ("text", "language", "llm")) else 0
+        return (count, bonus)
+
+    best_prefix = max(prefix_counts.items(), key=_score)[0]
+
+    if verbose:
+        print(f"[model_utils] Selected text prefix '{best_prefix}' from {len(prefix_counts)} candidates")
+
+    return [best_prefix]
 
 
 def replace_linear_with_qat(
